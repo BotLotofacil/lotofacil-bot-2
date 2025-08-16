@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Dados temporários
+*.log
+*.tmp
+*.bak
+
+# CSVs convertidos e dados locais
+history_convertido.csv
+
+# Ambientes virtuais
+.venv/
+env/
+venv/
+
+# Configuração local
+.env
+*.env
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
+
+# VSCode
+.vscode/

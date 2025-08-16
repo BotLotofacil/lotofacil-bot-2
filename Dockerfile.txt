@@ -1,0 +1,20 @@
+# Dockerfile
+
+# Imagem base enxuta com Python
+FROM python:3.10-slim
+
+# Define diretório de trabalho dentro do container
+WORKDIR /app
+
+# Copia e instala as dependências
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia o restante do código do projeto
+COPY . .
+
+# Define a variável de ambiente (pode ser sobrescrita no Railway)
+ENV TELEGRAM_BOT_TOKEN=changeme
+
+# Inicia o bot
+CMD ["python", "bot.py"]
