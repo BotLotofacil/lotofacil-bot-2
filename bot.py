@@ -2,6 +2,7 @@
 
 import os
 import logging
+import traceback
 from typing import List, Set
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -98,11 +99,15 @@ class LotoFacilBot:
             return
 
         try:
+            if not self.generator:
+                raise RuntimeError("Gerador de apostas não foi inicializado corretamente.")
+
             apostas = await self.generator.gerar_apostas(n_apostas=3)
             resposta = self._formatar_resposta(apostas)
             await update.message.reply_text(resposta, parse_mode='HTML')
+
         except Exception as e:
-            logger.error(f"Erro ao gerar apostas: {e}")
+            logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("❌ Erro ao gerar apostas. Tente novamente mais tarde.")
 
     def _formatar_resposta(self, apostas: List[List[int]]) -> str:
