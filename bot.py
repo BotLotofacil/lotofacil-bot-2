@@ -9,6 +9,10 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 from core.generator import ApostaGenerator
+from dotenv import load_dotenv
+
+# Carrega variáveis de ambiente de um arquivo .env (apenas localmente)
+load_dotenv()
 
 # ========================
 # Configuração de Logging
