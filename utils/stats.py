@@ -13,15 +13,18 @@ class Estatisticas:
         self.jogos = self._carregar_jogos()
 
     def _carregar_jogos(self) -> list[list[int]]:
-        """
-        Carrega os jogos do arquivo CSV.
-
-        :return: Lista de jogos como listas de inteiros.
-        """
         try:
-            df = pd.read_csv(self.historico_path, sep=";", header=None)
-            jogos = df.values.tolist()
-            return [[int(n) for n in jogo if pd.notnull(n)] for jogo in jogos]
+            df = pd.read_csv(self.historico_path, header=None)
+            jogos = []
+
+            for linha in df.itertuples(index=False):
+                # Cada linha tem uma string como: '1,3,5,...'
+                jogo_str = str(linha[0])
+                numeros = [int(n.strip()) for n in jogo_str.split(',') if n.strip().isdigit()]
+                if len(numeros) == 15:
+                    jogos.append(numeros)
+
+            return jogos
         except Exception as e:
             raise ValueError(f"Erro ao carregar o histórico: {e}")
 
@@ -54,3 +57,4 @@ class Estatisticas:
         """
         freq = self.frequencia_numeros()
         return [n for n, _ in sorted(freq.items(), key=lambda x: x[1])[:bottom_n]]
+
