@@ -13,7 +13,7 @@ class ApostaGenerator:
         df = pd.read_csv(historico_path, header=None)
         self.jogos = df.values.tolist()
 
-        self.stats = Estatisticas(self.jogos)
+        self.stats = Estatisticas(historico_path)
         self.strategy = GeneticStrategy(self.jogos)
 
     def gerar_aposta(self) -> list[int]:
@@ -28,6 +28,7 @@ class ApostaGenerator:
 
     def _gerar_aposta_randomica(self) -> list[int]:
         return random.sample(range(1, 26), 15)
+
 
 
 
