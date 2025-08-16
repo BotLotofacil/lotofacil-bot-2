@@ -43,7 +43,7 @@ class LotoFacilBot:
         return token
 
     def _get_admin_id(self) -> int:
-        admin_id = os.getenv("ADMIN_USER_ID")
+        admin_id = os.getenv("ADMIN_TELEGRAM_ID")
         if not admin_id or not admin_id.isdigit():
             raise EnvironmentError("❌ ADMIN_USER_ID não configurado corretamente.")
         return int(admin_id)
