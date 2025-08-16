@@ -2,7 +2,6 @@
 
 import os
 import logging
-import asyncio
 from typing import List, Set
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -29,8 +28,10 @@ logger = logging.getLogger(__name__)
 class LotoFacilBot:
     def __init__(self):
         self.token = self._get_bot_token()
+        self.admin_id = self._get_admin_id()
         self.whitelist_path = "whitelist.txt"
         self.whitelist = self._carregar_whitelist()
+        self._garantir_admin_na_whitelist()
         self.app = ApplicationBuilder().token(self.token).build()
         self.generator = ApostaGenerator("data/history.csv")
         self._setup_handlers()
@@ -40,6 +41,12 @@ class LotoFacilBot:
         if not token:
             raise EnvironmentError("❌ Variável TELEGRAM_BOT_TOKEN não configurada.")
         return token
+
+    def _get_admin_id(self) -> int:
+        admin_id = os.getenv("ADMIN_USER_ID")
+        if not admin_id or not admin_id.isdigit():
+            raise EnvironmentError("❌ ADMIN_USER_ID não configurado corretamente.")
+        return int(admin_id)
 
     def _carregar_whitelist(self) -> Set[int]:
         """Carrega os IDs autorizados do arquivo de whitelist"""
@@ -53,6 +60,13 @@ class LotoFacilBot:
         with open(self.whitelist_path, "w") as f:
             for user_id in sorted(self.whitelist):
                 f.write(f"{user_id}\n")
+
+    def _garantir_admin_na_whitelist(self):
+        """Garante que o administrador esteja sempre autorizado"""
+        if self.admin_id not in self.whitelist:
+            self.whitelist.add(self.admin_id)
+            self._salvar_whitelist()
+            logging.info(f"✅ Administrador {self.admin_id} autorizado automaticamente.")
 
     def _setup_handlers(self):
         """Registra os comandos do bot"""
@@ -112,20 +126,30 @@ class LotoFacilBot:
         )
 
     async def autorizar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /autorizar – Adiciona um ID à whitelist"""
-        if len(context.args) != 1 or not context.args[0].isdigit():
-            await update.message.reply_text("⚠️ Uso: /autorizar <ID>")
+        """Comando /autorizar – Adiciona um ID à whitelist (somente admin)"""
+        if update.effective_user.id != self.admin_id:
+            await update.message.reply_text("⛔ Você não tem permissão para autorizar usuários.")
             return
+
+        if len(context.args) != 1 or not context.args[0].isdigit():
+            await update.message.reply_text("⚠️ Uso correto: /autorizar <ID>")
+            return
+
         user_id = int(context.args[0])
         self.whitelist.add(user_id)
         self._salvar_whitelist()
-        await update.message.reply_text(f"✅ Usuário {user_id} autorizado.")
+        await update.message.reply_text(f"✅ Usuário {user_id} autorizado com sucesso.")
 
     async def remover(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /remover – Remove um ID da whitelist"""
-        if len(context.args) != 1 or not context.args[0].isdigit():
-            await update.message.reply_text("⚠️ Uso: /remover <ID>")
+        """Comando /remover – Remove um ID da whitelist (somente admin)"""
+        if update.effective_user.id != self.admin_id:
+            await update.message.reply_text("⛔ Você não tem permissão para remover usuários.")
             return
+
+        if len(context.args) != 1 or not context.args[0].isdigit():
+            await update.message.reply_text("⚠️ Uso correto: /remover <ID>")
+            return
+
         user_id = int(context.args[0])
         if user_id in self.whitelist:
             self.whitelist.remove(user_id)
@@ -145,4 +169,5 @@ class LotoFacilBot:
 if __name__ == '__main__':
     bot = LotoFacilBot()
     bot.run()
+
 
