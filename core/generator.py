@@ -1,7 +1,7 @@
 # core/generator.py
 
 import random
-from strategies.genetic import GeneticStrategy
+from strategies.genetic import GeneticGenerator
 from utils.stats import Estatisticas
 
 class ApostaGenerator:
@@ -20,3 +20,4 @@ class ApostaGenerator:
 
     def _gerar_aposta_randomica(self) -> list[int]:
         return random.sample(range(1, 26), 15)
+
