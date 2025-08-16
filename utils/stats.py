@@ -1,43 +1,56 @@
-# utils/stats.py
-
 from collections import Counter
-import numpy as np
 import pandas as pd
-
+import numpy as np
 
 class Estatisticas:
-    @staticmethod
-    def frequencia_numeros(jogos: list[list[int]]) -> dict:
+    def __init__(self, historico_path: str):
         """
-        Calcula a frequência de cada número nos jogos fornecidos.
+        Inicializa a classe carregando o histórico de jogos.
 
-        :param jogos: Lista de jogos, onde cada jogo é uma lista de inteiros.
+        :param historico_path: Caminho para o arquivo CSV com o histórico.
+        """
+        self.historico_path = historico_path
+        self.jogos = self._carregar_jogos()
+
+    def _carregar_jogos(self) -> list[list[int]]:
+        """
+        Carrega os jogos do arquivo CSV.
+
+        :return: Lista de jogos como listas de inteiros.
+        """
+        try:
+            df = pd.read_csv(self.historico_path, sep=";", header=None)
+            jogos = df.values.tolist()
+            return [[int(n) for n in jogo if pd.notnull(n)] for jogo in jogos]
+        except Exception as e:
+            raise ValueError(f"Erro ao carregar o histórico: {e}")
+
+    def frequencia_numeros(self) -> dict:
+        """
+        Calcula a frequência de cada número nos jogos carregados.
+
         :return: Dicionário com a frequência de cada número.
         """
-        todos_numeros = [num for jogo in jogos for num in jogo]
+        todos_numeros = [num for jogo in self.jogos for num in jogo]
         contagem = Counter(todos_numeros)
         return dict(sorted(contagem.items()))
 
-    @staticmethod
-    def numeros_mais_frequentes(jogos: list[list[int]], top_n: int = 15) -> list[int]:
+    def numeros_mais_frequentes(self, top_n: int = 15) -> list[int]:
         """
-        Retorna os números mais frequentes nos jogos.
+        Retorna os números mais frequentes.
 
-        :param jogos: Lista de jogos.
-        :param top_n: Quantidade de números mais frequentes a retornar.
+        :param top_n: Quantidade a retornar.
         :return: Lista de inteiros.
         """
-        frequencia = Estatisticas.frequencia_numeros(jogos)
-        return [numero for numero, _ in sorted(frequencia.items(), key=lambda item: item[1], reverse=True)[:top_n]]
+        freq = self.frequencia_numeros()
+        return [n for n, _ in sorted(freq.items(), key=lambda x: x[1], reverse=True)[:top_n]]
 
-    @staticmethod
-    def numeros_menos_frequentes(jogos: list[list[int]], bottom_n: int = 15) -> list[int]:
+    def numeros_menos_frequentes(self, bottom_n: int = 15) -> list[int]:
         """
-        Retorna os números menos frequentes nos jogos.
+        Retorna os números menos frequentes.
 
-        :param jogos: Lista de jogos.
-        :param bottom_n: Quantidade de números menos frequentes a retornar.
+        :param bottom_n: Quantidade a retornar.
         :return: Lista de inteiros.
         """
-        frequencia = Estatisticas.frequencia_numeros(jogos)
-        return [numero for numero, _ in sorted(frequencia.items(), key=lambda item: item[1])[:bottom_n]]
+        freq = self.frequencia_numeros()
+        return [n for n, _ in sorted(freq.items(), key=lambda x: x[1])[:bottom_n]]
