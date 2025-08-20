@@ -5,122 +5,113 @@ import re
 from pathlib import Path
 from typing import List, Set, Iterable
 
+def _only_int_1_25(x: str) -> int | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        v = int(s)
+    else:
+        s2 = re.sub(r"\D", "", s)
+        if not s2.isdigit():
+            return None
+        v = int(s2)
+    return v if 1 <= v <= 25 else None
+
 def _row_to_set(nums: Iterable[int]) -> Set[int]:
-    s = []
-    for x in nums:
-        try:
-            xi = int(x)
-            if 1 <= xi <= 25:
-                s.append(xi)
-        except Exception:
-            continue
-    # mantém no máximo 15 elementos, remove duplicados preservando ordem
     seen = set()
-    out = []
-    for v in s:
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
+    out: List[int] = []
+    for n in nums:
+        if n is None:
+            continue
+        if n not in seen and 1 <= n <= 25:
+            seen.add(n)
+            out.append(n)
         if len(out) == 15:
             break
     return set(out)
 
 def _parse_line_blob(txt: str) -> Set[int]:
-    """
-    Aceita linhas no formato:
-      - "01 02 03 04 ...", "1;2;3;...", "1, 2, 3, ..."
-      - tolera zeros à esquerda e separadores mistos
-    """
     parts = re.split(r"[,\s;]+", str(txt or "").strip())
-    nums = []
+    nums: List[int] = []
     for p in parts:
-        p = str(p).strip()
-        if not p:
-            continue
-        if p.isdigit():
-            nums.append(int(p))
-            continue
-        # remove caracteres não numéricos e tenta de novo
-        p2 = re.sub(r"\D", "", p)
-        if p2.isdigit():
-            nums.append(int(p2))
+        v = _only_int_1_25(p)
+        if v is not None:
+            nums.append(v)
     return _row_to_set(nums)
 
+def _infer_sep_read_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, sep=None, engine="python", dtype=str).fillna("")
+
+def _try_parse_15_numeric_columns(df: pd.DataFrame) -> List[Set[int]]:
+    if df.empty:
+        return []
+    candidate_cols = []
+    sample_n = min(50, len(df))
+    for col in df.columns:
+        vals = df[col].astype(str).head(sample_n).tolist()
+        valid = sum(1 for v in vals if _only_int_1_25(v) is not None)
+        ratio = valid / max(1, len(vals))
+        if ratio >= 0.70:
+            candidate_cols.append(col)
+    if len(candidate_cols) < 15:
+        return []
+    cols15 = candidate_cols[:15]
+    rows: List[Set[int]] = []
+    for _, r in df[cols15].iterrows():
+        nums: List[int] = []
+        for v in r.values:
+            iv = _only_int_1_25(v)
+            if iv is not None:
+                nums.append(iv)
+        s = _row_to_set(nums)
+        if len(s) == 15:
+            rows.append(s)
+    return rows
+
+def _try_parse_blob_column(df: pd.DataFrame) -> List[Set[int]]:
+    if df.empty:
+        return []
+    rows: List[Set[int]] = []
+    chosen = None
+    for col in df.columns:
+        sample = " ".join(df[col].astype(str).head(3).tolist())
+        hits = re.findall(r"\b0?([1-9]|1[0-9]|2[0-5])\b", sample)
+        if len(hits) >= 5:
+            chosen = col
+            break
+    if chosen is None:
+        return []
+    for v in df[chosen].astype(str):
+        s = _parse_line_blob(v)
+        if len(s) == 15:
+            rows.append(s)
+    return rows
+
 def carregar_historico(caminho: str | Path) -> List[Set[int]]:
-    """
-    Lê data/history.csv e retorna uma lista de conjuntos de 15 dezenas por concurso.
-    Formatos aceitos:
-      1) 15 colunas numéricas (ex.: d1..d15, n1..n15, d01..d15)
-      2) Uma coluna com string de dezenas separadas por espaço, vírgula ou ponto e vírgula.
-    """
     p = Path(caminho)
     if not p.exists():
         raise FileNotFoundError(f"Arquivo não encontrado: {p}")
-
-    # Lê tudo como string para tolerar zeros à esquerda e valores não limpos
-    df = pd.read_csv(p, dtype=str).fillna("")
-    if df.empty:
-        raise ValueError("Arquivo de histórico está vazio.")
-
-    # Normaliza nomes de colunas
-    cols_lower = [str(c).strip().lower() for c in df.columns]
-    df.columns = cols_lower
-
-    # Tentativa 1: detectar 15 colunas de dezenas
-    # Padrões comuns: d1..d15, n1..n15, d01..d15, n01..n15
-    candidatos = []
-    padroes = [
-        [f"d{i}" for i in range(1, 16)],
-        [f"n{i}" for i in range(1, 16)],
-        [f"d{i:02d}" for i in range(1, 16)],
-        [f"n{i:02d}" for i in range(1, 16)],
-    ]
-    for cand in padroes:
-        if all(c in df.columns for c in cand):
-            candidatos = cand
-            break
-
-    rows: List[Set[int]] = []
-
-    if candidatos:
-        sub = df[candidatos]
-        for _, r in sub.iterrows():
-            nums = []
-            for v in r.values:
-                v = str(v).strip()
-                if v.isdigit():
-                    nums.append(int(v))
-                else:
-                    v2 = re.sub(r"\D", "", v)
-                    if v2.isdigit():
-                        nums.append(int(v2))
-            s = _row_to_set(nums)
-            if len(s) == 15:
-                rows.append(s)
-    else:
-        # Tentativa 2: procurar uma coluna "blob" com as 15 dezenas
-        # Escolhe a primeira coluna que aparente conter listas
-        escolhido = None
-        for c in df.columns:
-            sample = " ".join(df[c].astype(str).head(3).tolist())
-            # Heurística simples: presença de números de 1..25
-            if re.search(r"\b0?([1-9]|1[0-9]|2[0-5])\b", sample):
-                escolhido = c
-                break
-        if not escolhido:
-            raise ValueError("Não encontrei 15 colunas de dezenas nem uma coluna com lista de dezenas.")
-        for v in df[escolhido].astype(str):
-            s = _parse_line_blob(v)
-            if len(s) == 15:
-                rows.append(s)
-
-    # Sanitização final
+    try:
+        df = _infer_sep_read_csv(p)
+    except Exception:
+        df = pd.read_csv(p, dtype=str).fillna("")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    rows = _try_parse_15_numeric_columns(df)
+    if not rows:
+        rows = _try_parse_blob_column(df)
     rows = [s for s in rows if len(s) == 15 and all(1 <= x <= 25 for x in s)]
     if not rows:
         raise ValueError("Não foi possível interpretar o histórico: nenhuma linha válida com 15 dezenas.")
     return rows
 
 def ultimos_n_concursos(historico: List[Set[int]], n: int) -> List[Set[int]]:
+    if n <= 0:
+        return []
+    return historico[-n:] if len(historico) > n else historico
+
     if n <= 0:
         return []
     return historico[-n:] if len(historico) > n else historico
