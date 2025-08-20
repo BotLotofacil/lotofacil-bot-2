@@ -4,10 +4,15 @@ import os
 import logging
 import traceback
 from typing import List, Set
+from datetime import datetime
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from core.generator import ApostaGenerator
 from dotenv import load_dotenv
+
+# --- Novos imports do gerador preditivo ---
+from utils.history import carregar_historico, ultimos_n_concursos
+from utils.predictor import Predictor, GeradorApostasConfig
 
 # ========================
 # Carrega variáveis de ambiente locais
@@ -24,6 +29,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========================
+# Parâmetros padrão do gerador
+# ========================
+JANELA_PADRAO = 200     # concursos usados no treino
+ALPHA_PADRAO = 0.35     # mistura uniforme vs estimado
+QTD_BILHETES_PADRAO = 3 # quantidade padrão de apostas por /gerar
+
+# ========================
 # Bot Principal
 # ========================
 class LotoFacilBot:
@@ -34,9 +46,9 @@ class LotoFacilBot:
         self.whitelist = self._carregar_whitelist()
         self._garantir_admin_na_whitelist()
         self.app = ApplicationBuilder().token(self.token).build()
-        self.generator = ApostaGenerator("data/history.csv")
         self._setup_handlers()
 
+    # ------------- Utilidades internas -------------
     def _get_bot_token(self) -> str:
         token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -46,7 +58,7 @@ class LotoFacilBot:
     def _get_admin_id(self) -> int:
         admin_id = os.getenv("ADMIN_TELEGRAM_ID")
         if not admin_id or not admin_id.isdigit():
-            raise EnvironmentError("❌ ADMIN_USER_ID não configurado corretamente.")
+            raise EnvironmentError("❌ ADMIN_TELEGRAM_ID não configurado corretamente.")
         return int(admin_id)
 
     def _carregar_whitelist(self) -> Set[int]:
@@ -69,6 +81,37 @@ class LotoFacilBot:
             self._salvar_whitelist()
             logging.info(f"✅ Administrador {self.admin_id} autorizado automaticamente.")
 
+    def _usuario_autorizado(self, user_id: int) -> bool:
+        return user_id in self.whitelist
+
+    # ------------- Gerador preditivo -------------
+    def _gerar_apostas_inteligentes(
+        self,
+        qtd: int = QTD_BILHETES_PADRAO,
+        janela: int = JANELA_PADRAO,
+        alpha: float = ALPHA_PADRAO
+    ) -> List[List[int]]:
+        """
+        Gera bilhetes usando o preditor sem enviesar.
+        Em caso de falha na leitura/treino, faz fallback para amostragem uniforme.
+        """
+        try:
+            historico = carregar_historico("data/history.csv")
+            janela_hist = ultimos_n_concursos(historico, max(30, int(janela)))
+
+            cfg = GeradorApostasConfig(janela=int(janela), alpha=float(alpha))
+            modelo = Predictor(cfg)
+            modelo.fit(janela_hist, janela=int(janela))
+            bilhetes = modelo.gerar_apostas(qtd=int(qtd))
+            return bilhetes
+        except Exception as e:
+            logger.error("Falha no gerador preditivo; aplicando fallback.\n" + traceback.format_exc())
+            import random
+            rng = random.Random()
+            qtd_seguro = max(1, int(qtd))
+            return [sorted(rng.sample(range(1, 26), 15)) for _ in range(qtd_seguro)]
+
+    # ------------- Handlers -------------
     def _setup_handlers(self):
         """Registra os comandos do bot"""
         self.app.add_handler(CommandHandler("start", self.start))
@@ -90,36 +133,56 @@ class LotoFacilBot:
         await update.message.reply_text(mensagem, parse_mode='HTML')
 
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Comando /gerar – Gera 3 apostas inteligentes (com verificação de autorização)"""
+        """
+        Comando /gerar – Gera apostas inteligentes (com verificação de autorização).
+        Uso opcional: /gerar [qtd] [janela] [alpha]
+        """
         user_id = update.effective_user.id
         logger.info(f"Comando /gerar chamado por {user_id}")
 
-        if user_id not in self.whitelist:
+        if not self._usuario_autorizado(user_id):
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
             return
 
+        # parâmetros padrão
+        qtd = QTD_BILHETES_PADRAO
+        janela = JANELA_PADRAO
+        alpha = ALPHA_PADRAO
+
+        # leitura opcional de argumentos
         try:
-            if not self.generator:
-                raise RuntimeError("Gerador de apostas não foi inicializado corretamente.")
+            if context.args and len(context.args) >= 1:
+                qtd = max(1, int(context.args[0]))
+            if context.args and len(context.args) >= 2:
+                janela = max(30, int(context.args[1]))  # mínimo razoável
+            if context.args and len(context.args) >= 3:
+                a = float(context.args[2])
+                alpha = a if 0.0 <= a <= 0.5 else ALPHA_PADRAO
+        except Exception:
+            # argumentos inválidos -> usa padrão
+            qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
 
-            apostas = await self.generator.gerar_apostas(n_apostas=3)
-            resposta = self._formatar_resposta(apostas)
+        try:
+            apostas = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alpha)
+            resposta = self._formatar_resposta(apostas, janela, alpha)
             await update.message.reply_text(resposta, parse_mode='HTML')
-
-        except Exception as e:
+        except Exception:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("❌ Erro ao gerar apostas. Tente novamente mais tarde.")
 
-    def _formatar_resposta(self, apostas: List[List[int]]) -> str:
-        """Formata a resposta com as apostas"""
-        resposta = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
+    def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
+        """Formata a resposta com as apostas no padrão atual."""
+        linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
         for i, aposta in enumerate(apostas, 1):
             pares = sum(1 for n in aposta if n % 2 == 0)
-            resposta.append(
+            linhas.append(
                 f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
                 f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
             )
-        return "\n".join(resposta)
+        linhas.append(
+            f"<i>janela={janela} | α={alpha:.2f} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%SZ')}</i>"
+        )
+        return "\n".join(linhas)
 
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /meuid – Retorna o ID do usuário"""
@@ -174,5 +237,6 @@ class LotoFacilBot:
 if __name__ == '__main__':
     bot = LotoFacilBot()
     bot.run()
+
 
 
