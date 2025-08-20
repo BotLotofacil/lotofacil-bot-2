@@ -5,6 +5,7 @@ import logging
 import traceback
 from typing import List, Set
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -36,6 +37,9 @@ logger = logging.getLogger(__name__)
 JANELA_PADRAO = 200     # concursos usados no treino
 ALPHA_PADRAO = 0.35     # mistura uniforme vs estimado
 QTD_BILHETES_PADRAO = 3 # quantidade padrão de apostas por /gerar
+
+SHOW_TIMESTAMP = True                 # False para ocultar a hora no /gerar
+TIMEZONE = "America/Sao_Paulo"        # Fuso para exibição do horário
 
 # ========================
 # Bot Principal
@@ -175,7 +179,7 @@ class LotoFacilBot:
             await update.message.reply_text("❌ Erro ao gerar apostas. Tente novamente mais tarde.")
 
     def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
-        """Formata a resposta com as apostas no padrão atual."""
+        """Formata a resposta com as apostas no padrão atual, com rodapé opcional."""
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
         for i, aposta in enumerate(apostas, 1):
             pares = sum(1 for n in aposta if n % 2 == 0)
@@ -183,9 +187,16 @@ class LotoFacilBot:
                 f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
                 f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
             )
-        linhas.append(
-            f"<i>janela={janela} | α={alpha:.2f} | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%SZ')}</i>"
-        )
+
+        if SHOW_TIMESTAMP:
+            try:
+                now_sp = datetime.now(ZoneInfo(TIMEZONE))
+                carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                # fallback seguro se o nome do fuso estiver incorreto
+                carimbo = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+            linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
+
         return "\n".join(linhas)
 
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
