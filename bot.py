@@ -10,9 +10,11 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
 
-# --- Novos imports do gerador preditivo ---
+# --- Imports do gerador preditivo ---
 from utils.history import carregar_historico, ultimos_n_concursos
 from utils.predictor import Predictor, GeradorApostasConfig
+# --- Import do backtest (novo) ---
+from utils.backtest import executar_backtest_resumido
 
 # ========================
 # Carrega variáveis de ambiente locais
@@ -104,7 +106,7 @@ class LotoFacilBot:
             modelo.fit(janela_hist, janela=int(janela))
             bilhetes = modelo.gerar_apostas(qtd=int(qtd))
             return bilhetes
-        except Exception as e:
+        except Exception:
             logger.error("Falha no gerador preditivo; aplicando fallback.\n" + traceback.format_exc())
             import random
             rng = random.Random()
@@ -119,6 +121,8 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("meuid", self.meuid))
         self.app.add_handler(CommandHandler("autorizar", self.autorizar))
         self.app.add_handler(CommandHandler("remover", self.remover))
+        # --- Handler do backtest (novo) ---
+        self.app.add_handler(CommandHandler("backtest", self.backtest))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /start – Mensagem de boas-vindas e aviso legal"""
@@ -226,6 +230,53 @@ class LotoFacilBot:
         else:
             await update.message.reply_text(f"ℹ️ Usuário {user_id} não está na whitelist.")
 
+    # ------------- Handler do backtest (novo) -------------
+    async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Comando oculto /backtest – somente admin.
+        Uso: /backtest [janela] [bilhetes_por_concurso] [alpha]
+        Exemplos:
+          /backtest
+          /backtest 200
+          /backtest 200 5
+          /backtest 200 5 0.35
+        """
+        user_id = update.effective_user.id
+        if user_id != self.admin_id:
+            # Silencioso para não expor o comando a não-admin
+            return
+
+        # Defaults
+        janela = 200
+        bilhetes_por_concurso = 5
+        alpha = 0.35
+
+        # Parse de argumentos opcionais
+        try:
+            if context.args and len(context.args) >= 1:
+                janela = max(30, int(context.args[0]))
+            if context.args and len(context.args) >= 2:
+                bilhetes_por_concurso = max(1, int(context.args[1]))
+            if context.args and len(context.args) >= 3:
+                a = float(context.args[2])
+                alpha = a if 0.0 <= a <= 0.5 else 0.35
+        except Exception:
+            await update.message.reply_text("Uso: /backtest [janela] [bilhetes_por_concurso] [alpha]")
+            return
+
+        try:
+            historico = carregar_historico("data/history.csv")
+            resumo = executar_backtest_resumido(
+                historico=historico,
+                janela=janela,
+                bilhetes_por_concurso=bilhetes_por_concurso,
+                alpha=alpha
+            )
+            await update.message.reply_text("📊 BACKTEST (rolling)\n" + resumo)
+        except Exception as e:
+            logger.error("Erro no backtest:\n" + traceback.format_exc())
+            await update.message.reply_text(f"Erro no backtest: {e}")
+
     def run(self):
         """Inicia o bot"""
         logger.info("Bot iniciado e aguardando comandos.")
@@ -237,6 +288,3 @@ class LotoFacilBot:
 if __name__ == '__main__':
     bot = LotoFacilBot()
     bot.run()
-
-
-
