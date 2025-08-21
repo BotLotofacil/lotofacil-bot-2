@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 # ========================
 # Parâmetros padrão do gerador
 # ========================
-JANELA_PADRAO = 200     # concursos usados no treino
-ALPHA_PADRAO = 0.35     # mistura uniforme vs estimado
+JANELA_PADRAO = 50     # concursos usados no treino
+ALPHA_PADRAO = 0.55     # mistura uniforme vs estimado
 QTD_BILHETES_PADRAO = 3 # quantidade padrão de apostas por /gerar
 
 SHOW_TIMESTAMP = True                 # False para ocultar a hora no /gerar
