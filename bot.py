@@ -3,7 +3,10 @@
 import os
 import logging
 import traceback
-from typing import List, Set
+import asyncio
+import re
+from functools import partial
+from typing import List, Set, Tuple, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -40,6 +43,11 @@ QTD_BILHETES_PADRAO = 3 # quantidade padrão de apostas por /gerar
 
 SHOW_TIMESTAMP = True                 # False para ocultar a hora no /gerar
 TIMEZONE = "America/Sao_Paulo"        # Fuso para exibição do horário
+
+# Limites defensivos
+JANELA_MIN, JANELA_MAX = 50, 1000
+ALPHA_MIN, ALPHA_MAX = 0.05, 0.95
+BILH_MIN, BILH_MAX   = 1, 20
 
 # ========================
 # Bot Principal
@@ -90,6 +98,9 @@ class LotoFacilBot:
     def _usuario_autorizado(self, user_id: int) -> bool:
         return user_id in self.whitelist
 
+    def _is_admin(self, user_id: int) -> bool:
+        return user_id == self.admin_id
+
     # ------------- Gerador preditivo -------------
     def _gerar_apostas_inteligentes(
         self,
@@ -116,6 +127,82 @@ class LotoFacilBot:
             rng = random.Random()
             qtd_seguro = max(1, int(qtd))
             return [sorted(rng.sample(range(1, 26), 15)) for _ in range(qtd_seguro)]
+
+    # ------------- Parse utilitário p/ backtest -------------
+    def _parse_backtest_args(self, args: List[str]) -> Tuple[int, int, float]:
+        """
+        Aceita:
+          - Posicional: /backtest [janela] [bilhetes_por_concurso] [alpha]
+          - Chave=valor: /backtest janela=200 bilhetes=5 alpha=0,45
+          - Aliases: j=, b=, a= funcionam
+        Retorna tupla validada (janela, bilhetes_por_concurso, alpha).
+        Aplica defaults/limites quando ausentes/fora de faixa.
+        """
+        # Defaults
+        janela = JANELA_PADRAO
+        bilhetes_por_concurso = 5
+        alpha = ALPHA_PADRAO
+
+        if not args:
+            return janela, bilhetes_por_concurso, alpha
+
+        # Normalização
+        joined = " ".join(args).strip()
+        joined = joined.replace(",", ".")
+        joined = re.sub(r"\bj\s*=", "janela=", joined)
+        joined = re.sub(r"\bb(ilhetes)?\s*=", "bilhetes=", joined)
+        joined = re.sub(r"\ba\s*=", "alpha=", joined)
+
+        # Se houver chave=valor, prioriza esse modo
+        has_kv = bool(re.search(r"\b(janela|bilhetes|alpha)\s*=", joined))
+
+        if has_kv:
+            m_j = re.search(r"\bjanela\s*=\s*(\d{1,5})\b", joined)
+            if m_j:
+                try:
+                    j_val = int(m_j.group(1))
+                    if JANELA_MIN <= j_val <= JANELA_MAX:
+                        janela = j_val
+                except ValueError:
+                    pass
+
+            m_b = re.search(r"\bbilhetes\s*=\s*(\d{1,3})\b", joined)
+            if m_b:
+                try:
+                    b_val = int(m_b.group(1))
+                    if BILH_MIN <= b_val <= BILH_MAX:
+                        bilhetes_por_concurso = b_val
+                except ValueError:
+                    pass
+
+            m_a = re.search(r"\balpha\s*=\s*([01]?(?:\.\d+)?)\b", joined)
+            if m_a:
+                try:
+                    a_val = float(m_a.group(1))
+                    if ALPHA_MIN <= a_val <= ALPHA_MAX:
+                        alpha = a_val
+                except ValueError:
+                    pass
+        else:
+            # Posicional
+            try:
+                if len(args) >= 1:
+                    j_val = int(args[0])
+                    if JANELA_MIN <= j_val <= JANELA_MAX:
+                        janela = j_val
+                if len(args) >= 2:
+                    b_val = int(args[1])
+                    if BILH_MIN <= b_val <= BILH_MAX:
+                        bilhetes_por_concurso = b_val
+                if len(args) >= 3:
+                    a_val = float(args[2].replace(",", "."))
+                    if ALPHA_MIN <= a_val <= ALPHA_MAX:
+                        alpha = a_val
+            except Exception:
+                # Ignora erro e mantém defaults já validados
+                pass
+
+        return janela, bilhetes_por_concurso, alpha
 
     # ------------- Handlers -------------
     def _setup_handlers(self):
@@ -164,8 +251,8 @@ class LotoFacilBot:
             if context.args and len(context.args) >= 2:
                 janela = max(30, int(context.args[1]))  # mínimo razoável
             if context.args and len(context.args) >= 3:
-                a = float(context.args[2])
-                alpha = a if 0.0 <= a <= 0.5 else ALPHA_PADRAO
+                a = float(context.args[2].replace(",", "."))
+                alpha = a if 0.0 < a < 1.0 else ALPHA_PADRAO
         except Exception:
             # argumentos inválidos -> usa padrão
             qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
@@ -193,7 +280,6 @@ class LotoFacilBot:
                 now_sp = datetime.now(ZoneInfo(TIMEZONE))
                 carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
             except Exception:
-                # fallback seguro se o nome do fuso estiver incorreto
                 carimbo = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
             linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
 
@@ -241,49 +327,57 @@ class LotoFacilBot:
         else:
             await update.message.reply_text(f"ℹ️ Usuário {user_id} não está na whitelist.")
 
-    # ------------- Handler do backtest (novo) -------------
+    # ------------- Handler do backtest (revisado) -------------
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando oculto /backtest – somente admin.
-        Uso: /backtest [janela] [bilhetes_por_concurso] [alpha]
-        Exemplos:
+        Uso:
           /backtest
           /backtest 200
           /backtest 200 5
           /backtest 200 5 0.35
+          /backtest janela=200 bilhetes=5 alpha=0,45
+        Limites:
+          janela:   50..1000
+          bilhetes: 1..20
+          alpha:    0.05..0.95
         """
         user_id = update.effective_user.id
-        if user_id != self.admin_id:
-            # Silencioso para não expor o comando a não-admin
+        if not self._is_admin(user_id):
+            # Silencioso para não expor o comando
             return
 
-        # Defaults
-        janela = 200
-        bilhetes_por_concurso = 5
-        alpha = 0.35
+        # Parse e validação
+        janela, bilhetes_por_concurso, alpha = self._parse_backtest_args(context.args)
 
-        # Parse de argumentos opcionais
-        try:
-            if context.args and len(context.args) >= 1:
-                janela = max(30, int(context.args[0]))
-            if context.args and len(context.args) >= 2:
-                bilhetes_por_concurso = max(1, int(context.args[1]))
-            if context.args and len(context.args) >= 3:
-                a = float(context.args[2])
-                alpha = a if 0.0 <= a <= 0.5 else 0.35
-        except Exception:
-            await update.message.reply_text("Uso: /backtest [janela] [bilhetes_por_concurso] [alpha]")
-            return
+        # Confirmação ao admin
+        await update.message.reply_text(
+            f"Executando backtest com janela={janela}, bilhetes={bilhetes_por_concurso}, alpha={alpha:.2f}..."
+        )
 
+        loop = asyncio.get_running_loop()
         try:
             historico = carregar_historico("data/history.csv")
-            resumo = executar_backtest_resumido(
+
+            func = partial(
+                executar_backtest_resumido,
                 historico=historico,
                 janela=janela,
                 bilhetes_por_concurso=bilhetes_por_concurso,
                 alpha=alpha
             )
+            resumo: str = await loop.run_in_executor(None, func)
+
+            # Resposta com truncamento defensivo
+            if len(resumo) > 4000:
+                resumo = resumo[:4000] + "\n\n[Saída truncada]"
             await update.message.reply_text("📊 BACKTEST (rolling)\n" + resumo)
+        except TypeError as te:
+            logger.error("Assinatura de executar_backtest_resumido não compatível:\n" + traceback.format_exc())
+            await update.message.reply_text(
+                "Erro: a função utils.backtest.executar_backtest_resumido não aceita os parâmetros esperados "
+                "(historico, janela, bilhetes_por_concurso, alpha). Ajuste a assinatura para compatibilidade."
+            )
         except Exception as e:
             logger.error("Erro no backtest:\n" + traceback.format_exc())
             await update.message.reply_text(f"Erro no backtest: {e}")
