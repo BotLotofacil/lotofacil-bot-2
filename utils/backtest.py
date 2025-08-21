@@ -12,9 +12,9 @@ ALPHA_MIN, ALPHA_MAX   = 0.05, 0.95
 BILH_MIN, BILH_MAX     = 1, 20
 
 # Padrões (mantenha alinhado ao bot.py)
-DEFAULT_JANELA  = 200
-DEFAULT_ALPHA   = 0.35
-DEFAULT_BILHETS = 5
+DEFAULT_JANELA  = 50
+DEFAULT_ALPHA   = 0.55
+DEFAULT_BILHETS = 3
 
 @dataclass
 class ResultadoBacktest:
