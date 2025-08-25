@@ -133,14 +133,14 @@ class LotoFacilBot:
         """
         Aceita:
           - Posicional: /backtest [janela] [bilhetes_por_concurso] [alpha]
-          - Chave=valor: /backtest janela=200 bilhetes=5 alpha=0,45
+          - Chave=valor: /backtest janela=200 bilhetes=3 alpha=0,45
           - Aliases: j=, b=, a= funcionam
         Retorna tupla validada (janela, bilhetes_por_concurso, alpha).
         Aplica defaults/limites quando ausentes/fora de faixa.
         """
         # Defaults
         janela = JANELA_PADRAO
-        bilhetes_por_concurso = 5
+        bilhetes_por_concurso = 3
         alpha = ALPHA_PADRAO
 
         if not args:
