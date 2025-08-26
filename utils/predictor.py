@@ -12,7 +12,7 @@ UNIFORME = 1.0 / 25.0  # prob. uniforme para cada dezena (1..25)
 class GeradorApostasConfig:
     """
     Parâmetros do gerador. Ajuste com cautela.
-    - janela: quantos concursos recentes usar para treinar.
+    - janela: quantos concursos recentes usar para treinar (>= 50 recomendado).
     - alpha: peso da estimativa vs uniforme (0..0.5 recomendado).
     - min_factor / max_factor: clipping relativo ao uniforme para limitar extremos.
     - repulsao_lift: força de penalização de pares com lift>1 (aparecem juntos além do esperado).
@@ -20,8 +20,8 @@ class GeradorApostasConfig:
     - temperatura: suaviza/acentua diferenças de score na escolha sequencial.
     - max_tentativas: robustez na geração de cada bilhete.
     """
-    janela: int = 200
-    alpha: float = 0.35
+    janela: int = 100
+    alpha: float = 0.45
     min_factor: float = 0.60
     max_factor: float = 1.80
     repulsao_lift: float = 0.25
@@ -81,7 +81,14 @@ class Predictor:
         """
         if not historico:
             raise ValueError("Histórico vazio.")
-        n = janela or self.cfg.janela
+
+        # janela efetiva: valor passado (se houver) ou default da config
+        n = int(janela or self.cfg.janela)
+        if n < 1:
+            n = 1
+        if n > len(historico):
+            n = len(historico)
+
         janelas = historico[-n:] if len(historico) > n else historico
 
         p_raw, lift = self._estimativas_basicas(janelas)
@@ -110,7 +117,7 @@ class Predictor:
         Score do candidato baseado em:
           - log-probabilidade estimada (estável numericamente)
           - penalização por coocorrência excessiva via lift
-          - balanceamentos suaves de paridade e faixa (1..12 vs 13..25)
+          - balanceamentos leves de paridade e faixa (1..12 vs 13..25)
         """
         p = float(self._p[cand - 1])
         base = math.log(max(p, 1e-12))
@@ -169,7 +176,7 @@ class Predictor:
         selecionados.sort()
         return selecionados
 
-    def gerar_apostas(self, qtd: int = 3, seed: int | None = None) -> List[List[int]]:
+    def gerar_apostas(self, qtd: int = 5, seed: int | None = None) -> List[List[int]]:
         """
         Gera 'qtd' bilhetes (listas ordenadas de 15 dezenas).
         Aplica checagens leves para evitar extremos improváveis.
