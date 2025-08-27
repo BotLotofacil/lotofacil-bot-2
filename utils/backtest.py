@@ -4,28 +4,43 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Set, Dict, Tuple
 
-from .predictor import Predictor, GeradorApostasConfig
+import numpy as np
+
+from .predictor import Predictor, GeradorApostasConfig, FilterConfig
 
 # Limites defensivos (mantenha alinhado ao bot.py)
 JANELA_MIN, JANELA_MAX = 50, 1000
 ALPHA_MIN, ALPHA_MAX   = 0.05, 0.95
 BILH_MIN, BILH_MAX     = 1, 20
 
-# Padrões (mantenha alinhado ao bot.py)
-DEFAULT_JANELA  = 50
-DEFAULT_ALPHA   = 0.55
-DEFAULT_BILHETS = 3
+# Padrões (alinhado ao bot.py revisado)
+DEFAULT_JANELA  = 100
+DEFAULT_ALPHA   = 0.30
+DEFAULT_BILHETS = 5
+
 
 @dataclass
 class ResultadoBacktest:
     total_concursos: int
     bilhetes_por_concurso: int
-    dist_acertos: Dict[int, int]   # mapa: acertos -> quantidade de bilhetes
+    dist_acertos: Dict[int, int]   # mapa: acertos -> quantidade de bilhetes (0..15)
     proporcao_11_mais: float       # razão de bilhetes com >= 11 acertos
     parametros_efetivos: Tuple[int, int, float]  # (janela, bilhetes, alpha)
+    # Métricas adicionais
+    media_por_aposta: float
+    desvio_por_aposta: float
+    minimo_por_aposta: int
+    maximo_por_aposta: int
+    minimo_pior_por_concurso: int
+    pct_concursos_pior_ge11: float
+    pct_concursos_melhor_ge11: float
+    pct_concursos_melhor_ge12: float
+    proporcao_12_mais: float       # razão de bilhetes com >= 12 acertos
+
 
 def _acertos(bilhete: List[int], sorteio: Set[int]) -> int:
     return len(set(bilhete) & sorteio)
+
 
 def _sanitize_historico(historico: List[Set[int]]) -> List[Set[int]]:
     """
@@ -41,6 +56,7 @@ def _sanitize_historico(historico: List[Set[int]]) -> List[Set[int]]:
         norm.append(s_norm)
     return norm
 
+
 def _validar_parametros(
     janela: int | None,
     bilhetes_por_concurso: int | None,
@@ -49,9 +65,9 @@ def _validar_parametros(
     """
     Aplica defaults e limites defensivos. Valores fora de faixa são ajustados (clamp).
     """
-    j = DEFAULT_JANELA if janela is None else int(janela)
+    j = DEFAULT_JANELA  if janela is None else int(janela)
     b = DEFAULT_BILHETS if bilhetes_por_concurso is None else int(bilhetes_por_concurso)
-    a = DEFAULT_ALPHA if alpha is None else float(alpha)
+    a = DEFAULT_ALPHA   if alpha is None else float(alpha)
 
     # clamp
     j = max(JANELA_MIN, min(JANELA_MAX, j))
@@ -59,6 +75,7 @@ def _validar_parametros(
     a = max(ALPHA_MIN,  min(ALPHA_MAX,  a))
 
     return j, b, a
+
 
 def executar_backtest(
     historico: List[Set[int]],
@@ -69,7 +86,7 @@ def executar_backtest(
     """
     Backtest rolling:
       Para cada t a partir de `janela`, treina no intervalo [t-janela, t) e avalia no concurso t.
-      Usa seed=t para reprodutibilidade.
+      Usa seed=t para reprodutibilidade na geração.
     Requisitos:
       - 'historico' deve conter sorteios com 15 dezenas válidas (1..25).
       - len(historico) > janela
@@ -88,28 +105,67 @@ def executar_backtest(
             f"len(historico)={len(historico)} <= janela={janela}."
         )
 
+    # Config padrão de produção para o gerador (alinhado ao bot.py)
+    filtro = FilterConfig(
+        paridade_min=6,
+        paridade_max=9,
+        col_min=1,
+        col_max=4,
+        relax_steps=2,
+    )
+
+    cfg_base = GeradorApostasConfig(
+        janela=janela,
+        alpha=alpha,
+        filtro=filtro,
+        pool_multiplier=3,
+    )
+
     dist: Dict[int, int] = {}
     total_bilhetes = 0
+    lista_acertos: List[int] = []
+    pior_por_concurso: List[int] = []
+    melhor_por_concurso: List[int] = []
 
     # Loop rolling
     for t in range(janela, len(historico)):
         treino = historico[t - janela: t]
         alvo = historico[t]
 
-        cfg = GeradorApostasConfig(janela=janela, alpha=alpha)
-        modelo = Predictor(cfg)
-        # Treina no histórico da janela
+        modelo = Predictor(cfg_base)
         modelo.fit(treino, janela=janela)
 
-        # Gera bilhetes de forma determinística por t
+        # Geração reprodutível por t
         bilhetes = modelo.gerar_apostas(qtd=bilhetes_por_concurso, seed=t)
+
+        acertos_concurso: List[int] = []
         for b in bilhetes:
             a = _acertos(b, alvo)
+            acertos_concurso.append(a)
             dist[a] = dist.get(a, 0) + 1
+            lista_acertos.append(a)
         total_bilhetes += len(bilhetes)
 
-    acima_11 = sum(v for k, v in dist.items() if k >= 11)
-    proporcao = (acima_11 / total_bilhetes) if total_bilhetes else 0.0
+        pior_por_concurso.append(min(acertos_concurso))
+        melhor_por_concurso.append(max(acertos_concurso))
+
+    # Estatísticas agregadas por aposta
+    arr = np.array(lista_acertos, dtype=float) if lista_acertos else np.array([], dtype=float)
+    media = float(arr.mean()) if arr.size else 0.0
+    desvio = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+    minimo = int(arr.min()) if arr.size else 0
+    maximo = int(arr.max()) if arr.size else 0
+    prop_11 = float((arr >= 11).mean()) if arr.size else 0.0
+    prop_12 = float((arr >= 12).mean()) if arr.size else 0.0
+
+    # Métricas por concurso (pior/melhor)
+    pior_arr = np.array(pior_por_concurso, dtype=float) if pior_por_concurso else np.array([], dtype=float)
+    melhor_arr = np.array(melhor_por_concurso, dtype=float) if melhor_por_concurso else np.array([], dtype=float)
+
+    min_pior = int(pior_arr.min()) if pior_arr.size else 0
+    pct_pior_ge11 = float((pior_arr >= 11).mean()) if pior_arr.size else 0.0
+    pct_melhor_ge11 = float((melhor_arr >= 11).mean()) if melhor_arr.size else 0.0
+    pct_melhor_ge12 = float((melhor_arr >= 12).mean()) if melhor_arr.size else 0.0
 
     # Preenche chaves ausentes (0..15) com zero para facilitar leitura/plot
     for k in range(0, 16):
@@ -122,9 +178,19 @@ def executar_backtest(
         total_concursos=(len(historico) - janela),
         bilhetes_por_concurso=bilhetes_por_concurso,
         dist_acertos=dist_ordenada,
-        proporcao_11_mais=proporcao,
+        proporcao_11_mais=prop_11,
         parametros_efetivos=(janela, bilhetes_por_concurso, alpha),
+        media_por_aposta=media,
+        desvio_por_aposta=desvio,
+        minimo_por_aposta=minimo,
+        maximo_por_aposta=maximo,
+        minimo_pior_por_concurso=min_pior,
+        pct_concursos_pior_ge11=pct_pior_ge11,
+        pct_concursos_melhor_ge11=pct_melhor_ge11,
+        pct_concursos_melhor_ge12=pct_melhor_ge12,
+        proporcao_12_mais=prop_12,
     )
+
 
 def executar_backtest_resumido(
     historico: List[Set[int]],
@@ -144,11 +210,24 @@ def executar_backtest_resumido(
         f"  janela={j} | bilhetes_por_concurso={b} | alpha={a:.2f}",
         f"Concursos avaliados: {r.total_concursos}",
         f"Bilhetes por concurso: {r.bilhetes_por_concurso}",
+        "",
         "Distribuição de acertos (acertos: quantidade):",
     ]
-    # Exibe de 15 até 8 (mais relevantes); abaixo de 8 costuma ser pouco útil, mas já está no dicionário se quiser inspecionar
-    for k in range(15, 7, -1):
+    for k in range(15, -1, -1):
         linhas.append(f"  {k}: {r.dist_acertos.get(k, 0)}")
 
-    linhas.append(f"Proporção de bilhetes com >=11 acertos: {r.proporcao_11_mais:.2%}")
+    linhas.extend([
+        "",
+        "Métricas por aposta:",
+        f"  Média: {r.media_por_aposta:.3f} | Desvio: {r.desvio_por_aposta:.3f}",
+        f"  Mín/Máx: {r.minimo_por_aposta} / {r.maximo_por_aposta}",
+        f"  %≥11 por aposta: {r.proporcao_11_mais:.2%}",
+        f"  %≥12 por aposta: {r.proporcao_12_mais:.2%}",
+        "",
+        "Por concurso (entre as apostas do concurso):",
+        f"  Mínimo (pior) observado: {r.minimo_pior_por_concurso}",
+        f"  % de concursos com pior ≥11: {r.pct_concursos_pior_ge11:.2%}",
+        f"  % de concursos com melhor ≥11: {r.pct_concursos_melhor_ge11:.2%}",
+        f"  % de concursos com melhor ≥12: {r.pct_concursos_melhor_ge12:.2%}",
+    ])
     return "\n".join(linhas)
