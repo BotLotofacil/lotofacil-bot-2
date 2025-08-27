@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 # --- Imports do gerador preditivo ---
 from utils.history import carregar_historico, ultimos_n_concursos
-from utils.predictor import Predictor, GeradorApostasConfig
+from utils.predictor import Predictor, GeradorApostasConfig, FilterConfig
 # --- Import do backtest ---
 from utils.backtest import executar_backtest_resumido
 
@@ -37,12 +37,12 @@ logger = logging.getLogger(__name__)
 # ========================
 # Parâmetros padrão do gerador
 # ========================
-# Definições padrão fixas (sem necessidade de passar argumentos no /gerar):
+# Definições padrão:
 #   - quantidade: 5 apostas
 #   - janela:     100 concursos do histórico
-#   - alpha:      0.45 (equilíbrio estatística vs uniforme)
+#   - alpha:      0.30 (recomendado para elevar %≥11 por aposta)
 JANELA_PADRAO = 100
-ALPHA_PADRAO = 0.45
+ALPHA_PADRAO = 0.30
 QTD_BILHETES_PADRAO = 5
 
 SHOW_TIMESTAMP = True
@@ -128,6 +128,7 @@ class LotoFacilBot:
     ) -> List[List[int]]:
         """
         Gera bilhetes usando o preditor configurado.
+        - Aplica pool (3x) e filtro pós-geração (pares 6–9; colunas 1–4; relaxamento).
         Em caso de falha, aplica fallback uniforme.
         """
         try:
@@ -135,7 +136,20 @@ class LotoFacilBot:
             historico = carregar_historico(HISTORY_PATH)
             janela_hist = ultimos_n_concursos(historico, janela)
 
-            cfg = GeradorApostasConfig(janela=janela, alpha=alpha)
+            filtro = FilterConfig(
+                paridade_min=6,
+                paridade_max=9,
+                col_min=1,
+                col_max=4,
+                relax_steps=2,
+            )
+
+            cfg = GeradorApostasConfig(
+                janela=janela,
+                alpha=alpha,
+                filtro=filtro,
+                pool_multiplier=3,
+            )
             modelo = Predictor(cfg)
             modelo.fit(janela_hist, janela=janela)
             return modelo.gerar_apostas(qtd=qtd)
@@ -150,7 +164,7 @@ class LotoFacilBot:
         """
         Aceita:
           - Posicional: /backtest [janela] [bilhetes_por_concurso] [alpha]
-          - Chave=valor: /backtest janela=200 bilhetes=5 alpha=0,45
+          - Chave=valor: /backtest janela=200 bilhetes=5 alpha=0,30
           - Aliases: j=, b=, a=
         Retorna parâmetros validados.
         """
@@ -202,7 +216,7 @@ class LotoFacilBot:
             "Este bot é apenas para fins estatísticos e recreativos. "
             "Não há garantia de ganhos na Lotofácil.\n\n"
             "🎉 <b>Bem-vindo</b>\n"
-            "Use /gerar para receber 5 apostas baseadas em 100 concursos e α=0.45.\n"
+            "Use /gerar para receber 5 apostas baseadas em 100 concursos e α=0,30.\n"
             "Use /meuid para obter seu identificador e solicitar autorização.\n"
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
@@ -211,7 +225,7 @@ class LotoFacilBot:
         """
         Comando /gerar – Gera apostas inteligentes.
         Uso: /gerar [qtd] [janela] [alpha]
-        Padrão: 5 apostas | janela=100 | α=0.45
+        Padrão: 5 apostas | janela=100 | α=0,30
         """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -287,7 +301,7 @@ class LotoFacilBot:
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando oculto /backtest – apenas admin.
-        Padrão: janela=100 | bilhetes=5 | α=0.45
+        Padrão: janela=100 | bilhetes=5 | α=0,30
         """
         user_id = update.effective_user.id
         if not self._is_admin(user_id):
@@ -324,4 +338,5 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
+
 
