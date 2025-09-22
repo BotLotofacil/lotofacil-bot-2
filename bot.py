@@ -9,17 +9,12 @@ from functools import partial
 from typing import List, Set, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from pathlib import Path  # <-- novo
+from pathlib import Path
+from os import getenv
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
-
-# --- Imports do gerador preditivo ---
-from utils.history import carregar_historico, ultimos_n_concursos
-from utils.predictor import Predictor, GeradorApostasConfig, FilterConfig
-# --- Import do backtest ---
-from utils.backtest import executar_backtest_resumido
 
 # ========================
 # Carrega variáveis de ambiente locais
@@ -36,12 +31,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========================
+# Imports do projeto (compatíveis: utils.* OU raiz)
+# ========================
+try:
+    # layout em pacote
+    from utils.history import carregar_historico, ultimos_n_concursos
+    from utils.predictor import Predictor, GeradorApostasConfig, FilterConfig
+    from utils.backtest import executar_backtest_resumido
+    LAYOUT = "utils"
+except Exception:
+    # layout na raiz
+    from history import carregar_historico, ultimos_n_concursos
+    from predictor import Predictor, GeradorApostasConfig, FilterConfig
+    from backtest import executar_backtest_resumido
+    LAYOUT = "root"
+    logger.info("Usando layout de módulos na raiz (history.py/predictor.py/backtest.py).")
+
+# ========================
 # Parâmetros padrão do gerador
 # ========================
-# Definições padrão:
-#   - quantidade: 5 apostas
-#   - janela:     100 concursos do histórico
-#   - alpha:      0.30 (recomendado para elevar %≥11 por aposta)
 JANELA_PADRAO = 100
 ALPHA_PADRAO = 0.30
 QTD_BILHETES_PADRAO = 5
@@ -59,6 +67,9 @@ WHITELIST_PATH = "whitelist.txt"
 
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
+
+# Identificação do build (para /versao)
+BUILD_TAG = getenv("BUILD_TAG", "unknown")
 
 # ========================
 # Bot Principal
@@ -259,6 +270,10 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("backtest", self.backtest))  # oculto (só admin)
         # --- Novo handler: /mestre ---
         self.app.add_handler(CommandHandler("mestre", self.mestre))
+        # Diagnóstico
+        self.app.add_handler(CommandHandler("ping", self.ping))
+        self.app.add_handler(CommandHandler("versao", self.versao))
+        logger.info("Handlers ativos: /start /gerar /mestre /meuid /autorizar /remover /backtest /ping /versao")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /start – mensagem de boas-vindas e aviso legal."""
@@ -570,6 +585,19 @@ class LotoFacilBot:
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
+    # --- Diagnóstico ---
+    async def ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("pong")
+
+    async def versao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        txt = (
+            f"🤖 Versão do bot\n"
+            f"- BUILD_TAG: <code>{BUILD_TAG}</code>\n"
+            f"- Import layout: <code>{LAYOUT}</code>\n"
+            f"- Comandos: /start /gerar /mestre /meuid /autorizar /remover /backtest /ping /versao"
+        )
+        await update.message.reply_text(txt, parse_mode="HTML")
+
     # --- Comandos auxiliares (meuid, autorizar, remover) ---
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -641,6 +669,8 @@ class LotoFacilBot:
 # ========================
 if __name__ == "__main__":
     bot = LotoFacilBot()
+    bot.run()
+
     bot.run()
 
 
