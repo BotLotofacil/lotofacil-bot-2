@@ -423,7 +423,7 @@ class LotoFacilBot:
                     break
         return sorted(aposta)
         
-        def _diversificar_mestre(self, apostas, ultimo, comp, max_rep_ultimo=7, min_mid=3, min_fortes=2):
+    def _diversificar_mestre(self, apostas, ultimo, comp, max_rep_ultimo=7, min_mid=3, min_fortes=2):
         """
         Aplica refinamentos determinísticos nas apostas geradas pelo Mestre:
         - Garante pelo menos 'min_fortes' dezenas de AUSENTES FORTES por aposta
@@ -549,7 +549,7 @@ class LotoFacilBot:
 
         return [sorted(a) for a in apostas]
     
-        def _gerar_mestre_por_ultimo_resultado(self, historico):
+    def _gerar_mestre_por_ultimo_resultado(self, historico):
         """
         Gera 10 apostas determinísticas a partir do último resultado:
         - 1x com 8R
