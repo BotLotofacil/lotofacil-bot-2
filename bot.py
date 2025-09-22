@@ -422,8 +422,134 @@ class LotoFacilBot:
                 if len(aposta) == 15:
                     break
         return sorted(aposta)
+        
+        def _diversificar_mestre(self, apostas, ultimo, comp, max_rep_ultimo=7, min_mid=3, min_fortes=2):
+        """
+        Aplica refinamentos determinísticos nas apostas geradas pelo Mestre:
+        - Garante pelo menos 'min_fortes' dezenas de AUSENTES FORTES por aposta
+        - Limita a repetição de cada dezena do último resultado a 'max_rep_ultimo'
+        - Garante pelo menos 'min_mid' dezenas na faixa [12..18] em cada aposta
+        Mantém paridade (7–8) e max_seq<=3 após cada ajuste.
+        """
+        from collections import Counter
 
-    def _gerar_mestre_por_ultimo_resultado(self, historico):
+        # 1) AUSENTES FORTES priorizados (ordem determinística)
+        #    Obs.: só contam se estiverem realmente ausentes (pertencem a 'comp').
+        preferidos = [20, 22, 24, 10, 12, 14, 16, 18]
+        ausentes_fortes = [n for n in preferidos if n in comp]
+
+        for idx, a in enumerate(apostas):
+            a = sorted(a)
+            # conta quantos fortes já estão
+            fortes_na_aposta = sum(1 for n in a if n in ausentes_fortes)
+            if fortes_na_aposta < min_fortes and ausentes_fortes:
+                # quantidade que falta incluir
+                faltam = min_fortes - fortes_na_aposta
+                # candidatos para remover: numeros do último resultado presentes na aposta
+                removiveis = sorted([x for x in a if x in ultimo], reverse=True)
+                for k in range(faltam):
+                    # seleciona um ausente forte que ainda não está na aposta
+                    add = next((c for c in ausentes_fortes if c not in a), None)
+                    if add is None:
+                        break
+                    # tenta remover do fim (maior) entre os que vieram do último
+                    rem = None
+                    for r in removiveis:
+                        if r in a:
+                            rem = r
+                            removiveis.remove(r)
+                            break
+                    # se não tiver ninguém do último para sair, remove o maior da aposta
+                    if rem is None:
+                        rem = a[-1]
+                    if rem == add:
+                        continue
+                    a.remove(rem)
+                    a.append(add)
+                    a.sort()
+                # reequilibra paridade/seq
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                apostas[idx] = a
+
+        # 2) LIMITAR REPETIÇÃO de dezenas do último resultado
+        # conta aparições atuais das dezenas do último nas 10 apostas
+        cnt = Counter()
+        for a in apostas:
+            for n in a:
+                if n in ultimo:
+                    cnt[n] += 1
+
+        # ordem determinística dos candidatos a reduzir (maiores primeiro)
+        excesso = [(n, cnt[n]) for n in sorted(ultimo, reverse=True) if cnt[n] > max_rep_ultimo]
+
+        if excesso and comp:
+            comp_ord = sorted(comp)  # base para substituições
+            # percorre cada dezena com excesso e reduz trocando em apostas "mais tardias"
+            for dezena, _ in excesso:
+                # enquanto a dezena ainda estourar o limite, substitui em algumas apostas
+                for i in range(len(apostas) - 1, -1, -1):
+                    if cnt[dezena] <= max_rep_ultimo:
+                        break
+                    a = apostas[i][:]
+                    if dezena not in a:
+                        continue
+                    # seleciona candidato do complemento que ainda não esteja na aposta
+                    add = next((c for c in comp_ord if c not in a), None)
+                    if add is None:
+                        break
+                    # remove a própria dezena do último (de preferência a maior ocorrência)
+                    a.remove(dezena)
+                    a.append(add)
+                    a.sort()
+                    # normaliza paridade/seq
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                    apostas[i] = a
+                    # atualiza contadores
+                    cnt[dezena] -= 1
+
+        # 3) GARANTIR FAIXA MÉDIA (12..18) mínima por aposta
+        mid_lo, mid_hi = 12, 18
+        for i, a in enumerate(apostas):
+            a = sorted(a)
+            mid = [n for n in a if mid_lo <= n <= mid_hi]
+            if len(mid) < min_mid:
+                need = min_mid - len(mid)
+                # preferir inserir ausentes da faixa média
+                candidatos_add = [n for n in sorted(comp) if mid_lo <= n <= mid_hi and n not in a]
+                # se faltar, completa com qqr número da faixa média (mesmo que venha do último)
+                if len(candidatos_add) < need:
+                    extras = [n for n in range(mid_lo, mid_hi + 1) if (n not in a)]
+                    for x in extras:
+                        if x not in candidatos_add:
+                            candidatos_add.append(x)
+                # para remover, preferir dezenas que NÃO são da faixa média e que sejam do último
+                candidatos_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi) and x in ultimo]
+                # se não houver suficientes, remove também fora da média mesmo não sendo do último
+                if len(candidatos_rem) < need:
+                    outros = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi)]
+                    for x in outros:
+                        if x not in candidatos_rem:
+                            candidatos_rem.append(x)
+                # aplica as trocas
+                j = 0
+                while need > 0 and j < len(candidatos_add) and j < len(candidatos_rem):
+                    add = candidatos_add[j]
+                    rem = candidatos_rem[j]
+                    if add == rem:
+                        j += 1
+                        continue
+                    if rem in a and add not in a:
+                        a.remove(rem)
+                        a.append(add)
+                        a.sort()
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        need -= 1
+                    j += 1
+                apostas[i] = a
+
+        return [sorted(a) for a in apostas]
+    
+        def _gerar_mestre_por_ultimo_resultado(self, historico):
         """
         Gera 10 apostas determinísticas a partir do último resultado:
         - 1x com 8R
@@ -464,6 +590,10 @@ class LotoFacilBot:
                     a.sort()
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
             apostas[-1] = a
+
+        # >>>>>> ADICIONE ESTAS 2 LINHAS <<<<<<
+        apostas = self._diversificar_mestre(apostas, ultimo=ultimo, comp=set(comp),
+                                            max_rep_ultimo=7, min_mid=3, min_fortes=2)
 
         return apostas
 
