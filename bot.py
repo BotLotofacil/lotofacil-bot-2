@@ -9,6 +9,7 @@ from functools import partial
 from typing import List, Set, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path  # <-- novo
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -67,8 +68,13 @@ class LotoFacilBot:
         self.token = self._get_bot_token()
         self.admin_id = self._get_admin_id()
         self.whitelist_path = WHITELIST_PATH
+
+        # Garante pastas/arquivos essenciais antes de qualquer IO
+        self._ensure_paths()
+
         self.whitelist = self._carregar_whitelist()
         self._garantir_admin_na_whitelist()
+
         self.app = ApplicationBuilder().token(self.token).build()
         # mapa de cooldown: {(chat_id, comando): timestamp}
         self._cooldown_map = {}
@@ -86,6 +92,30 @@ class LotoFacilBot:
         if not admin_id or not admin_id.isdigit():
             raise EnvironmentError("ADMIN_TELEGRAM_ID não configurado corretamente.")
         return int(admin_id)
+
+    def _ensure_paths(self):
+        """Garante que diretórios e arquivos base existam (sem criar history.csv)."""
+        # pasta data/
+        data_dir = Path(HISTORY_PATH).parent
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.warning(f"Não foi possível criar pasta de dados: {data_dir}")
+
+        # pasta do whitelist.txt (caso WHITELIST_PATH esteja em subpasta)
+        wl_dir = Path(self.whitelist_path).parent
+        try:
+            wl_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.warning(f"Não foi possível criar pasta do whitelist: {wl_dir}")
+
+        # se whitelist.txt não existir, cria vazio (admin será adicionado depois)
+        wl_file = Path(self.whitelist_path)
+        if not wl_file.exists():
+            try:
+                wl_file.write_text("", encoding="utf-8")
+            except Exception:
+                logger.warning("Não foi possível criar arquivo whitelist.txt")
 
     def _carregar_whitelist(self) -> Set[int]:
         """Carrega os IDs autorizados do arquivo de whitelist."""
@@ -342,7 +372,7 @@ class LotoFacilBot:
                 # troca o fim da sequência
                 subs = None
                 for c in comp:
-                    if (c-1 not in a) and (c+1 not in a):  # tenta não criar sequência nova
+                    if (c-1 not in a) and (c+1 not in a):  # tenta não criar nova sequência
                         subs = c
                         break
                 if subs is None:
@@ -612,6 +642,7 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
+
 
 
 
