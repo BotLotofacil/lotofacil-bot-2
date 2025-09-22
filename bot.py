@@ -208,6 +208,8 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("autorizar", self.autorizar))
         self.app.add_handler(CommandHandler("remover", self.remover))
         self.app.add_handler(CommandHandler("backtest", self.backtest))  # oculto (só admin)
+        # --- Novo handler: /mestre (preset do usuário) ---
+        self.app.add_handler(CommandHandler("mestre", self.mestre))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /start – mensagem de boas-vindas e aviso legal."""
@@ -265,6 +267,28 @@ class LotoFacilBot:
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
             linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
         return "\n".join(linhas)
+
+    # --- Novo comando: /mestre (preset Mestre – 10/50/0.30) ---
+    async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Preset 'Mestre': gera 10 apostas com janela=50 e alpha=0.30,
+        reaproveitando o mesmo pipeline do gerador e a mesma formatação.
+        """
+        user_id = update.effective_user.id
+        if not self._usuario_autorizado(user_id):
+            await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
+            return
+
+        qtd, janela, alpha = 10, 50, 0.30
+        try:
+            apostas = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alpha)
+            resposta = self._formatar_resposta(apostas, janela, alpha)
+            # Personaliza o título sem mudar o corpo
+            resposta = resposta.replace("SUAS APOSTAS INTELIGENTES", "SUAS APOSTAS INTELIGENTES — Preset Mestre")
+            await update.message.reply_text(resposta, parse_mode="HTML")
+        except Exception:
+            logger.error("Erro ao executar preset Mestre:\n" + traceback.format_exc())
+            await update.message.reply_text("Erro ao executar o preset Mestre. Tente novamente.")
 
     # --- Comandos auxiliares (meuid, autorizar, remover) ---
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
