@@ -56,6 +56,9 @@ BILH_MIN, BILH_MAX   = 1, 20
 HISTORY_PATH = "data/history.csv"
 WHITELIST_PATH = "whitelist.txt"
 
+# Cooldown (segundos) para evitar flood
+COOLDOWN_SECONDS = 10
+
 # ========================
 # Bot Principal
 # ========================
@@ -67,6 +70,8 @@ class LotoFacilBot:
         self.whitelist = self._carregar_whitelist()
         self._garantir_admin_na_whitelist()
         self.app = ApplicationBuilder().token(self.token).build()
+        # mapa de cooldown: {(chat_id, comando): timestamp}
+        self._cooldown_map = {}
         self._setup_handlers()
 
     # ------------- Utilidades internas -------------
@@ -109,6 +114,20 @@ class LotoFacilBot:
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id == self.admin_id
+
+    def _hit_cooldown(self, chat_id: int, comando: str) -> bool:
+        """
+        Retorna True se o cooldown ainda estiver ativo para (chat_id, comando).
+        Caso contrário, atualiza o timestamp e retorna False.
+        """
+        import time
+        key = (chat_id, comando)
+        now = time.time()
+        last = self._cooldown_map.get(key, 0)
+        if now - last < COOLDOWN_SECONDS:
+            return True
+        self._cooldown_map[key] = now
+        return False
 
     # --------- Validações e clamps de parâmetros ---------
     def _clamp_params(self, qtd: int, janela: int, alpha: float) -> Tuple[int, int, float]:
@@ -208,7 +227,7 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("autorizar", self.autorizar))
         self.app.add_handler(CommandHandler("remover", self.remover))
         self.app.add_handler(CommandHandler("backtest", self.backtest))  # oculto (só admin)
-        # --- Novo handler: /mestre (preset do usuário) ---
+        # --- Novo handler: /mestre ---
         self.app.add_handler(CommandHandler("mestre", self.mestre))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,27 +287,258 @@ class LotoFacilBot:
             linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
         return "\n".join(linhas)
 
-    # --- Novo comando: /mestre (preset Mestre – 10/50/0.30) ---
+    # ---------- Utilitários Mestre (baseado só no último resultado) ----------
+    @staticmethod
+    def _contar_pares(aposta):
+        return sum(1 for n in aposta if n % 2 == 0)
+
+    @staticmethod
+    def _max_seq(aposta):
+        """Maior sequência consecutiva (ex.: [7,8,9] = 3)."""
+        s = sorted(aposta)
+        best = cur = 1
+        for i in range(1, len(s)):
+            if s[i] == s[i-1] + 1:
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 1
+        return best
+
+    @staticmethod
+    def _complemento(last_set):
+        return [n for n in range(1, 26) if n not in last_set]
+
+    def _ajustar_paridade_e_seq(self, aposta, alvo_par=(7, 8), max_seq=3):
+        """
+        Ajusta determinísticamente a aposta para paridade 7–8 e máx. sequência 3,
+        trocando com números do complemento (1..25 \ aposta).
+        """
+        aposta = sorted(set(aposta))
+        comp = [n for n in range(1, 26) if n not in aposta]
+
+        def tentar_quebrar_sequencias(a):
+            # Se houver sequência > max_seq, substitui sempre o maior da sequência por um número do comp que não crie nova sequência
+            changed = False
+            while self._max_seq(a) > max_seq and comp:
+                s = sorted(a)
+                # encontra uma sequência longa
+                start = s[0]
+                run_len = 1
+                seqs = []
+                for i in range(1, len(s)):
+                    if s[i] == s[i-1] + 1:
+                        run_len += 1
+                    else:
+                        if run_len > 1:
+                            seqs.append((start, s[i-1], run_len))
+                        start = s[i]
+                        run_len = 1
+                if run_len > 1:
+                    seqs.append((start, s[-1], run_len))
+                # pega a maior sequência
+                seqs.sort(key=lambda t: t[2], reverse=True)
+                _, fim, _ = seqs[0]
+                # troca o fim da sequência
+                subs = None
+                for c in comp:
+                    if (c-1 not in a) and (c+1 not in a):  # tenta não criar sequência nova
+                        subs = c
+                        break
+                if subs is None:
+                    subs = comp[0]
+                a.remove(fim)
+                a.append(subs)
+                comp.remove(subs)
+                changed = True
+                a.sort()
+            return changed
+
+    def _construir_aposta_por_repeticao(self, last_sorted, comp_sorted, repeticoes, offset_last=0, offset_comp=0):
+        """
+        Monta uma aposta determinística com 'repeticoes' vindas do último resultado,
+        completando com ausentes. Usa offsets para variar jogos de forma reprodutível.
+        """
+        # seleciona 'repeticoes' do último resultado, rotacionando pelo offset
+        L = last_sorted
+        C = comp_sorted
+        base = L[offset_last % 15:] + L[:offset_last % 15]
+        manter = base[:repeticoes]  # repeticoes itens
+        # completa com ausentes (determinístico via offset_comp)
+        faltam = 15 - len(manter)
+        comp_rot = C[offset_comp % len(C):] + C[:offset_comp % len(C)]
+        completar = comp_rot[:faltam]
+        aposta = sorted(set(manter + completar))
+        # garante 15
+        if len(aposta) < 15:
+            for n in C:
+                if n not in aposta:
+                    aposta.append(n)
+                if len(aposta) == 15:
+                    break
+        return sorted(aposta)
+
+    def _gerar_mestre_por_ultimo_resultado(self, historico):
+        """
+        Gera 10 apostas determinísticas a partir do último resultado:
+        - 1x com 8R
+        - 1x com 11R
+        - demais com 9–10R
+        Regras: paridade 7–8 e max_seq=3, cobrindo ausentes.
+        """
+        ultimo = sorted(historico[-1])
+        comp = self._complemento(set(ultimo))
+
+        # plano de repetição (10 jogos): 10,10,9,9,10,9,10,8,11,10
+        planos = [10, 10, 9, 9, 10, 9, 10, 8, 11, 10]
+
+        apostas = []
+        for i, r in enumerate(planos):
+            aposta = self._construir_aposta_por_repeticao(
+                last_sorted=ultimo,
+                comp_sorted=comp,
+                repeticoes=r,
+                offset_last=i,    # rotaciona quais dezenas do último ficam/saem
+                offset_comp=i*2,  # rotaciona quais ausentes entram
+            )
+            aposta = self._ajustar_paridade_e_seq(aposta, alvo_par=(7, 8), max_seq=3)
+            apostas.append(aposta)
+
+        # cobertura de ausentes: se algum ausente não entrou em nenhuma aposta, force inclusão trocando da última aposta
+        ausentes = set(comp)
+        presentes_em_alguma = set(n for a in apostas for n in a)
+        faltantes = [n for n in ausentes if n not in presentes_em_alguma]
+        if faltantes:
+            a = apostas[-1][:]
+            for n in faltantes:
+                # substitui o maior número da aposta que pertence ao último resultado para inserir um ausente
+                subs_idx = next((idx for idx, x in enumerate(reversed(a)) if x in ultimo), None)
+                if subs_idx is not None:
+                    idx_real = len(a) - 1 - subs_idx
+                    a[idx_real] = n
+                    a.sort()
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            apostas[-1] = a
+
+        return apostas
+
+    def _ajustar_paridade_e_seq(self, aposta, alvo_par=(7, 8), max_seq=3):
+        """
+        Ajusta determinísticamente a aposta para paridade 7–8 e máx. sequência 3,
+        trocando com números do complemento (1..25 \ aposta).
+        """
+        aposta = sorted(set(aposta))
+        comp = [n for n in range(1, 26) if n not in aposta]
+
+        def tentar_quebrar_sequencias(a):
+            changed = False
+            while self._max_seq(a) > max_seq and comp:
+                s = sorted(a)
+                start = s[0]
+                run_len = 1
+                seqs = []
+                for i in range(1, len(s)):
+                    if s[i] == s[i-1] + 1:
+                        run_len += 1
+                    else:
+                        if run_len > 1:
+                            seqs.append((start, s[i-1], run_len))
+                        start = s[i]
+                        run_len = 1
+                if run_len > 1:
+                    seqs.append((start, s[-1], run_len))
+                seqs.sort(key=lambda t: t[2], reverse=True)
+                _, fim, _ = seqs[0]
+                subs = None
+                for c in comp:
+                    if (c-1 not in a) and (c+1 not in a):
+                        subs = c
+                        break
+                if subs is None:
+                    subs = comp[0]
+                a.remove(fim)
+                a.append(subs)
+                comp.remove(subs)
+                changed = True
+                a.sort()
+            return changed
+
+        def tentar_ajustar_paridade(a):
+            min_par, max_par = alvo_par
+            pares = self._contar_pares(a)
+            if pares > max_par:
+                rem = next((x for x in a if x % 2 == 0), None)
+                add = next((c for c in comp if c % 2 == 1), None)
+            elif pares < min_par:
+                rem = next((x for x in a if x % 2 == 1), None)
+                add = next((c for c in comp if c % 2 == 0), None)
+            else:
+                return False
+            if rem is not None and add is not None:
+                a.remove(rem)
+                a.append(add)
+                comp.remove(add)
+                a.sort()
+                return True
+            return False
+
+        for _ in range(10):
+            m1 = tentar_quebrar_sequencias(aposta)
+            m2 = tentar_ajustar_paridade(aposta)
+            if not m1 and not m2:
+                break
+        return sorted(aposta)
+
+    # --- Novo comando: /mestre (idêntico ao nosso fluxo manual) ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Preset 'Mestre': gera 10 apostas com janela=50 e alpha=0.30,
-        reaproveitando o mesmo pipeline do gerador e a mesma formatação.
+        Preset 'Mestre' baseado APENAS no último resultado do histórico.
+        - Gera 10 apostas determinísticas (9R–10R + 1x 8R + 1x 11R)
+        - Paridade 7–8 e máx. sequência = 3
+        - Cobre ausentes ao longo do pacote
         """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
             return
 
-        qtd, janela, alpha = 10, 50, 0.30
+        # cooldown por chat
+        chat_id = update.effective_chat.id
+        if self._hit_cooldown(chat_id, "mestre"):
+            await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre novamente.")
+            return
+
+        # carrega histórico e pega somente o último resultado
         try:
-            apostas = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alpha)
-            resposta = self._formatar_resposta(apostas, janela, alpha)
-            # Personaliza o título sem mudar o corpo
-            resposta = resposta.replace("SUAS APOSTAS INTELIGENTES", "SUAS APOSTAS INTELIGENTES — Preset Mestre")
-            await update.message.reply_text(resposta, parse_mode="HTML")
-        except Exception:
-            logger.error("Erro ao executar preset Mestre:\n" + traceback.format_exc())
-            await update.message.reply_text("Erro ao executar o preset Mestre. Tente novamente.")
+            historico = carregar_historico(HISTORY_PATH)
+            if not historico:
+                await update.message.reply_text("Erro: histórico vazio.")
+                return
+        except Exception as e:
+            await update.message.reply_text(f"Erro ao carregar histórico: {e}")
+            return
+
+        try:
+            apostas = self._gerar_mestre_por_ultimo_resultado(historico)
+        except Exception as e:
+            logger.error("Erro no preset Mestre (último resultado):\n" + traceback.format_exc())
+            await update.message.reply_text(f"Erro no preset Mestre: {e}")
+            return
+
+        # formatação
+        linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Preset Mestre</b> 🎰\n"]
+        for i, aposta in enumerate(apostas, 1):
+            pares = self._contar_pares(aposta)
+            linhas.append(
+                f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
+                f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
+            )
+        if SHOW_TIMESTAMP:
+            now_sp = datetime.now(ZoneInfo(TIMEZONE))
+            carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+            linhas.append(f"<i>base=último resultado | paridade=7–8 | max_seq=3 | {carimbo}</i>")
+
+        await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
     # --- Comandos auxiliares (meuid, autorizar, remover) ---
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,5 +612,6 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
+
 
 
