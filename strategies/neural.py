@@ -20,3 +20,4 @@ class NeuralStrategy:
         """Simula uma aposta como se fosse gerada por uma rede neural"""
         return sorted(random.sample(range(1, 26), 15))
 
+
