@@ -20,5 +20,8 @@ COPY . .
 # Variável de ambiente (será sobrescrita em produção)
 ENV TELEGRAM_BOT_TOKEN=changeme
 
+# Garante diretório de dados
+RUN mkdir -p /app/data
+
 # Inicia o bot
 CMD ["python", "bot.py"]
