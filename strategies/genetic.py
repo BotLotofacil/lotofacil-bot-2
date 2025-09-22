@@ -1,5 +1,4 @@
 # strategies/genetic.py
-
 import random
 from typing import List
 
@@ -16,6 +15,7 @@ class GeneticStrategy:
         """Executa uma única aposta"""
         return self._gerar_individuo()
 
+    # --- Interno ---
     def _gerar_individuo(self) -> List[int]:
         # Seleção dos pais
         pai1 = random.choice(self.populacao_base)
@@ -31,15 +31,11 @@ class GeneticStrategy:
             if n not in filho:
                 filho.append(n)
 
-        # Se por alguma falha ainda estiver menor, completa com números restantes
-        if len(filho) < 15:
-            restantes = [n for n in range(1, 26) if n not in filho]
-            filho.extend(random.sample(restantes, 15 - len(filho)))
-
         # Garantir exatamente 15 números únicos
         filho = list(set(filho))
         if len(filho) > 15:
             filho = random.sample(filho, 15)
 
         return sorted(filho)
+
 
