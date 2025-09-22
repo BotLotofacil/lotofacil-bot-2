@@ -1,7 +1,11 @@
 # Dockerfile
 
-# Imagem base enxuta com Python
+# Imagem base enxuta com Python 3.10 (compatível com TF 2.14)
 FROM python:3.10-slim
+
+# Boas práticas de runtime
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # Define diretório de trabalho dentro do container
 WORKDIR /app
@@ -13,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia o restante do código do projeto
 COPY . .
 
-# Define a variável de ambiente (pode ser sobrescrita no Railway)
+# Variável de ambiente (será sobrescrita em produção)
 ENV TELEGRAM_BOT_TOKEN=changeme
 
 # Inicia o bot
