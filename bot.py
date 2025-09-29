@@ -52,7 +52,7 @@ except Exception:
 # Parâmetros padrão do gerador
 # ========================
 JANELA_PADRAO = 50
-ALPHA_PADRAO = 0.40
+ALPHA_PADRAO = 0.55
 QTD_BILHETES_PADRAO = 5
 
 SHOW_TIMESTAMP = True
@@ -292,7 +292,7 @@ class LotoFacilBot:
         """
         Comando /gerar – Gera apostas inteligentes.
         Uso: /gerar [qtd] [janela] [alpha]
-        Padrão: 5 apostas | janela=100 | α=0,30
+        Padrão: 5 apostas | janela=50 | α=0,55
         """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -736,7 +736,7 @@ class LotoFacilBot:
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando oculto /backtest – apenas admin.
-        Padrão: janela=100 | bilhetes=5 | α=0,30
+        Padrão: janela=30 | bilhetes=3 | α=0,55
         """
         user_id = update.effective_user.id
         if not self._is_admin(user_id):
