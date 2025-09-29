@@ -40,8 +40,8 @@ class GeradorApostasConfig:
     - filtro: regras simples de qualidade aplicadas após a geração.
     - pool_multiplier: fator para gerar um pool maior e então filtrar (>=1).
     """
-    janela: int = 100
-    alpha: float = 0.45
+    janela: int = 50
+    alpha: float = 0.55
     min_factor: float = 0.60
     max_factor: float = 1.80
     repulsao_lift: float = 0.25
