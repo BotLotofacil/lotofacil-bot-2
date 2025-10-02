@@ -600,6 +600,67 @@ class LotoFacilBot:
                 break
         return apostas
 
+    # --------- Passe final para garantir regras após ajustes ---------
+    def _finalizar_regras_mestre(self, apostas, ultimo, comp, anchors):
+        """
+        Passes finais: reforça paridade 7–8 e max_seq<=3, reequilibra ausentes (min/max)
+        e aplica um anti-overlap final. Evita que passos anteriores reintroduzam falhas.
+        """
+        from collections import Counter
+
+        # 1) Normalização individual (paridade e sequência)
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+
+        # 2) Re-checagem de distribuição de ausentes (min/max)
+        comp_set = set(comp)
+        comp_list = sorted(comp_set)
+        min_per_absent = 2 if len(comp_list) <= 10 else 1
+        max_per_absent = 5
+
+        cnt_abs = Counter()
+        for a in apostas:
+            for n in a:
+                if n in comp_set:
+                    cnt_abs[n] += 1
+
+        # 2a) Força mínimos de presença para ausentes
+        for n in comp_list:
+            while cnt_abs[n] < min_per_absent:
+                idx = min(range(len(apostas)), key=lambda k: sum(1 for x in apostas[k] if x in comp_set))
+                alvo = apostas[idx][:]
+                rem = next((x for x in sorted(alvo, reverse=True) if x in ultimo and x not in anchors), None)
+                if rem is None or n in alvo:
+                    break
+                alvo.remove(rem); alvo.append(n); alvo.sort()
+                alvo = self._ajustar_paridade_e_seq(alvo, alvo_par=(7, 8), max_seq=3)
+                apostas[idx] = alvo
+                cnt_abs[n] += 1
+
+        # 2b) Corta excessos acima do teto
+        for n in comp_list:
+            while cnt_abs[n] > max_per_absent:
+                idx = max(
+                    range(len(apostas)),
+                    key=lambda k: (n in apostas[k]) + sum(1 for x in apostas[k] if x in comp_set)
+                )
+                a = apostas[idx][:]
+                if n not in a:
+                    break
+                cand_add = next((u for u in ultimo if u not in a and u not in anchors), None)
+                if cand_add is None:
+                    cand_add = next((u for u in ultimo if u not in a), None)
+                if cand_add is None:
+                    break
+                a.remove(n); a.append(cand_add); a.sort()
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                apostas[idx] = a
+                cnt_abs[n] -= 1
+
+        # 3) Normalização final + anti-overlap (anti-overlap é a porta de saída)
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
+        return apostas
+
     # --------- Gerador mestre (com seed por usuário/chat) ---------
     def _gerar_mestre_por_ultimo_resultado(self, historico, seed: int | None = None):
         """
@@ -733,6 +794,8 @@ class LotoFacilBot:
         )
         # Anti-overlap final (interseção máxima = 11)
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
+        # PASSE FINAL: garante regras após todos os ajustes (paridade/seq + dist. ausentes + novo overlap)
+        apostas = self._finalizar_regras_mestre(apostas, ultimo=ultimo, comp=comp, anchors=anchors)
 
         return apostas
 
@@ -884,3 +947,4 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
+
