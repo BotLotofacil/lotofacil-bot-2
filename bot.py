@@ -52,7 +52,7 @@ except Exception:
 # Parâmetros padrão do gerador
 # ========================
 JANELA_PADRAO = 80
-ALPHA_PADRAO = 0.35
+ALPHA_PADRAO = 0.36
 QTD_BILHETES_PADRAO = 5
 
 SHOW_TIMESTAMP = True
