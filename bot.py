@@ -75,7 +75,7 @@ BUILD_TAG = getenv("BUILD_TAG", "unknown")
 # ========================
 # Heurísticas adicionais (Mestre + A/B)
 # ========================
-# Pares cuja coocorrência derrubou média no concurso 3506
+# Pares cuja coocorrência derrubou média em análises anteriores
 PARES_PENALIZADOS = {(23, 2), (22, 19), (24, 20), (11, 1)}
 # Conjunto de “ruídos” com cap de frequência por lote (Mestre)
 RUIDOS = {2, 1, 14, 19, 20, 10, 7, 15, 21, 9}
@@ -725,7 +725,6 @@ class LotoFacilBot:
         Se exceder, substitui em apostas onde o ruído aparece por um candidato seguro do complemento.
         """
         from collections import Counter
-        # Contagem de presença de cada ruído por aposta (não por slots)
         pres = Counter()
         for a in apostas:
             sa = set(a)
@@ -737,12 +736,10 @@ class LotoFacilBot:
         comp_pool = sorted(set(comp))
         for r in sorted(RUIDOS):
             while pres[r] > RUIDO_CAP_POR_LOTE and comp_pool:
-                # escolhe uma aposta (do fim p/ início) que contenha r
                 idx = next((i for i in range(len(apostas)-1, -1, -1) if r in apostas[i]), None)
                 if idx is None:
                     break
                 a = apostas[idx][:]
-                # escolhe add do comp que não crie sequência longa
                 add = None
                 for c in comp_pool:
                     if c not in a and (c-1 not in a) and (c+1 not in a):
@@ -752,7 +749,6 @@ class LotoFacilBot:
                     add = comp_pool[0] if comp_pool else None
                 if add is None:
                     break
-                # remove r (se não for âncora) ou outro não-âncora
                 rem = r if r not in anchors else next((x for x in reversed(a) if x not in anchors), None)
                 if rem is None or rem not in a:
                     break
@@ -788,7 +784,6 @@ class LotoFacilBot:
                 freq[n] += 1
 
         # âncoras adaptativas:
-        # 1) prioriza 13 (se estiver no último), 2) co-âncora entre {25,3,17}, 3) completa com quentes
         prefer = []
         if 13 in ultimo:
             prefer.append(13)
@@ -810,7 +805,6 @@ class LotoFacilBot:
 
         apostas = []
         for i, r in enumerate(planos):
-            # offsets derivados da seed (mantendo faixas válidas)
             off_last = (i + seed) % 15
             off_comp = (i * 2 + seed // 15) % len(comp) if len(comp) > 0 else 0
 
@@ -838,12 +832,11 @@ class LotoFacilBot:
                         aposta.append(add)
                         aposta.sort()
 
-            # normaliza e quebra pares penalizados
             aposta = self._ajustar_paridade_e_seq(aposta, alvo_par=(7, 8), max_seq=3)
             aposta, _ = self._quebrar_pares_ruins(aposta, comp=comp, anchors=set(anchors))
             apostas.append(aposta)
 
-        # cobertura de ausentes: se algum ausente não entrou em nenhuma aposta, força na última aposta
+        # cobertura de ausentes
         ausentes = set(comp)
         presentes_em_alguma = set(n for a in apostas for n in a)
         faltantes = [n for n in ausentes if n not in presentes_em_alguma]
@@ -851,7 +844,6 @@ class LotoFacilBot:
             a = apostas[-1][:]
             for n in faltantes:
                 subs_idx = next((idx for idx, x in enumerate(reversed(a)) if x in ultimo), None)
-            # substitui pelos faltantes
                 if subs_idx is not None:
                     idx_real = len(a) - 1 - subs_idx
                     a[idx_real] = n
@@ -863,8 +855,8 @@ class LotoFacilBot:
         # ===== Balanceamento de AUSENTES (min/max por dezena) =====
         from collections import Counter
         comp_list = list(comp)
-        min_per_absent = 2 if len(comp_list) <= 10 else 1  # cada ausente aparece pelo menos 2× (ou 1×)
-        max_per_absent = 5                                 # teto para não inflar demais
+        min_per_absent = 2 if len(comp_list) <= 10 else 1
+        max_per_absent = 5
 
         cnt_abs = Counter()
         for a in apostas:
@@ -914,7 +906,7 @@ class LotoFacilBot:
         apostas = [self._quebrar_pares_ruins(a, comp=comp, anchors=set(anchors))[0] for a in apostas]
         # Anti-overlap final (interseção máxima = 11)
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
-        # Passe final: garante regras após os ajustes (paridade/seq + dist. ausentes + overlap)
+        # Passe final
         apostas = self._finalizar_regras_mestre(apostas, ultimo=ultimo, comp=comp, anchors=anchors)
 
         return apostas
@@ -995,6 +987,37 @@ class LotoFacilBot:
         )
         await update.message.reply_text(txt, parse_mode="HTML")
 
+    # --- Auxiliares de acesso (repostos para corrigir o erro) ---
+    async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        await update.message.reply_text(
+            f"🆔 Seu ID: <code>{user_id}</code>\nUse este código para liberação.",
+            parse_mode="HTML",
+        )
+
+    async def autorizar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.admin_id:
+            return await update.message.reply_text("⛔ Você não tem permissão.")
+        if len(context.args) != 1 or not context.args[0].isdigit():
+            return await update.message.reply_text("Uso: /autorizar <ID>")
+        user_id = int(context.args[0])
+        self.whitelist.add(user_id)
+        self._salvar_whitelist()
+        await update.message.reply_text(f"✅ Usuário {user_id} autorizado.")
+
+    async def remover(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != self.admin_id:
+            return await update.message.reply_text("⛔ Você não tem permissão.")
+        if len(context.args) != 1 or not context.args[0].isdigit():
+            return await update.message.reply_text("Uso: /remover <ID>")
+        user_id = int(context.args[0])
+        if user_id in self.whitelist:
+            self.whitelist.remove(user_id)
+            self._salvar_whitelist()
+            await update.message.reply_text(f"✅ Usuário {user_id} removido.")
+        else:
+            await update.message.reply_text("ℹ️ Usuário não está na whitelist.")
+
     # --- A/B técnico: gera dois lotes com a mesma janela e qtd, variando alpha ---
     async def ab(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -1004,11 +1027,9 @@ class LotoFacilBot:
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
-        # cooldown por chat
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "ab"):
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /ab novamente.")
-        # parse
         try:
             qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
             janela = int(context.args[1]) if len(context.args) >= 2 else 60
@@ -1016,17 +1037,14 @@ class LotoFacilBot:
             alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
         except Exception:
             qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
-        # clamp
         qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
         _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
-        # geração (usa o gerador padrão, não o Mestre)
         try:
             apostasA = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaA)
             apostasB = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaB)
         except Exception:
             logger.error("Erro no /ab:\n" + traceback.format_exc())
             return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
-        # formato
         def _fmt(tag, aps):
             linhas = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
             for i, a in enumerate(aps, 1):
@@ -1085,5 +1103,6 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
+
 
 
