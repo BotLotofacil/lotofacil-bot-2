@@ -85,6 +85,12 @@ RUIDO_CAP_POR_LOTE = 6
 ALPHA_TEST_B = 0.38
 
 # ========================
+# Ciclo C (ancorado no último resultado)
+# ========================
+CICLO_C_ANCHORS = (9, 11)
+CICLO_C_PLANOS = [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
+
+# ========================
 # Bot Principal
 # ========================
 class LotoFacilBot:
@@ -910,6 +916,79 @@ class LotoFacilBot:
         apostas = self._finalizar_regras_mestre(apostas, ultimo=ultimo, comp=comp, anchors=anchors)
 
         return apostas
+
+    # --------- Gerador Ciclo C (ancorado no último resultado) ---------
+    def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
+        if not historico:
+            raise ValueError("Histórico vazio no Ciclo C.")
+        ultimo = sorted(historico[-1])
+        u_set = set(ultimo)
+        comp = self._complemento(u_set)
+        anchors = set(CICLO_C_ANCHORS)
+
+        apostas = []
+        for i, repeticoes in enumerate(CICLO_C_PLANOS):
+            off_last = (i * 3) % 15
+            off_comp = (i * 5) % max(1, len(comp))
+            a = self._construir_aposta_por_repeticao(
+                last_sorted=ultimo,
+                comp_sorted=comp,
+                repeticoes=repeticoes,
+                offset_last=off_last,
+                offset_comp=off_comp,
+            )
+            for anc in anchors:
+                if anc not in a:
+                    rem = next((x for x in a if x in u_set and x not in anchors), None)
+                    if rem is None:
+                        rem = next((x for x in reversed(a) if x not in anchors), None)
+                    if rem is not None and rem != anc:
+                        a.remove(rem); a.append(anc); a.sort()
+
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+
+            mid_lo, mid_hi = 12, 18
+            mid = [n for n in a if mid_lo <= n <= mid_hi]
+            if len(mid) < 3:
+                need = 3 - len(mid)
+                cand_add = [n for n in comp if mid_lo <= n <= mid_hi and n not in a]
+                cand_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi)]
+                j = 0
+                while need > 0 and j < len(cand_add) and j < len(cand_rem):
+                    add, rem = cand_add[j], cand_rem[j]
+                    if rem in anchors:
+                        j += 1; continue
+                    if add not in a and rem in a:
+                        a.remove(rem); a.append(add); a.sort()
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        need -= 1
+                    j += 1
+
+            apostas.append(sorted(a))
+
+        ausentes = set(comp)
+        presentes = set(n for ap in apostas for n in ap)
+        faltantes = [n for n in ausentes if n not in presentes]
+        if faltantes:
+            a = apostas[-1][:]
+            for n in faltantes:
+                rem = next((x for x in reversed(a) if x in u_set and x not in anchors), None)
+                if rem is None: break
+                if n not in a:
+                    a.remove(rem); a.append(n); a.sort()
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            apostas[-1] = a
+
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+        return apostas
+
+    @staticmethod
+    def _contar_repeticoes(aposta, ultimo):
+        u = set(ultimo)
+        return sum(1 for n in aposta if n in u)
+
 
     # --- Novo comando: /mestre ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
