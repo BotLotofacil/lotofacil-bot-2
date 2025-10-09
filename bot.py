@@ -1018,11 +1018,22 @@ class LotoFacilBot:
         else:
             await update.message.reply_text("ℹ️ Usuário não está na whitelist.")
 
-    # --- A/B técnico: gera dois lotes com a mesma janela e qtd, variando alpha ---
+        # --- A/B técnico + Ciclo C: gera dois lotes (A/B) OU o Ciclo C baseado no último resultado ---
     async def ab(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        /ab [qtd] [janela] [alphaA] [alphaB]
-        Padrão: qtd=5 | janela=60 | alphaA=0.42 | alphaB=0.38
+        /ab  → A/B padrão (mesma janela e qtd, variando alpha)
+        /ab ciclo  → executa o preset Ciclo C baseado no último resultado (âncoras 09 & 11)
+        /ab c     → atalho do Ciclo C
+
+        A/B padrão:
+          /ab [qtd] [janela] [alphaA] [alphaB]
+          Padrão: qtd=5 | janela=60 | alphaA=0.42 | alphaB=0.38
+
+        Ciclo C (ignora qtd/jan/alphas):
+          - 10 apostas
+          - Plano de repetição: [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
+          - Âncoras 09 e 11 em 100% dos jogos
+          - Paridade 7–8 e max_seq=3
         """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -1030,6 +1041,40 @@ class LotoFacilBot:
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "ab"):
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /ab novamente.")
+
+        # Se o primeiro argumento for "ciclo" ou "c", executa o preset Ciclo C
+        mode_ciclo = (len(context.args) >= 1 and str(context.args[0]).lower() in {"ciclo", "c"})
+        if mode_ciclo:
+            try:
+                historico = carregar_historico(HISTORY_PATH)
+                if not historico:
+                    return await update.message.reply_text("Erro: histórico vazio.")
+                apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
+                ultimo = sorted(historico[-1])
+            except Exception:
+                logger.error("Erro no /ab (Ciclo C):\n" + traceback.format_exc())
+                return await update.message.reply_text("Erro ao gerar o Ciclo C. Tente novamente.")
+
+            # formatação com rótulo de R por jogo
+            linhas = ["🎯 <b>Ciclo C — baseado no último resultado</b>\n"
+                      f"Âncoras: {CICLO_C_ANCHORS[0]:02d} e {CICLO_C_ANCHORS[1]:02d} | "
+                      "paridade=7–8 | max_seq=3\n"]
+            for i, a in enumerate(apostas, 1):
+                pares = self._contar_pares(a)
+                r = self._contar_repeticoes(a, ultimo)
+                linhas.append(
+                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  "
+                    f"<i>[{r}R]</i>\n"
+                    f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
+                )
+            if SHOW_TIMESTAMP:
+                now_sp = datetime.now(ZoneInfo(TIMEZONE))
+                carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+                linhas.append(f"<i>base=último resultado | {carimbo}</i>")
+
+            return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+        # --------- A/B padrão (com preditor) ---------
         try:
             qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
             janela = int(context.args[1]) if len(context.args) >= 2 else 60
@@ -1037,6 +1082,7 @@ class LotoFacilBot:
             alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
         except Exception:
             qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
+
         qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
         _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
         try:
@@ -1045,6 +1091,7 @@ class LotoFacilBot:
         except Exception:
             logger.error("Erro no /ab:\n" + traceback.format_exc())
             return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
+
         def _fmt(tag, aps):
             linhas = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
             for i, a in enumerate(aps, 1):
@@ -1054,6 +1101,7 @@ class LotoFacilBot:
                     f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
                 )
             return "\n".join(linhas)
+
         msg = (
             f"🧪 <b>A/B Técnico</b> — janela={janela}\n"
             f"• A: α={alphaA:.2f}\n"
@@ -1103,6 +1151,3 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
-
-
-
