@@ -303,7 +303,7 @@ class LotoFacilBot:
             "Este bot é apenas para fins estatísticos e recreativos. "
             "Não há garantia de ganhos na Lotofácil.\n\n"
             "🎉 <b>Bem-vindo</b>\n"
-            "Use /gerar para receber 5 apostas baseadas em 100 concursos e α=0,30.\n"
+            "Use /gerar para receber 5 apostas baseadas em 60 concursos e α=0,42.\n"
             "Use /meuid para obter seu identificador e solicitar autorização.\n"
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
@@ -312,7 +312,7 @@ class LotoFacilBot:
         """
         Comando /gerar – Gera apostas inteligentes.
         Uso: /gerar [qtd] [janela] [alpha]
-        Padrão: 5 apostas | janela=50 | α=0,55
+        Padrão: 5 apostas | janela=60 | α=0,42
         """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -375,10 +375,10 @@ class LotoFacilBot:
     def _complemento(last_set):
         return [n for n in range(1, 26) if n not in last_set]
 
-    def _ajustar_paridade_e_seq(self, aposta, alvo_par=(7, 8), max_seq=3):
+    def _ajustar_paridade_e_seq(self, aposta, alvo_par=(7, 8), max_seq=3, anchors=frozenset()):
         """
         Ajusta determinísticamente a aposta para paridade 7–8 e máx. sequência 3,
-        trocando com números do complemento (1..25 \ aposta).
+        trocando com números do complemento (1..25 \ aposta). Nunca remove âncoras.
         """
         aposta = sorted(set(aposta))
         comp = [n for n in range(1, 26) if n not in aposta]
@@ -387,51 +387,54 @@ class LotoFacilBot:
             changed = False
             while self._max_seq(a) > max_seq and comp:
                 s = sorted(a)
-                start = s[0]
-                run_len = 1
+                # coleta sequências
                 seqs = []
+                start = s[0]
+                run = 1
                 for i in range(1, len(s)):
                     if s[i] == s[i-1] + 1:
-                        run_len += 1
+                        run += 1
                     else:
-                        if run_len > 1:
-                            seqs.append((start, s[i-1], run_len))
+                        if run > 1:
+                            seqs.append((start, s[i-1], run))
                         start = s[i]
-                        run_len = 1
-                if run_len > 1:
-                    seqs.append((start, s[-1], run_len))
+                        run = 1
+                if run > 1:
+                    seqs.append((start, s[-1], run))
+                # maior sequência primeiro
                 seqs.sort(key=lambda t: t[2], reverse=True)
-                _, fim, _ = seqs[0]
-                subs = None
-                for c in comp:
-                    if (c-1 not in a) and (c+1 not in a):  # tenta não criar nova sequência
-                        subs = c
+                # tenta remover um membro NÃO âncora da sequência (preferindo o fim)
+                rem = None
+                for st, fn, _ in seqs:
+                    cand = list(range(fn, st-1, -1))  # percorre do fim pro início
+                    rem = next((x for x in cand if x in a and x not in anchors), None)
+                    if rem is not None:
                         break
-                if subs is None:
-                    subs = comp[0]
-                a.remove(fim)
-                a.append(subs)
-                comp.remove(subs)
+                if rem is None:
+                    break  # não mexe se apenas âncoras compõem as sequências
+                # escolhe substituto que não crie nova sequência
+                sub = next((c for c in comp if (c-1 not in a) and (c+1 not in a)), None)
+                if sub is None:
+                    sub = comp[0]
+                a.remove(rem); a.append(sub); a.sort()
+                comp.remove(sub)
                 changed = True
-                a.sort()
             return changed
 
         def tentar_ajustar_paridade(a):
             min_par, max_par = alvo_par
             pares = self._contar_pares(a)
             if pares > max_par:
-                rem = next((x for x in a if x % 2 == 0), None)
+                rem = next((x for x in a if x % 2 == 0 and x not in anchors), None)
                 add = next((c for c in comp if c % 2 == 1), None)
             elif pares < min_par:
-                rem = next((x for x in a if x % 2 == 1), None)
+                rem = next((x for x in a if x % 2 == 1 and x not in anchors), None)
                 add = next((c for c in comp if c % 2 == 0), None)
             else:
                 return False
             if rem is not None and add is not None:
-                a.remove(rem)
-                a.append(add)
+                a.remove(rem); a.append(add); a.sort()
                 comp.remove(add)
-                a.sort()
                 return True
             return False
 
@@ -544,6 +547,7 @@ class LotoFacilBot:
                     a.remove(dezena)
                     a.append(add)
                     a.sort()
+                    # REMOVIDO anchors=set(anchors) (não existe anchors aqui; Mestre usa âncoras leves)
                     a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
                     apostas[i] = a
                     cnt[dezena] -= 1
@@ -586,14 +590,14 @@ class LotoFacilBot:
         return [sorted(a) for a in apostas]
 
     # --------- Anti-overlap real ---------
-    def _anti_overlap(self, apostas, ultimo, comp, max_overlap=11):
+    def _anti_overlap(self, apostas, ultimo, comp, max_overlap=11, anchors=frozenset()):
         """
         Garante que pares de apostas não compartilhem mais que 'max_overlap' dezenas.
-        Resolve trocando números do último (não-âncora) por ausentes distintos.
+        Troca números do último (NÃO âncora) por ausentes distintos.
         """
         comp_pool = sorted(set(comp))
-        for _ in range(2):  # duas varreduras
-            changed = False
+        for _ in range(2):
+            changed_any = False
             for i in range(len(apostas)):
                 for j in range(i):
                     a, b = apostas[i][:], apostas[j][:]
@@ -601,8 +605,9 @@ class LotoFacilBot:
                     if len(inter) <= max_overlap:
                         continue
                     need = len(inter) - max_overlap
-                    trocaveis = [x for x in inter if x in ultimo]  # prioriza trocar números do último
+                    trocaveis = [x for x in inter if x in ultimo and x not in anchors]
                     k = 0
+                    changed = False
                     while need > 0 and k < len(trocaveis):
                         out = trocaveis[k]
                         add = next((c for c in comp_pool if c not in a and c not in b), None)
@@ -611,12 +616,13 @@ class LotoFacilBot:
                         if add is None:
                             break
                         a.remove(out); a.append(add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                         need -= 1; changed = True
                         k += 1
                     if changed:
                         apostas[i] = a
-            if not changed:
+                        changed_any = True
+            if not changed_any:
                 break
         return apostas
 
@@ -629,7 +635,7 @@ class LotoFacilBot:
         from collections import Counter
 
         # 1) Normalização individual (paridade e sequência)
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
 
         # 2) Re-checagem de distribuição de ausentes (min/max)
         comp_set = set(comp)
@@ -652,7 +658,7 @@ class LotoFacilBot:
                 if rem is None or n in alvo:
                     break
                 alvo.remove(rem); alvo.append(n); alvo.sort()
-                alvo = self._ajustar_paridade_e_seq(alvo, alvo_par=(7, 8), max_seq=3)
+                alvo = self._ajustar_paridade_e_seq(alvo, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
                 apostas[idx] = alvo
                 cnt_abs[n] += 1
 
@@ -672,13 +678,13 @@ class LotoFacilBot:
                 if cand_add is None:
                     break
                 a.remove(n); a.append(cand_add); a.sort()
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
                 apostas[idx] = a
                 cnt_abs[n] -= 1
 
         # 3) Normalização final + anti-overlap (anti-overlap é a porta de saída)
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=set(anchors))
         return apostas
 
     # --------- Funções auxiliares (pares penalizados e cap de ruído) ---------
@@ -721,8 +727,8 @@ class LotoFacilBot:
             a.append(sub)
             a.sort()
             comp_list.remove(sub)
-            # normaliza regras
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            # normaliza regras (AGORA protegendo âncoras)
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
         return a, True
 
     def _cap_frequencia_ruido(self, apostas, ultimo, comp, anchors=()):
@@ -759,7 +765,8 @@ class LotoFacilBot:
                 if rem is None or rem not in a:
                     break
                 a.remove(rem); a.append(add); a.sort()
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                # normalização protegendo âncoras
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
                 apostas[idx] = a
                 pres[r] -= 1
                 comp_pool.remove(add)
@@ -895,7 +902,7 @@ class LotoFacilBot:
                         if cand_add is None:
                             continue
                         a.remove(n); a.append(cand_add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
                         a, _ = self._quebrar_pares_ruins(a, comp=comp, anchors=set(anchors))
                         apostas[i] = a
                         cnt_abs[n] -= 1
@@ -926,6 +933,37 @@ class LotoFacilBot:
         comp = self._complemento(u_set)
         anchors = set(CICLO_C_ANCHORS)
 
+        def _forcar_repeticoes(a, r_alvo):
+            # Ajusta a contagem de repetidos em relação ao último resultado (R)
+            a = a[:]
+            r_atual = sum(1 for n in a if n in u_set)
+            if r_atual == r_alvo:
+                return a
+            if r_atual < r_alvo:
+                # precisa AUMENTAR R: trocar ausentes por números do último (não âncora) que faltam
+                faltam = [n for n in ultimo if n not in a]
+                for add in faltam:
+                    if add in anchors:  # âncora já garantida adiante
+                        pass
+                    rem = next((x for x in a if x not in u_set and x not in anchors), None)
+                    if rem is None:
+                        break
+                    a.remove(rem); a.append(add); a.sort()
+                    r_atual += 1
+                    if r_atual == r_alvo:
+                        break
+            else:
+                # precisa REDUZIR R: trocar números do último (não âncora) por ausentes
+                for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
+                    add = next((c for c in comp if c not in a), None)
+                    if add is None:
+                        break
+                    a.remove(rem); a.append(add); a.sort()
+                    r_atual -= 1
+                    if r_atual == r_alvo:
+                        break
+            return a
+
         apostas = []
         for i, repeticoes in enumerate(CICLO_C_PLANOS):
             off_last = (i * 3) % 15
@@ -937,6 +975,7 @@ class LotoFacilBot:
                 offset_last=off_last,
                 offset_comp=off_comp,
             )
+            # 1) Garantir âncoras já no começo
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in a if x in u_set and x not in anchors), None)
@@ -945,27 +984,31 @@ class LotoFacilBot:
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
 
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            # 2) Forçar R-alvo do plano
+            a = _forcar_repeticoes(a, repeticoes)
 
+            # 3) Normalização com proteção às âncoras
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+
+            # 4) Garantir pelo menos 3 dezenas na faixa [12..18]
             mid_lo, mid_hi = 12, 18
             mid = [n for n in a if mid_lo <= n <= mid_hi]
             if len(mid) < 3:
                 need = 3 - len(mid)
                 cand_add = [n for n in comp if mid_lo <= n <= mid_hi and n not in a]
-                cand_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi)]
+                cand_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi) and x not in anchors]
                 j = 0
                 while need > 0 and j < len(cand_add) and j < len(cand_rem):
                     add, rem = cand_add[j], cand_rem[j]
-                    if rem in anchors:
-                        j += 1; continue
                     if add not in a and rem in a:
                         a.remove(rem); a.append(add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                         need -= 1
                     j += 1
 
             apostas.append(sorted(a))
 
+        # Cobertura de ausentes no pacote
         ausentes = set(comp)
         presentes = set(n for ap in apostas for n in ap)
         faltantes = [n for n in ausentes if n not in presentes]
@@ -973,16 +1016,34 @@ class LotoFacilBot:
             a = apostas[-1][:]
             for n in faltantes:
                 rem = next((x for x in reversed(a) if x in u_set and x not in anchors), None)
-                if rem is None: break
+                if rem is None:
+                    break
                 if n not in a:
                     a.remove(rem); a.append(n); a.sort()
-                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             apostas[-1] = a
 
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+        # Anti-overlap com proteção às âncoras
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors) for a in apostas]
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=anchors)
+
+        # Reforço final: reâncorar e normalizar novamente (caso algo tenha escapado)
+        for idx, a in enumerate(apostas):
+            changed = False
+            for anc in anchors:
+                if anc not in a:
+                    rem = next((x for x in reversed(a) if x not in anchors), None)
+                    if rem is not None:
+                        a.remove(rem); a.append(anc); a.sort(); changed = True
+            if changed:
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+            # Garantir R do plano após todo o pipeline
+            a = _forcar_repeticoes(a, CICLO_C_PLANOS[idx])
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+            apostas[idx] = a
+
         return apostas
+
 
     @staticmethod
     def _contar_repeticoes(aposta, ultimo):
@@ -1230,3 +1291,4 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
+
