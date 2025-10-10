@@ -449,21 +449,34 @@ class LotoFacilBot:
         """
         Monta uma aposta determinística com 'repeticoes' vindas do último resultado,
         completando com ausentes. Usa offsets para variar jogos de forma reprodutível.
+        Tolerante a comp_sorted vazio.
         """
-        L = last_sorted
-        C = comp_sorted
-        base = L[offset_last % 15:] + L[:offset_last % 15]
+        L = list(last_sorted)
+        C = list(comp_sorted)
+
+        # rotaciona último
+        base = L[offset_last % len(L):] + L[:offset_last % len(L)]
         manter = base[:repeticoes]
+
         faltam = 15 - len(manter)
-        comp_rot = C[offset_comp % len(C):] + C[:offset_comp % len(C)]
-        completar = comp_rot[:faltam]
+        completar = []
+        if C:
+            k = offset_comp % len(C)
+            comp_rot = C[k:] + C[:k]
+            completar = comp_rot[:faltam]
+        else:
+            completar = []
+
         aposta = sorted(set(manter + completar))
+
+        # completa se ainda faltar algo (quando C vazio ou houve deduplicação)
         if len(aposta) < 15:
-            for n in C:
-                if n not in aposta:
-                    aposta.append(n)
+            pool = [n for n in range(1, 26) if n not in aposta]
+            for n in pool:
+                aposta.append(n)
                 if len(aposta) == 15:
                     break
+
         return sorted(aposta)
 
     # --------- Seed/Salt estável para personalizar o /mestre ---------
@@ -967,7 +980,7 @@ class LotoFacilBot:
         apostas = []
         for i, repeticoes in enumerate(CICLO_C_PLANOS):
             off_last = (i * 3) % 15
-            off_comp = (i * 5) % max(1, len(comp))
+            off_comp = (i * 5) % len(comp) if len(comp) > 0 else 0
             a = self._construir_aposta_por_repeticao(
                 last_sorted=ultimo,
                 comp_sorted=comp,
@@ -1191,10 +1204,10 @@ class LotoFacilBot:
                     return await update.message.reply_text("Erro: histórico vazio.")
                 apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
                 ultimo = sorted(historico[-1])
-            except Exception:
-                logger.error("Erro no /ab (Ciclo C):\n" + traceback.format_exc())
-                return await update.message.reply_text("Erro ao gerar o Ciclo C. Tente novamente.")
-
+            except Exception as e:
+                logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
+                return await update.message.reply_text(f"Erro ao gerar o Ciclo C: {e}")
+                
             # formatação com rótulo de R por jogo
             linhas = ["🎯 <b>Ciclo C — baseado no último resultado</b>\n"
                       f"Âncoras: {CICLO_C_ANCHORS[0]:02d} e {CICLO_C_ANCHORS[1]:02d} | "
