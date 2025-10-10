@@ -1271,7 +1271,7 @@ class LotoFacilBot:
         else:
             await update.message.reply_text("ℹ️ Usuário não está na whitelist.")
 
-    # --- A/B técnico + Ciclo C: gera dois lotes (A/B) OU o Ciclo C baseado no último resultado ---
+        # --- A/B técnico + Ciclo C: gera dois lotes (A/B) OU o Ciclo C baseado no último resultado ---
     async def ab(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         /ab  → A/B padrão (mesma janela e qtd, variando alpha)
@@ -1303,13 +1303,13 @@ class LotoFacilBot:
                 if not historico:
                     return await update.message.reply_text("Erro: histórico vazio.")
                 apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
-                apostas = self._ciclo_c_fixup(apostas, historico)   # <- hotfix
+                apostas = self._ciclo_c_fixup(apostas, historico)   # reforço final
                 ultimo = sorted(historico[-1])
             except Exception as e:
                 logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
                 return await update.message.reply_text(f"Erro ao gerar o Ciclo C: {e}")
 
-            # --- Sanity pass final: garante Âncoras, R, paridade 7–8 e max_seq<=3 em cada jogo ---
+            # Sanity pass final local (extra proteção)
             anchors = set(CICLO_C_ANCHORS)
             u_set = set(ultimo)
 
@@ -1380,78 +1380,6 @@ class LotoFacilBot:
                 linhas.append(f"<i>base=último resultado | {carimbo}</i>")
 
             return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
-
-        # --------- A/B padrão (com preditor) ---------
-        try:
-            qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
-            janela = int(context.args[1]) if len(context.args) >= 2 else 60
-            alphaA = float(context.args[2].replace(",", ".")) if len(context.args) >= 3 else ALPHA_PADRAO
-            alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
-        except Exception:
-            qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
-
-        qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
-        _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
-        try:
-            apostasA = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaA)
-            apostasB = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaB)
-        except Exception:
-            logger.error("Erro no /ab:\n" + traceback.format_exc())
-            return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
-
-        def _fmt(tag, aps):
-            linhas = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
-            for i, a in enumerate(aps, 1):
-                pares = self._contar_pares(a)
-                linhas.append(
-                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
-                    f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
-                )
-            return "\n".join(linhas)
-
-        msg = (
-            f"🧪 <b>A/B Técnico</b> — janela={janela}\n"
-            f"• A: α={alphaA:.2f}\n"
-            f"• B: α={alphaB:.2f}\n\n"
-            f"{_fmt('A', apostasA)}\n\n{_fmt('B', apostasB)}"
-        )
-        await update.message.reply_text(msg, parse_mode="HTML")
-
-      # --------- A/B padrão (com preditor) ---------
-      try:
-          qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
-          janela = int(context.args[1]) if len(context.args) >= 2 else 60
-          alphaA = float(context.args[2].replace(",", ".")) if len(context.args) >= 3 else ALPHA_PADRAO
-          alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
-      except Exception:
-          qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
-
-      qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
-      _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
-      try:
-          apostasA = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaA)
-          apostasB = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaB)
-      except Exception:
-          logger.error("Erro no /ab:\n" + traceback.format_exc())
-          return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
-
-      def _fmt(tag, aps):
-          linhas = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
-          for i, a in enumerate(aps, 1):
-              pares = self._contar_pares(a)
-              linhas.append(
-                  f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
-                  f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
-              )
-          return "\n".join(linhas)
-
-      msg = (
-          f"🧪 <b>A/B Técnico</b> — janela={janela}\n"
-          f"• A: α={alphaA:.2f}\n"
-          f"• B: α={alphaB:.2f}\n\n"
-          f"{_fmt('A', apostasA)}\n\n{_fmt('B', apostasB)}"
-      )
-      await update.message.reply_text(msg, parse_mode="HTML")
 
         # --------- A/B padrão (com preditor) ---------
         try:
