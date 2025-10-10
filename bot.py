@@ -972,7 +972,7 @@ class LotoFacilBot:
 
         return apostas
 
-    # --------- Gerador Ciclo C (ancorado no último resultado) ---------
+    # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
         if not historico:
             raise ValueError("Histórico vazio no Ciclo C.")
@@ -981,19 +981,22 @@ class LotoFacilBot:
         comp = self._complemento(u_set)
         anchors = set(CICLO_C_ANCHORS)
 
-        def _forcar_repeticoes(a, r_alvo):
-            # Ajusta a contagem de repetidos em relação ao último resultado (R)
+        def _forcar_repeticoes(a: list[int], r_alvo: int) -> list[int]:
+            """Ajusta a contagem R (repetidos versus último) para r_alvo, preservando âncoras."""
             a = a[:]
             r_atual = sum(1 for n in a if n in u_set)
             if r_atual == r_alvo:
                 return a
+
             if r_atual < r_alvo:
-                # precisa AUMENTAR R: trocar ausentes por números do último (não âncora) que faltam
+                # aumentar R: trocar ausentes por números do último que faltam (não-âncora preferencialmente)
                 faltam = [n for n in ultimo if n not in a]
                 for add in faltam:
-                    if add in anchors:  # âncora já garantida adiante
+                    if add in anchors:  # será garantido de todo jeito
                         pass
                     rem = next((x for x in a if x not in u_set and x not in anchors), None)
+                    if rem is None:
+                        rem = next((x for x in a if x not in u_set), None)
                     if rem is None:
                         break
                     a.remove(rem); a.append(add); a.sort()
@@ -1001,7 +1004,7 @@ class LotoFacilBot:
                     if r_atual == r_alvo:
                         break
             else:
-                # precisa REDUZIR R: trocar números do último (não âncora) por ausentes
+                # reduzir R: trocar números do último (não-âncora) por ausentes
                 for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
                     add = next((c for c in comp if c not in a), None)
                     if add is None:
@@ -1012,18 +1015,25 @@ class LotoFacilBot:
                         break
             return a
 
-        apostas = []
-        for i, repeticoes in enumerate(CICLO_C_PLANOS):
+        def _ok(a: list[int], r_alvo: int) -> bool:
+            pares = self._contar_pares(a)
+            return (7 <= pares <= 8) and (self._max_seq(a) <= 3) and (sum(1 for n in a if n in u_set) == r_alvo)
+
+        # ===== Construção inicial (segue o plano definido) =====
+        apostas: list[list[int]] = []
+        for i, r_alvo in enumerate(CICLO_C_PLANOS):
             off_last = (i * 3) % 15
             off_comp = (i * 5) % len(comp) if len(comp) > 0 else 0
+
             a = self._construir_aposta_por_repeticao(
                 last_sorted=ultimo,
                 comp_sorted=comp,
-                repeticoes=repeticoes,
+                repeticoes=r_alvo,
                 offset_last=off_last,
                 offset_comp=off_comp,
             )
-            # 1) Garantir âncoras já no começo
+
+            # Garantir âncoras
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in a if x in u_set and x not in anchors), None)
@@ -1032,13 +1042,10 @@ class LotoFacilBot:
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
 
-            # 2) Forçar R-alvo do plano
-            a = _forcar_repeticoes(a, repeticoes)
-
-            # 3) Normalização com proteção às âncoras
+            # Forçar R do plano e normalizar (paridade/seq) com proteção às âncoras
+            a = _forcar_repeticoes(a, r_alvo)
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-
-            # 4) Garantir pelo menos 3 dezenas na faixa [12..18]
+            # Pelo menos 3 na faixa [12..18]
             mid_lo, mid_hi = 12, 18
             mid = [n for n in a if mid_lo <= n <= mid_hi]
             if len(mid) < 3:
@@ -1051,12 +1058,13 @@ class LotoFacilBot:
                     if add not in a and rem in a:
                         a.remove(rem); a.append(add); a.sort()
                         a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                        a = _forcar_repeticoes(a, r_alvo)
                         need -= 1
                     j += 1
 
             apostas.append(sorted(a))
 
-        # Cobertura de ausentes no pacote
+        # ===== Cobertura de ausentes no pacote =====
         ausentes = set(comp)
         presentes = set(n for ap in apostas for n in ap)
         faltantes = [n for n in ausentes if n not in presentes]
@@ -1069,35 +1077,51 @@ class LotoFacilBot:
                 if n not in a:
                     a.remove(rem); a.append(n); a.sort()
                     a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                    a = _forcar_repeticoes(a, CICLO_C_PLANOS[-1])
             apostas[-1] = a
 
-        # Anti-overlap com proteção às âncoras
+        # ===== Anti-overlap com proteção às âncoras =====
         apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors) for a in apostas]
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=anchors)
 
-        # Reforço final: reâncorar e normalizar novamente (caso algo tenha escapado)
-        for idx, a in enumerate(apostas):
-            changed = False
+        # ===== Reforço final com LOOP de convergência =====
+        # Garante simultaneamente: Âncoras 100%, R exato, paridade 7–8, max_seq ≤ 3.
+        for i, r_alvo in enumerate(CICLO_C_PLANOS):
+            a = apostas[i][:]
+            # reâncora (se algo escapou no anti-overlap)
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in reversed(a) if x not in anchors), None)
-                    if rem is not None:
-                        a.remove(rem); a.append(anc); a.sort(); changed = True
-            if changed:
+                    if rem is not None and rem != anc:
+                        a.remove(rem); a.append(anc); a.sort()
+
+            # loop de normalização até convergir ou atingir limite
+            for _ in range(14):
+                # 1) paridade/seq
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            # Garantir R do plano após todo o pipeline
-            a = _forcar_repeticoes(a, CICLO_C_PLANOS[idx])
+                # 2) R-alvo
+                a = _forcar_repeticoes(a, r_alvo)
+                # 3) se já atende tudo, sai
+                if _ok(a, r_alvo):
+                    break
+            # garantia hard-stop: uma passada final
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            apostas[idx] = a
+            a = _forcar_repeticoes(a, r_alvo)
+            apostas[i] = sorted(a)
+
+        # ===== Segundo passe anti-overlap (rápido) + última normalização, só por segurança =====
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=anchors)
+        for i, r_alvo in enumerate(CICLO_C_PLANOS):
+            a = self._ajustar_paridade_e_seq(apostas[i], alvo_par=(7, 8), max_seq=3, anchors=anchors)
+            a = _forcar_repeticoes(a, r_alvo)
+            apostas[i] = sorted(a)
 
         return apostas
-
 
     @staticmethod
     def _contar_repeticoes(aposta, ultimo):
         u = set(ultimo)
         return sum(1 for n in aposta if n in u)
-
 
     # --- Novo comando: /mestre ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
