@@ -1271,7 +1271,7 @@ class LotoFacilBot:
         else:
             await update.message.reply_text("ℹ️ Usuário não está na whitelist.")
 
-        # --- A/B técnico + Ciclo C: gera dois lotes (A/B) OU o Ciclo C baseado no último resultado ---
+    # --- A/B técnico + Ciclo C: gera dois lotes (A/B) OU o Ciclo C baseado no último resultado ---
     async def ab(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         /ab  → A/B padrão (mesma janela e qtd, variando alpha)
@@ -1308,7 +1308,60 @@ class LotoFacilBot:
             except Exception as e:
                 logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
                 return await update.message.reply_text(f"Erro ao gerar o Ciclo C: {e}")
-                
+
+            # --- Sanity pass final: garante Âncoras, R, paridade 7–8 e max_seq<=3 em cada jogo ---
+            anchors = set(CICLO_C_ANCHORS)
+            u_set = set(ultimo)
+
+            def _forcar_repeticoes_local(a: list[int], r_alvo: int) -> list[int]:
+                a = a[:]
+                r_atual = sum(1 for n in a if n in u_set)
+                if r_atual == r_alvo:
+                    return a
+                comp_local = [n for n in range(1, 26) if n not in a]
+                if r_atual < r_alvo:
+                    faltam = [n for n in ultimo if n not in a]
+                    for add in faltam:
+                        rem = next((x for x in a if x not in u_set and x not in anchors), None)
+                        if rem is None:
+                            rem = next((x for x in a if x not in u_set), None)
+                        if rem is None:
+                            break
+                        a.remove(rem); a.append(add); a.sort()
+                        r_atual += 1
+                        if r_atual == r_alvo:
+                            break
+                else:
+                    for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
+                        add = next((c for c in comp_local if c not in a), None)
+                        if add is None:
+                            break
+                        a.remove(rem); a.append(add); a.sort()
+                        r_atual -= 1
+                        if r_atual == r_alvo:
+                            break
+                return a
+
+            for i, ap in enumerate(apostas):
+                r_alvo = CICLO_C_PLANOS[i]
+                a = ap[:]
+                # Reâncorar defensivamente
+                for anc in anchors:
+                    if anc not in a:
+                        rem = next((x for x in reversed(a) if x not in anchors), None)
+                        if rem is not None and rem != anc:
+                            a.remove(rem); a.append(anc); a.sort()
+                # Convergência curta
+                for _ in range(12):
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                    a = _forcar_repeticoes_local(a, r_alvo)
+                    if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+                        break
+                # Selagem
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                a = _forcar_repeticoes_local(a, r_alvo)
+                apostas[i] = sorted(a)
+
             # formatação com rótulo de R por jogo
             linhas = ["🎯 <b>Ciclo C — baseado no último resultado</b>\n"
                       f"Âncoras: {CICLO_C_ANCHORS[0]:02d} e {CICLO_C_ANCHORS[1]:02d} | "
@@ -1327,6 +1380,78 @@ class LotoFacilBot:
                 linhas.append(f"<i>base=último resultado | {carimbo}</i>")
 
             return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+        # --------- A/B padrão (com preditor) ---------
+        try:
+            qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
+            janela = int(context.args[1]) if len(context.args) >= 2 else 60
+            alphaA = float(context.args[2].replace(",", ".")) if len(context.args) >= 3 else ALPHA_PADRAO
+            alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
+        except Exception:
+            qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
+
+        qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
+        _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
+        try:
+            apostasA = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaA)
+            apostasB = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaB)
+        except Exception:
+            logger.error("Erro no /ab:\n" + traceback.format_exc())
+            return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
+
+        def _fmt(tag, aps):
+            linhas = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
+            for i, a in enumerate(aps, 1):
+                pares = self._contar_pares(a)
+                linhas.append(
+                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                    f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
+                )
+            return "\n".join(linhas)
+
+        msg = (
+            f"🧪 <b>A/B Técnico</b> — janela={janela}\n"
+            f"• A: α={alphaA:.2f}\n"
+            f"• B: α={alphaB:.2f}\n\n"
+            f"{_fmt('A', apostasA)}\n\n{_fmt('B', apostasB)}"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+      # --------- A/B padrão (com preditor) ---------
+      try:
+          qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
+          janela = int(context.args[1]) if len(context.args) >= 2 else 60
+          alphaA = float(context.args[2].replace(",", ".")) if len(context.args) >= 3 else ALPHA_PADRAO
+          alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
+      except Exception:
+          qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
+
+      qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
+      _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
+      try:
+          apostasA = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaA)
+          apostasB = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaB)
+      except Exception:
+          logger.error("Erro no /ab:\n" + traceback.format_exc())
+          return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
+
+      def _fmt(tag, aps):
+          linhas = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
+          for i, a in enumerate(aps, 1):
+              pares = self._contar_pares(a)
+              linhas.append(
+                  f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                  f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
+              )
+          return "\n".join(linhas)
+
+      msg = (
+          f"🧪 <b>A/B Técnico</b> — janela={janela}\n"
+          f"• A: α={alphaA:.2f}\n"
+          f"• B: α={alphaB:.2f}\n\n"
+          f"{_fmt('A', apostasA)}\n\n{_fmt('B', apostasB)}"
+      )
+      await update.message.reply_text(msg, parse_mode="HTML")
 
         # --------- A/B padrão (com preditor) ---------
         try:
