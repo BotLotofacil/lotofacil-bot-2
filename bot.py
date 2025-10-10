@@ -1262,6 +1262,7 @@ class LotoFacilBot:
                 if not historico:
                     return await update.message.reply_text("Erro: histórico vazio.")
                 apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
+                apostas = self._ciclo_c_fixup(apostas, historico)   # <- hotfix
                 ultimo = sorted(historico[-1])
             except Exception as e:
                 logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
@@ -1321,6 +1322,81 @@ class LotoFacilBot:
             f"{_fmt('A', apostasA)}\n\n{_fmt('B', apostasB)}"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
+
+    def _ciclo_c_fixup(self, apostas: list[list[int]], historico) -> list[list[int]]:
+        """Pós-processa o pacote do Ciclo C para garantir:
+        - Âncoras (09,11) presentes em 100%,
+        - R exatamente conforme CICLO_C_PLANOS,
+        - Paridade 7–8,
+        - max_seq <= 3,
+        mantendo o anti-overlap (<=11).
+        """
+        if not historico:
+            return apostas
+        ultimo = sorted(historico[-1])
+        u_set = set(ultimo)
+        anchors = set(CICLO_C_ANCHORS)
+
+        def _forcar_repeticoes(a: list[int], r_alvo: int) -> list[int]:
+            a = a[:]
+            r_atual = sum(1 for n in a if n in u_set)
+            if r_atual == r_alvo:
+                return a
+            comp = [n for n in range(1, 26) if n not in a]
+            if r_atual < r_alvo:
+                # aumentar R
+                faltam = [n for n in ultimo if n not in a]
+                for add in faltam:
+                    rem = next((x for x in a if x not in u_set and x not in anchors), None)
+                    if rem is None:
+                        rem = next((x for x in a if x not in u_set), None)
+                    if rem is None:
+                        break
+                    a.remove(rem); a.append(add); a.sort()
+                    r_atual += 1
+                    if r_atual == r_alvo:
+                        break
+            else:
+                # reduzir R
+                for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
+                    add = next((c for c in comp if c not in a), None)
+                    if add is None:
+                        break
+                    a.remove(rem); a.append(add); a.sort()
+                    r_atual -= 1
+                    if r_atual == r_alvo:
+                        break
+            return a
+
+        # 1) Reâncorar e normalizar cada aposta até convergir
+        for i, a in enumerate(apostas):
+            # garantir âncoras
+            for anc in anchors:
+                if anc not in a:
+                    rem = next((x for x in reversed(a) if x not in anchors), None)
+                    if rem is not None and rem != anc:
+                        a.remove(rem); a.append(anc); a.sort()
+            # loop de convergência
+            r_alvo = CICLO_C_PLANOS[i]
+            for _ in range(14):
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                a = _forcar_repeticoes(a, r_alvo)
+                pares = self._contar_pares(a)
+                if 7 <= pares <= 8 and self._max_seq(a) <= 3 and sum(1 for n in a if n in u_set) == r_alvo:
+                    break
+            # passada final de segurança
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+            a = _forcar_repeticoes(a, r_alvo)
+            apostas[i] = sorted(a)
+
+        # 2) Anti-overlap e última normalização leve
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=[n for n in range(1,26) if n not in ultimo], max_overlap=11, anchors=anchors)
+        for i, a in enumerate(apostas):
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+            a = _forcar_repeticoes(a, CICLO_C_PLANOS[i])
+            apostas[i] = sorted(a)
+
+        return apostas
 
     # ------------- Handler do backtest -------------
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
