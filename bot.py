@@ -379,15 +379,31 @@ class LotoFacilBot:
         """
         Ajusta determinísticamente a aposta para paridade 7–8 e máx. sequência 3,
         trocando com números do complemento (1..25 \ aposta). Nunca remove âncoras.
+        OBS: comp é reavaliado a cada iteração (corrige estagnação de paridade/seq).
         """
-        aposta = sorted(set(aposta))
-        comp = [n for n in range(1, 26) if n not in aposta]
+        a = sorted(set(aposta))
 
-        def tentar_quebrar_sequencias(a):
+        def max_seq_run(s):
+            s = sorted(s)
+            best = cur = 1
+            for i in range(1, len(s)):
+                if s[i] == s[i-1] + 1:
+                    cur += 1
+                    best = max(best, cur)
+                else:
+                    cur = 1
+            return best
+
+        def contar_pares(s):
+            return sum(1 for n in s if n % 2 == 0)
+
+        def tentar_quebrar_sequencias(a_local, comp_local):
             changed = False
-            while self._max_seq(a) > max_seq and comp:
-                s = sorted(a)
-                # coleta sequências
+            # enquanto houver sequência > max_seq e houver candidatos no comp
+            guard = 0
+            while max_seq_run(a_local) > max_seq and comp_local and guard < 50:
+                guard += 1
+                s = sorted(a_local)
                 seqs = []
                 start = s[0]
                 run = 1
@@ -401,49 +417,64 @@ class LotoFacilBot:
                         run = 1
                 if run > 1:
                     seqs.append((start, s[-1], run))
-                # maior sequência primeiro
-                seqs.sort(key=lambda t: t[2], reverse=True)
-                # tenta remover um membro NÃO âncora da sequência (preferindo o fim)
+                if not seqs:
+                    break
+                seqs.sort(key=lambda t: t[2], reverse=True)  # maior primeiro
                 rem = None
-                for st, fn, _ in seqs:
-                    cand = list(range(fn, st-1, -1))  # percorre do fim pro início
-                    rem = next((x for x in cand if x in a and x not in anchors), None)
+                for st, fn, _run in seqs:
+                    for x in range(fn, st - 1, -1):  # do fim pro início
+                        if x in a_local and x not in anchors:
+                            rem = x
+                            break
                     if rem is not None:
                         break
                 if rem is None:
-                    break  # não mexe se apenas âncoras compõem as sequências
+                    break  # não mexe se só houver âncoras nas sequências
                 # escolhe substituto que não crie nova sequência
-                sub = next((c for c in comp if (c-1 not in a) and (c+1 not in a)), None)
+                sub = next((c for c in comp_local if (c-1 not in a_local) and (c+1 not in a_local)), None)
                 if sub is None:
-                    sub = comp[0]
-                a.remove(rem); a.append(sub); a.sort()
-                comp.remove(sub)
+                    sub = comp_local[0]
+                a_local.remove(rem)
+                a_local.append(sub)
+                a_local.sort()
                 changed = True
+                # recomputa comp porque removemos/adicionamos
+                comp_local[:] = [n for n in range(1, 26) if n not in a_local]
             return changed
 
-        def tentar_ajustar_paridade(a):
-            min_par, max_par = alvo_par
-            pares = self._contar_pares(a)
+        def tentar_ajustar_paridade(a_local, comp_local, min_par, max_par):
+            pares = contar_pares(a_local)
             if pares > max_par:
-                rem = next((x for x in a if x % 2 == 0 and x not in anchors), None)
-                add = next((c for c in comp if c % 2 == 1), None)
+                # reduzir pares: tira um par (não âncora) e põe um ímpar do comp
+                rem = next((x for x in a_local if x % 2 == 0 and x not in anchors), None)
+                add = next((c for c in comp_local if c % 2 == 1), None)
             elif pares < min_par:
-                rem = next((x for x in a if x % 2 == 1 and x not in anchors), None)
-                add = next((c for c in comp if c % 2 == 0), None)
+                # aumentar pares: tira um ímpar (não âncora) e põe um par do comp
+                rem = next((x for x in a_local if x % 2 == 1 and x not in anchors), None)
+                add = next((c for c in comp_local if c % 2 == 0), None)
             else:
                 return False
             if rem is not None and add is not None:
-                a.remove(rem); a.append(add); a.sort()
-                comp.remove(add)
+                a_local.remove(rem)
+                a_local.append(add)
+                a_local.sort()
+                # recomputa comp imediatamente
+                comp_local[:] = [n for n in range(1, 26) if n not in a_local]
                 return True
             return False
 
-        for _ in range(10):
-            m1 = tentar_quebrar_sequencias(aposta)
-            m2 = tentar_ajustar_paridade(aposta)
+        min_par, max_par = alvo_par
+
+        # Loop de convergência com recomputo de comp a cada passo
+        for _ in range(40):
+            comp = [n for n in range(1, 26) if n not in a]
+            m1 = tentar_quebrar_sequencias(a, comp)
+            comp = [n for n in range(1, 26) if n not in a]
+            m2 = tentar_ajustar_paridade(a, comp, min_par, max_par)
             if not m1 and not m2:
                 break
-        return sorted(aposta)
+
+        return sorted(a)
 
     def _construir_aposta_por_repeticao(self, last_sorted, comp_sorted, repeticoes, offset_last=0, offset_comp=0):
         """
