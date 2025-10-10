@@ -602,40 +602,75 @@ class LotoFacilBot:
 
         return [sorted(a) for a in apostas]
 
-    # --------- Anti-overlap real ---------
+    # --------- Anti-overlap robusto ---------
     def _anti_overlap(self, apostas, ultimo, comp, max_overlap=11, anchors=frozenset()):
         """
-        Garante que pares de apostas não compartilhem mais que 'max_overlap' dezenas.
-        Troca números do último (NÃO âncora) por ausentes distintos.
+        Reduz interseções entre pares de apostas até 'max_overlap'.
+        Robustez:
+          - Recalcula a interseção a cada iteração;
+          - Valida presença antes de remover;
+          - Se não dá pra mexer em 'a', tenta em 'b';
+          - Normaliza após cada troca.
         """
         comp_pool = sorted(set(comp))
-        for _ in range(2):
-            changed_any = False
+
+        # percorre algumas vezes para estabilizar
+        for _ in range(3):
+            changed_any_outer = False
             for i in range(len(apostas)):
                 for j in range(i):
-                    a, b = apostas[i][:], apostas[j][:]
-                    inter = sorted(set(a) & set(b))
-                    if len(inter) <= max_overlap:
-                        continue
-                    need = len(inter) - max_overlap
-                    trocaveis = [x for x in inter if x in ultimo and x not in anchors]
-                    k = 0
-                    changed = False
-                    while need > 0 and k < len(trocaveis):
-                        out = trocaveis[k]
+                    a = list(apostas[i])
+                    b = list(apostas[j])
+
+                    # loop interno até resolver o par (i,j)
+                    guard = 0
+                    while guard < 30:
+                        guard += 1
+                        inter = sorted(set(a) & set(b))
+                        if len(inter) <= max_overlap:
+                            break
+
+                        # tenta tirar de 'a' (um número do último que não seja âncora)
+                        out = next(
+                            (x for x in inter if (x in ultimo) and (x not in anchors) and (x in a)),
+                            None
+                        )
+                        if out is None:
+                            # se não há o que tirar de 'a', tenta tirar de 'b'
+                            out_b = next(
+                                (x for x in inter if (x in ultimo) and (x not in anchors) and (x in b)),
+                                None
+                            )
+                            if out_b is None:
+                                break  # não há como reduzir mais sem ferir âncoras
+                            add_b = next((c for c in comp_pool if c not in a and c not in b), None)
+                            if add_b is None:
+                                add_b = next((c for c in comp_pool if c not in b), None)
+                            if add_b is None:
+                                break
+                            if out_b in b:
+                                b.remove(out_b); b.append(add_b); b.sort()
+                                b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                                changed_any_outer = True
+                            continue
+
+                        # troca em 'a'
                         add = next((c for c in comp_pool if c not in a and c not in b), None)
                         if add is None:
                             add = next((c for c in comp_pool if c not in a), None)
                         if add is None:
                             break
-                        a.remove(out); a.append(add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                        need -= 1; changed = True
-                        k += 1
-                    if changed:
+                        if out in a:
+                            a.remove(out); a.append(add); a.sort()
+                            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                            changed_any_outer = True
+
+                    # escreve de volta se mudou
+                    if a != apostas[i]:
                         apostas[i] = a
-                        changed_any = True
-            if not changed_any:
+                    if b != apostas[j]:
+                        apostas[j] = b
+            if not changed_any_outer:
                 break
         return apostas
 
@@ -1304,4 +1339,3 @@ class LotoFacilBot:
 if __name__ == "__main__":
     bot = LotoFacilBot()
     bot.run()
-
