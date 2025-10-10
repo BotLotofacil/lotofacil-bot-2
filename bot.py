@@ -474,6 +474,14 @@ class LotoFacilBot:
             if not m1 and not m2:
                 break
 
+        # ===== Passe de selagem (hard-stop) =====
+        # Se ainda ficou fora de 7–8 ou com sequência > max_seq, faz uma última dupla passada.
+        if not (min_par <= contar_pares(a) <= max_par) or max_seq_run(a) > max_seq:
+            comp = [n for n in range(1, 26) if n not in a]
+            _ = tentar_ajustar_paridade(a, comp, min_par, max_par)
+            comp = [n for n in range(1, 26) if n not in a]
+            _ = tentar_quebrar_sequencias(a, comp)
+        
         return sorted(a)
 
     def _construir_aposta_por_repeticao(self, last_sorted, comp_sorted, repeticoes, offset_last=0, offset_comp=0):
