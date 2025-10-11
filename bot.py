@@ -1,4 +1,4 @@
-# bot.py
+# bot.py 
 
 import os
 import logging
@@ -76,6 +76,17 @@ BUILD_TAG = getenv("BUILD_TAG", "unknown")
 
 # >>> ADIÇÃO: cache de processo em memória (sanity checks entre chamadas)
 _PROCESS_CACHE: dict = {}  # ADIÇÃO
+
+# >>> ADIÇÃO: controle explícito da ordem do CSV + helpers de hash/format
+# True  -> arquivo em ordem decrescente (linha 0 = concurso mais recente)
+# False -> arquivo em ordem crescente  (última linha = concurso mais recente)
+HISTORY_ORDER_DESC = True  # ADIÇÃO
+
+def _fmt_dezenas(nums: List[int]) -> str:  # ADIÇÃO
+    return "".join(f"{n:02d}" for n in sorted(nums))
+
+def _hash_dezenas(nums: List[int]) -> str:  # ADIÇÃO
+    return hashlib.blake2b(_fmt_dezenas(nums).encode("utf-8"), digest_size=4).hexdigest()
 
 # ========================
 # Heurísticas adicionais (Mestre + A/B)
@@ -211,16 +222,26 @@ class LotoFacilBot:
             alpha = ALPHA_PADRAO
         return qtd, janela, alpha
 
+    # >>> ADIÇÃO: pega o último resultado respeitando a ordem declarada
+    def _ultimo_resultado(self, historico) -> List[int]:  # ADIÇÃO
+        """
+        Retorna o concurso mais recente conforme HISTORY_ORDER_DESC.
+        - HISTORY_ORDER_DESC=True  -> historico[0]
+        - HISTORY_ORDER_DESC=False -> historico[-1]
+        """
+        if not historico:
+            raise ValueError("Histórico vazio.")
+        ult = historico[0] if HISTORY_ORDER_DESC else historico[-1]
+        return sorted(list(ult))
+
     # >>> ADIÇÃO: Snapshot atual da base (tamanho + hash do último)
     def _latest_snapshot(self) -> _Snapshot:  # ADIÇÃO
         historico = carregar_historico(HISTORY_PATH)
         if not historico:
             raise ValueError("Histórico vazio.")
         tamanho = len(historico)
-        ultimo = sorted(historico[-1])
-        # hash curto e estável do último: 8 hex
-        payload = "".join(f"{n:02d}" for n in ultimo).encode("utf-8")
-        h8 = hashlib.blake2b(payload, digest_size=4).hexdigest()  # 8 hex chars
+        ultimo = self._ultimo_resultado(historico)
+        h8 = _hash_dezenas(ultimo)  # 8 hex chars
         snapshot_id = f"{tamanho}|{h8}"
         return _Snapshot(snapshot_id=snapshot_id, tamanho=tamanho, dezenas=ultimo)
 
@@ -901,7 +922,7 @@ class LotoFacilBot:
         Regras: paridade 7–8 e max_seq=3, cobrindo ausentes.
         Personalizado por usuário/chat via seed (reprodutível).
         """
-        ultimo = sorted(historico[-1])
+        ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
         comp = self._complemento(set(ultimo))
 
         # ===== Anchors por janela curta (50) =====
@@ -1045,7 +1066,7 @@ class LotoFacilBot:
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
         if not historico:
             raise ValueError("Histórico vazio no Ciclo C.")
-        ultimo = sorted(historico[-1])
+        ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
         u_set = set(ultimo)
         comp = self._complemento(u_set)
         anchors = set(CICLO_C_ANCHORS)
@@ -1224,7 +1245,7 @@ class LotoFacilBot:
 
         # seed personalizada por usuário/chat/último resultado
         try:
-            ultimo_sorted = sorted(historico[-1])
+            ultimo_sorted = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
             seed = self._calc_mestre_seed(
                 user_id=update.effective_user.id,
                 chat_id=update.effective_chat.id,
@@ -1251,7 +1272,8 @@ class LotoFacilBot:
         if SHOW_TIMESTAMP:
             now_sp = datetime.now(ZoneInfo(TIMEZONE))
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-            linhas.append(f"<i>base=último resultado | paridade=7–8 | max_seq=3 | {carimbo}</i>")
+            hash_ult = _hash_dezenas(ultimo_sorted)  # ADIÇÃO
+            linhas.append(f"<i>base=último resultado | paridade=7–8 | max_seq=3 | hash={hash_ult} | {carimbo}</i>")  # ADIÇÃO
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
@@ -1349,7 +1371,7 @@ class LotoFacilBot:
                     return await update.message.reply_text("Erro: histórico vazio.")
                 apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
                 apostas = self._ciclo_c_fixup(apostas, historico)   # reforço final
-                ultimo = sorted(historico[-1])
+                ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
             except Exception as e:
                 logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
                 return await update.message.reply_text(f"Erro ao gerar o Ciclo C: {e}")
@@ -1433,7 +1455,8 @@ class LotoFacilBot:
             if SHOW_TIMESTAMP:
                 now_sp = datetime.now(ZoneInfo(TIMEZONE))
                 carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                linhas.append(f"<i>base=último resultado | {carimbo}</i>")
+                hash_ult = _hash_dezenas(ultimo)  # ADIÇÃO
+                linhas.append(f"<i>base=último resultado | hash={hash_ult} | {carimbo}</i>")  # ADIÇÃO
                 # >>> ADIÇÃO: rodapé com snapshot e contexto do comando
                 linhas.append(f"<i>snapshot={snap.snapshot_id} | tz={TIMEZONE} | ab:cicloC</i>")  # ADIÇÃO
 
@@ -1485,7 +1508,7 @@ class LotoFacilBot:
         """
         if not historico:
             return apostas
-        ultimo = sorted(historico[-1])
+        ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
         u_set = set(ultimo)
         anchors = set(CICLO_C_ANCHORS)
 
