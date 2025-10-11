@@ -1197,6 +1197,7 @@ class LotoFacilBot:
             # garantia hard-stop: uma passada final
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             a = _forcar_repeticoes(a, r_alvo)
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)  # <<< INSERIDO: selagem de paridade >>>
             apostas[i] = sorted(a)
 
         # ===== Segundo passe anti-overlap (rápido) + última normalização, só por segurança =====
@@ -1427,6 +1428,7 @@ class LotoFacilBot:
                 # Selagem
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                 a = _forcar_repeticoes_local(a, r_alvo)
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)  # <<< INSERIDO: selagem de paridade >>>
                 apostas[i] = sorted(a)
 
             # >>> ADIÇÃO: sanity check entre snapshots
@@ -1562,6 +1564,7 @@ class LotoFacilBot:
             # passada final de segurança
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             a = _forcar_repeticoes(a, r_alvo)
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)  # <<< INSERIDO: selagem de paridade >>>
             apostas[i] = sorted(a)
 
         # 2) Anti-overlap e última normalização leve
