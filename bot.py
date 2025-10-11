@@ -692,76 +692,116 @@ class LotoFacilBot:
 
         return [sorted(a) for a in apostas]
 
-    # --------- Anti-overlap robusto ---------
+     # --------- Anti-overlap robusto (NUNCA muda o tamanho das apostas) -------
     def _anti_overlap(self, apostas, ultimo, comp, max_overlap=11, anchors=frozenset()):
         """
-        Reduz interseções entre pares de apostas até 'max_overlap'.
-        Robustez:
-          - Recalcula a interseção a cada iteração;
-          - Valida presença antes de remover;
-          - Se não dá pra mexer em 'a', tenta em 'b';
-          - Normaliza após cada troca.
+        Reduz interseções entre pares de apostas até 'max_overlap' SEM alterar o tamanho
+        das apostas. Em cada troca:
+          - só remove quando já houver substituto 'add' definido;
+          - normaliza (paridade 7–8 e max_seq<=3) mantendo âncoras;
+          - garante len==15 (complementa por comp; se esgotar, usa pool 1..25 sem repetir).
         """
-        comp_pool = sorted(set(comp))
+        def _fix_len15(a: list[int]) -> list[int]:
+            """Garante exatamente 15 dezenas sem repetir."""
+            a = list(a)
+            if len(a) < 15:
+                presentes = set(a)
+                # tenta primeiro do complemento informado
+                for c in comp:
+                    if len(a) == 15:
+                        break
+                    if c not in presentes:
+                        a.append(c); presentes.add(c)
+                # fallback: qualquer dezena de 1..25 que não esteja presente
+                if len(a) < 15:
+                    for n in range(1, 26):
+                        if n not in presentes:
+                            a.append(n); presentes.add(n)
+                            if len(a) == 15:
+                                break
+            elif len(a) > 15:
+                # corta excedentes não âncora, depois quaisquer outros, preservando diversidade
+                s_anc = set(anchors)
+                i = len(a) - 1
+                while len(a) > 15 and i >= 0:
+                    if a[i] not in s_anc:
+                        a.pop(i)
+                    i -= 1
+                i = len(a) - 1
+                while len(a) > 15 and i >= 0:
+                    a.pop(i); i -= 1
+            return sorted(a)
 
+        comp_pool_base = sorted(set(comp))
         # percorre algumas vezes para estabilizar
-        for _ in range(3):
+        for _outer in range(3):
             changed_any_outer = False
             for i in range(len(apostas)):
                 for j in range(i):
                     a = list(apostas[i])
                     b = list(apostas[j])
 
-                    # loop interno até resolver o par (i,j)
                     guard = 0
-                    while guard < 30:
+                    while guard < 40:
                         guard += 1
                         inter = sorted(set(a) & set(b))
                         if len(inter) <= max_overlap:
                             break
 
-                        # tenta tirar de 'a' (um número do último que não seja âncora)
+                        # pool renovado a cada iteração (nunca descartamos sem repor)
+                        comp_pool = [c for c in comp_pool_base if c not in a or c not in b]
+
+                        # tenta mexer em 'a' primeiro
                         out = next(
                             (x for x in inter if (x in ultimo) and (x not in anchors) and (x in a)),
                             None
                         )
-                        if out is None:
-                            # se não há o que tirar de 'a', tenta tirar de 'b'
-                            out_b = next(
-                                (x for x in inter if (x in ultimo) and (x not in anchors) and (x in b)),
-                                None
-                            )
-                            if out_b is None:
-                                break  # não há como reduzir mais sem ferir âncoras
-                            add_b = next((c for c in comp_pool if c not in a and c not in b), None)
+                        if out is not None:
+                            add = next((c for c in comp_pool if c not in a and c not in b and (c-1 not in a) and (c+1 not in a)), None)
+                            if add is None:
+                                add = next((c for c in comp_pool if c not in a and c not in b), None)
+                            if add is None:
+                                add = next((c for c in comp_pool if c not in a), None)
+                            if add is not None and out in a:
+                                a.remove(out); a.append(add)
+                                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                                a = _fix_len15(a)
+                                changed_any_outer = True
+                                continue  # reavalia interseção
+                        # senão, tenta mexer em 'b'
+                        out_b = next(
+                            (x for x in inter if (x in ultimo) and (x not in anchors) and (x in b)),
+                            None
+                        )
+                        if out_b is not None:
+                            add_b = next((c for c in comp_pool if c not in a and c not in b and (c-1 not in b) and (c+1 not in b)), None)
+                            if add_b is None:
+                                add_b = next((c for c in comp_pool if c not in a and c not in b), None)
                             if add_b is None:
                                 add_b = next((c for c in comp_pool if c not in b), None)
-                            if add_b is None:
-                                break
-                            if out_b in b:
-                                b.remove(out_b); b.append(add_b); b.sort()
+                            if add_b is not None and out_b in b:
+                                b.remove(out_b); b.append(add_b)
                                 b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                                b = _fix_len15(b)
                                 changed_any_outer = True
-                            continue
-
-                        # troca em 'a'
-                        add = next((c for c in comp_pool if c not in a and c not in b), None)
-                        if add is None:
-                            add = next((c for c in comp_pool if c not in a), None)
-                        if add is None:
-                            break
-                        if out in a:
-                            a.remove(out); a.append(add); a.sort()
-                            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                            changed_any_outer = True
+                                continue
+                        # sem como reduzir mais
+                        break
 
                     # escreve de volta se mudou
                     if a != apostas[i]:
-                        apostas[i] = a
+                        apostas[i] = _fix_len15(a)
                     if b != apostas[j]:
-                        apostas[j] = b
+                        apostas[j] = _fix_len15(b)
+
             if not changed_any_outer:
                 break
+
+        # selagem final de segurança em todas
+        apostas = [
+            _fix_len15(self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors))
+            for a in apostas
+        ]
         return apostas
 
     # --------- Passe final para garantir regras após ajustes ---------
@@ -1410,6 +1450,7 @@ class LotoFacilBot:
                             break
                 return a
 
+            # Convergência curta + selagem
             for i, ap in enumerate(apostas):
                 r_alvo = CICLO_C_PLANOS[i]
                 a = ap[:]
@@ -1428,7 +1469,25 @@ class LotoFacilBot:
                 # Selagem
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                 a = _forcar_repeticoes_local(a, r_alvo)
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)  # <<< INSERIDO: selagem de paridade >>>
+                apostas[i] = sorted(a)
+
+            # >>> REFORÇO FINAL ANTES DE FORMATAR (hard seal de paridade/seq/R)
+            def _ok_final(a: list[int], r_alvo: int) -> bool:
+                return (7 <= self._contar_pares(a) <= 8) and (self._max_seq(a) <= 3) and \
+                       (sum(1 for n in a if n in u_set) == r_alvo)
+
+            for i in range(len(apostas)):
+                r_alvo = CICLO_C_PLANOS[i]
+                a = list(apostas[i])
+                # converge no máx. 20 passos (normalmente resolve em 3–6)
+                for _ in range(20):
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                    a = _forcar_repeticoes_local(a, r_alvo)
+                    if _ok_final(a, r_alvo):
+                        break
+                # selagem final (idempotente)
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+                a = _forcar_repeticoes_local(a, r_alvo)
                 apostas[i] = sorted(a)
 
             # >>> ADIÇÃO: sanity check entre snapshots
