@@ -12,6 +12,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from os import getenv
+# >>> ADIÇÃO: dataclass p/ snapshot
+from dataclasses import dataclass  # ADIÇÃO
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -72,6 +74,9 @@ COOLDOWN_SECONDS = 10
 # Identificação do build (para /versao)
 BUILD_TAG = getenv("BUILD_TAG", "unknown")
 
+# >>> ADIÇÃO: cache de processo em memória (sanity checks entre chamadas)
+_PROCESS_CACHE: dict = {}  # ADIÇÃO
+
 # ========================
 # Heurísticas adicionais (Mestre + A/B)
 # ========================
@@ -89,6 +94,14 @@ ALPHA_TEST_B = 0.38
 # ========================
 CICLO_C_ANCHORS = (9, 11)
 CICLO_C_PLANOS = [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
+
+# >>> ADIÇÃO: estrutura de Snapshot para diagnosticar a base corrente
+@dataclass
+class _Snapshot:  # ADIÇÃO
+    snapshot_id: str  # ex: "3509|a1b2c3d4"
+    tamanho: int      # total de concursos no CSV
+    dezenas: List[int]  # último resultado (ordenado)
+
 
 # ========================
 # Bot Principal
@@ -198,6 +211,19 @@ class LotoFacilBot:
             alpha = ALPHA_PADRAO
         return qtd, janela, alpha
 
+    # >>> ADIÇÃO: Snapshot atual da base (tamanho + hash do último)
+    def _latest_snapshot(self) -> _Snapshot:  # ADIÇÃO
+        historico = carregar_historico(HISTORY_PATH)
+        if not historico:
+            raise ValueError("Histórico vazio.")
+        tamanho = len(historico)
+        ultimo = sorted(historico[-1])
+        # hash curto e estável do último: 8 hex
+        payload = "".join(f"{n:02d}" for n in ultimo).encode("utf-8")
+        h8 = hashlib.blake2b(payload, digest_size=4).hexdigest()  # 8 hex chars
+        snapshot_id = f"{tamanho}|{h8}"
+        return _Snapshot(snapshot_id=snapshot_id, tamanho=tamanho, dezenas=ultimo)
+
     # ------------- Gerador preditivo -------------
     def _gerar_apostas_inteligentes(
         self,
@@ -291,10 +317,12 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("mestre", self.mestre))
         # --- Novo handler: /ab (A/B técnico) ---
         self.app.add_handler(CommandHandler("ab", self.ab))
+        # >>> ADIÇÃO: handler /diagbase para diagnosticar a base atual
+        self.app.add_handler(CommandHandler("diagbase", self.diagbase))  # ADIÇÃO
         # Diagnóstico
         self.app.add_handler(CommandHandler("ping", self.ping))
         self.app.add_handler(CommandHandler("versao", self.versao))
-        logger.info("Handlers ativos: /start /gerar /mestre /ab /meuid /autorizar /remover /backtest /ping /versao")
+        logger.info("Handlers ativos: /start /gerar /mestre /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /start – mensagem de boas-vindas e aviso legal."""
@@ -1236,9 +1264,23 @@ class LotoFacilBot:
             f"🤖 Versão do bot\n"
             f"- BUILD_TAG: <code>{BUILD_TAG}</code>\n"
             f"- Import layout: <code>{LAYOUT}</code>\n"
-            f"- Comandos: /start /gerar /mestre /ab /meuid /autorizar /remover /backtest /ping /versao"
+            f"- Comandos: /start /gerar /mestre /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao"
         )
         await update.message.reply_text(txt, parse_mode="HTML")
+
+    # >>> ADIÇÃO: comando /diagbase para inspecionar a base atual
+    async def diagbase(self, update: Update, context: ContextTypes.DEFAULT_TYPE):  # ADIÇÃO
+        try:
+            snap = self._latest_snapshot()
+            await update.message.reply_text(
+                "📌 Base atual carregada pelo bot\n"
+                f"- snapshot_id: <code>{snap.snapshot_id}</code>\n"
+                f"- tamanho(histórico): <b>{snap.tamanho}</b>\n"
+                f"- último resultado: <b>{' '.join(f'{n:02d}' for n in snap.dezenas)}</b>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Erro no diagbase: {e}")
 
     # --- Auxiliares de acesso (repostos para corrigir o erro) ---
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1299,6 +1341,9 @@ class LotoFacilBot:
         mode_ciclo = (len(context.args) >= 1 and str(context.args[0]).lower() in {"ciclo", "c"})
         if mode_ciclo:
             try:
+                # >>> ADIÇÃO: snapshot capturado antes da geração
+                snap = self._latest_snapshot()  # ADIÇÃO
+
                 historico = carregar_historico(HISTORY_PATH)
                 if not historico:
                     return await update.message.reply_text("Erro: histórico vazio.")
@@ -1362,6 +1407,17 @@ class LotoFacilBot:
                 a = _forcar_repeticoes_local(a, r_alvo)
                 apostas[i] = sorted(a)
 
+            # >>> ADIÇÃO: sanity check entre snapshots
+            last_snap = _PROCESS_CACHE.get("ab:cicloC:last_snapshot")  # ADIÇÃO
+            last_pack = _PROCESS_CACHE.get("ab:cicloC:last_pack")      # ADIÇÃO
+            if last_snap is not None and last_snap != snap.snapshot_id and last_pack == apostas:
+                await update.message.reply_text(
+                    "⚠️ Aviso: lote idêntico ao anterior apesar de snapshot diferente. "
+                    "Verifique se o history.csv corresponde ao concurso correto."
+                )
+            _PROCESS_CACHE["ab:cicloC:last_snapshot"] = snap.snapshot_id  # ADIÇÃO
+            _PROCESS_CACHE["ab:cicloC:last_pack"] = [a[:] for a in apostas]  # ADIÇÃO
+
             # formatação com rótulo de R por jogo
             linhas = ["🎯 <b>Ciclo C — baseado no último resultado</b>\n"
                       f"Âncoras: {CICLO_C_ANCHORS[0]:02d} e {CICLO_C_ANCHORS[1]:02d} | "
@@ -1378,6 +1434,8 @@ class LotoFacilBot:
                 now_sp = datetime.now(ZoneInfo(TIMEZONE))
                 carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
                 linhas.append(f"<i>base=último resultado | {carimbo}</i>")
+                # >>> ADIÇÃO: rodapé com snapshot e contexto do comando
+                linhas.append(f"<i>snapshot={snap.snapshot_id} | tz={TIMEZONE} | ab:cicloC</i>")  # ADIÇÃO
 
             return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
