@@ -1095,56 +1095,56 @@ class LotoFacilBot:
         # Cap de ruído + quebra de pares ruins mais uma vez
         apostas = self._cap_frequencia_ruido(apostas, ultimo=ultimo, comp=comp, anchors=set(anchors))
         apostas = [self._quebrar_pares_ruins(a, comp=comp, anchors=set(anchors))[0] for a in apostas]
-    # Anti-overlap final (interseção máxima = 11)
-    apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
-    # Passe final (paridade/seq e distribuição de ausentes)
-    apostas = self._finalizar_regras_mestre(apostas, ultimo=ultimo, comp=comp, anchors=anchors)
+        # Anti-overlap final (interseção máxima = 11)
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
+        # Passe final (paridade/seq e distribuição de ausentes)
+        apostas = self._finalizar_regras_mestre(apostas, ultimo=ultimo, comp=comp, anchors=anchors)
 
-    # ===== HARD SEAL DO PRESET MESTRE =====
-    anchors_set = set(anchors)
-    comp_list = list(comp)
+        # ===== HARD SEAL DO PRESET MESTRE =====
+        anchors_set = set(anchors)
+        comp_list = list(comp)
 
-    def _ensure_len_15(a: list[int]) -> list[int]:
-        # completa determinística até 15 dezenas (se alguma etapa anterior reduziu)
-        if len(a) < 15:
-            pool = [n for n in range(1, 26) if n not in a]
-            for n in pool:
-                a.append(n)
-                if len(a) == 15:
-                    break
-        return sorted(a)
+        def _ensure_len_15(a: list[int]) -> list[int]:
+            # completa determinística até 15 dezenas (se alguma etapa anterior reduziu)
+            if len(a) < 15:
+                pool = [n for n in range(1, 26) if n not in a]
+                for n in pool:
+                    a.append(n)
+                    if len(a) == 15:
+                        break
+            return sorted(a)
 
-    # 1) Tamanho 15 + convergência para paridade 7–8 e max_seq ≤ 3
-    for i, a in enumerate(apostas):
-        a = _ensure_len_15(a[:])
-        for _ in range(14):
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-            if len(a) == 15 and 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
-                break
-        apostas[i] = sorted(a)
-
-    # 2) Deduplicação leve (evita pacotes idênticos)
-    seen = set()
-    for i, a in enumerate(apostas):
-        key = tuple(a)
-        if key in seen:
-            # troca um número do último (não-âncora) por um ausente ainda não usado
-            rem = next((x for x in reversed(a) if x in ultimo and x not in anchors_set), None)
-            add = next((c for c in comp_list if c not in a), None)
-            if rem is not None and add is not None:
-                a.remove(rem); a.append(add); a.sort()
+        # 1) Tamanho 15 + convergência para paridade 7–8 e max_seq ≤ 3
+        for i, a in enumerate(apostas):
+            a = _ensure_len_15(a[:])
+            for _ in range(14):
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-        seen.add(tuple(a))
-        apostas[i] = a
+                if len(a) == 15 and 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+                    break
+            apostas[i] = sorted(a)
 
-    # 3) Anti-overlap finalíssimo + selagem idempotente
-    apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=11, anchors=anchors_set)
-    for i, a in enumerate(apostas):
-        a = _ensure_len_15(a[:])
-        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-        apostas[i] = sorted(a)
+        # 2) Deduplicação leve (evita pacotes idênticos)
+        seen = set()
+        for i, a in enumerate(apostas):
+            key = tuple(a)
+            if key in seen:
+                # troca um número do último (não-âncora) por um ausente ainda não usado
+                rem = next((x for x in reversed(a) if x in ultimo and x not in anchors_set), None)
+                add = next((c for c in comp_list if c not in a), None)
+                if rem is not None and add is not None:
+                    a.remove(rem); a.append(add); a.sort()
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            seen.add(tuple(a))
+            apostas[i] = a
 
-    return apostas
+        # 3) Anti-overlap finalíssimo + selagem idempotente
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=11, anchors=anchors_set)
+        for i, a in enumerate(apostas):
+            a = _ensure_len_15(a[:])
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            apostas[i] = sorted(a)
+
+        return apostas
 
     # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
