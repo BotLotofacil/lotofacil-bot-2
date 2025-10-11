@@ -1144,8 +1144,32 @@ class LotoFacilBot:
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
             apostas[i] = sorted(a)
 
-        return apostas
+        # 4) Dedup pós-anti-overlap (garante pacote 100% único)
+        seen = set()
+        for i, a in enumerate(apostas):
+            key = tuple(a)
+            if key in seen:
+                # troca 1 dezena do último (não-âncora) por um ausente ainda não usado
+                rem = next((x for x in reversed(a) if x in ultimo and x not in anchors_set), None)
+                add = next((c for c in comp_list if c not in a), None)
+                if rem is not None and add is not None and rem != add:
+                    a.remove(rem); a.append(add); a.sort()
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+                    key = tuple(a)
+        # se ainda colidiu, faz uma segunda tentativa bem leve
+        tries = 0
+        while key in seen and tries < 2:
+            rem = next((x for x in reversed(a) if x not in anchors_set), None)
+            add = next((c for c in comp_list if c not in a), None)
+            if rem is None or add is None: break
+            a.remove(rem); a.append(add); a.sort()
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+           key = tuple(a); tries += 1
+        seen.add(key)
+        apostas[i] = a
 
+    return apostas
+    
     # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
         if not historico:
