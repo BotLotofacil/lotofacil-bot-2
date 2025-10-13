@@ -6,36 +6,14 @@ import traceback
 import asyncio
 import re
 import hashlib
+import json
 from functools import partial
 from typing import List, Set, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from os import getenv
-# >>> ADIÇÃO: dataclass p/ snapshot
-from dataclasses import dataclass  # ADIÇÃO
-# >>> BEGIN PATCH A (imports e constantes do Bolão) >>>
-import json  # necessário p/ persistência do estado do bolão
-
-# Parâmetros do Bolão 19→15
-BOLAO_JANELA_FREQ = 80     # janela p/ frequência (aprox.)
-BOLAO_PLANOS_R = [10, 10, 9, 9, 10, 9, 10, 8, 11, 10]  # alvo de repetição vs último
-BOLAO_MAX_OVERLAP = 11     # sobreposição máxima entre apostas
-BOLAO_PARIDADE = (7, 8)    # alvo de pares
-BOLAO_MAX_SEQ = 3          # sequência máxima
-BOLAO_NEUTRA_RANGE = (12, 18)  # faixa "neutra" p/ reforço
-
-# Limites de aprendizado (bias)
-BOLAO_BIAS_MIN = -2.0
-BOLAO_BIAS_MAX =  2.0
-BOLAO_BIAS_HIT = +0.5   # incremento quando a dezena estava na matriz e foi sorteada
-BOLAO_BIAS_MISS = -0.2  # decremento quando estava na matriz e não saiu
-BOLAO_BIAS_ANCHOR_SCALE = 0.5  # âncoras sofrem metade do ajuste
-
-def _clamp(v, lo, hi):  # utilitário simples
-    return max(lo, min(hi, v))
-    
-# <<< END PATCH A
+from dataclasses import dataclass
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from dotenv import load_dotenv
@@ -95,19 +73,29 @@ COOLDOWN_SECONDS = 10
 # Identificação do build (para /versao)
 BUILD_TAG = getenv("BUILD_TAG", "unknown")
 
-# >>> ADIÇÃO: cache de processo em memória (sanity checks entre chamadas)
-_PROCESS_CACHE: dict = {}  # ADIÇÃO
+# ========================
+# Configurações do Bolão Inteligente v5 (19 → 15)
+# ========================
+BOLAO_JANELA = 80
+BOLAO_ALPHA  = 0.37
+BOLAO_QTD_APOSTAS = 10
+BOLAO_ANCHORS = (9, 11)
+BOLAO_STATE_PATH = "data/bolao_state.json"
 
-# >>> ADIÇÃO: controle explícito da ordem do CSV + helpers de hash/format
-# True  -> arquivo em ordem decrescente (linha 0 = concurso mais recente)
-# False -> arquivo em ordem crescente  (última linha = concurso mais recente)
-HISTORY_ORDER_DESC = True  # ADIÇÃO
+# Parâmetros do Bolão 19→15
+BOLAO_JANELA_FREQ = 80
+BOLAO_PLANOS_R = [10, 10, 9, 9, 10, 9, 10, 8, 11, 10]
+BOLAO_MAX_OVERLAP = 11
+BOLAO_PARIDADE = (7, 8)
+BOLAO_MAX_SEQ = 3
+BOLAO_NEUTRA_RANGE = (12, 18)
 
-def _fmt_dezenas(nums: List[int]) -> str:  # ADIÇÃO
-    return "".join(f"{n:02d}" for n in sorted(nums))
-
-def _hash_dezenas(nums: List[int]) -> str:  # ADIÇÃO
-    return hashlib.blake2b(_fmt_dezenas(nums).encode("utf-8"), digest_size=4).hexdigest()
+# Limites de aprendizado (bias)
+BOLAO_BIAS_MIN = -2.0
+BOLAO_BIAS_MAX =  2.0
+BOLAO_BIAS_HIT = +0.5
+BOLAO_BIAS_MISS = -0.2
+BOLAO_BIAS_ANCHOR_SCALE = 0.5
 
 # ========================
 # Heurísticas adicionais (Mestre + A/B)
@@ -128,14 +116,35 @@ CICLO_C_ANCHORS = (9, 11)
 CICLO_C_PLANOS = [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
 
 # ========================
-# BOLÃO INTELIGENTE v5 (19 → 15)
+# Cache e utilitários globais
 # ========================
-BOLAO_JANELA = 80
-BOLAO_ALPHA  = 0.37
-BOLAO_QTD_APOSTAS = 10
-BOLAO_ANCHORS = (9, 11)   # âncoras fixas
-BOLAO_STATE_PATH = "data/bolao_state.json"  # persistência leve
+_PROCESS_CACHE: dict = {}
+HISTORY_ORDER_DESC = True
 
+# ========================
+# Funções utilitárias
+# ========================
+def _fmt_dezenas(nums: List[int]) -> str:
+    return "".join(f"{n:02d}" for n in sorted(nums))
+
+def _hash_dezenas(nums: List[int]) -> str:
+    return hashlib.blake2b(_fmt_dezenas(nums).encode("utf-8"), digest_size=4).hexdigest()
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+# ========================
+# Estruturas de dados
+# ========================
+@dataclass
+class _Snapshot:
+    snapshot_id: str
+    tamanho: int
+    dezenas: List[int]
+
+# ========================
+# Funções do Bolão Inteligente v5
+# ========================
 def _freq_window(hist, bias: dict[int, float] | None = None):
     """
     Frequência simples na janela (hist já cortado).
@@ -165,10 +174,8 @@ def _atrasos_recent_first(hist_recent_first):
                 atrasos[n] = idx
     return atrasos
 
-# ------- Estado do Bolão (persistência simples) -------
 def _bolao_load_state(path: str = BOLAO_STATE_PATH) -> dict:
     """Carrega estado/bias do bolão; retorna estrutura padrão se não existir."""
-    import json, os
     if not os.path.exists(path):
         return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None}
     try:
@@ -185,23 +192,12 @@ def _bolao_load_state(path: str = BOLAO_STATE_PATH) -> dict:
 
 def _bolao_save_state(state: dict, path: str = BOLAO_STATE_PATH):
     """Grava estado do bolão de forma atômica."""
-    import json, os, tempfile
+    import tempfile
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-# >>> ADIÇÃO: estrutura de Snapshot para diagnosticar a base corrente
-@dataclass
-class _Snapshot:  # ADIÇÃO
-    snapshot_id: str  # ex: "3509|a1b2c3d4"
-    tamanho: int      # total de concursos no CSV
-    dezenas: List[int]  # último resultado (ordenado)
-
 
 # ========================
 # Bot Principal
@@ -311,8 +307,7 @@ class LotoFacilBot:
             alpha = ALPHA_PADRAO
         return qtd, janela, alpha
 
-    # >>> ADIÇÃO: pega o último resultado respeitando a ordem declarada
-    def _ultimo_resultado(self, historico) -> List[int]:  # ADIÇÃO
+    def _ultimo_resultado(self, historico) -> List[int]:
         """
         Retorna o concurso mais recente conforme HISTORY_ORDER_DESC.
         - HISTORY_ORDER_DESC=True  -> historico[0]
@@ -323,14 +318,13 @@ class LotoFacilBot:
         ult = historico[0] if HISTORY_ORDER_DESC else historico[-1]
         return sorted(list(ult))
 
-    # >>> ADIÇÃO: Snapshot atual da base (tamanho + hash do último)
-    def _latest_snapshot(self) -> _Snapshot:  # ADIÇÃO
+    def _latest_snapshot(self) -> _Snapshot:
         historico = carregar_historico(HISTORY_PATH)
         if not historico:
             raise ValueError("Histórico vazio.")
         tamanho = len(historico)
         ultimo = self._ultimo_resultado(historico)
-        h8 = _hash_dezenas(ultimo)  # 8 hex chars
+        h8 = _hash_dezenas(ultimo)
         snapshot_id = f"{tamanho}|{h8}"
         return _Snapshot(snapshot_id=snapshot_id, tamanho=tamanho, dezenas=ultimo)
 
@@ -422,19 +416,13 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("meuid", self.meuid))
         self.app.add_handler(CommandHandler("autorizar", self.autorizar))
         self.app.add_handler(CommandHandler("remover", self.remover))
-        self.app.add_handler(CommandHandler("backtest", self.backtest))  # oculto (só admin)
-        # --- Novo handler: /mestre ---
+        self.app.add_handler(CommandHandler("backtest", self.backtest))
         self.app.add_handler(CommandHandler("mestre", self.mestre))
-        # --- Novo handler: /ab (A/B técnico) ---
         self.app.add_handler(CommandHandler("ab", self.ab))
-        # >>> ADIÇÃO: handler /diagbase para diagnosticar a base atual
-        self.app.add_handler(CommandHandler("diagbase", self.diagbase))  # ADIÇÃO
-        # Diagnóstico
+        self.app.add_handler(CommandHandler("diagbase", self.diagbase))
         self.app.add_handler(CommandHandler("ping", self.ping))
         self.app.add_handler(CommandHandler("versao", self.versao))
-        # --- Novo handler: /mestre_bolao (fechamento virtual 19→15) ---
         self.app.add_handler(CommandHandler("mestre_bolao", self.mestre_bolao))
-        # --- Novo handler: /refinar_bolao ---
         self.app.add_handler(CommandHandler("refinar_bolao", self.refinar_bolao))
         logger.info("Handlers ativos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao")
 
@@ -541,7 +529,6 @@ class LotoFacilBot:
 
         def tentar_quebrar_sequencias(a_local, comp_local):
             changed = False
-            # enquanto houver sequência > max_seq e houver candidatos no comp
             guard = 0
             while max_seq_run(a_local) > max_seq and comp_local and guard < 50:
                 guard += 1
@@ -561,18 +548,17 @@ class LotoFacilBot:
                     seqs.append((start, s[-1], run))
                 if not seqs:
                     break
-                seqs.sort(key=lambda t: t[2], reverse=True)  # maior primeiro
+                seqs.sort(key=lambda t: t[2], reverse=True)
                 rem = None
                 for st, fn, _run in seqs:
-                    for x in range(fn, st - 1, -1):  # do fim pro início
+                    for x in range(fn, st - 1, -1):
                         if x in a_local and x not in anchors:
                             rem = x
                             break
                     if rem is None:
                         break
                 if rem is None:
-                    break  # não mexe se só houver âncoras nas sequências
-                # escolhe substituto que não crie nova sequência
+                    break
                 sub = next((c for c in comp_local if (c-1 not in a_local) and (c+1 not in a_local)), None)
                 if sub is None:
                     sub = comp_local[0]
@@ -580,18 +566,15 @@ class LotoFacilBot:
                 a_local.append(sub)
                 a_local.sort()
                 changed = True
-                # recomputa comp porque removemos/adicionamos
                 comp_local[:] = [n for n in range(1, 26) if n not in a_local]
             return changed
 
         def tentar_ajustar_paridade(a_local, comp_local, min_par, max_par):
             pares = contar_pares(a_local)
             if pares > max_par:
-                # reduzir pares: tira um par (não âncora) e põe um ímpar do comp
                 rem = next((x for x in a_local if x % 2 == 0 and x not in anchors), None)
                 add = next((c for c in comp_local if c % 2 == 1), None)
             elif pares < min_par:
-                # aumentar pares: tira um ímpar (não âncora) e põe um par do comp
                 rem = next((x for x in a_local if x % 2 == 1 and x not in anchors), None)
                 add = next((c for c in comp_local if c % 2 == 0), None)
             else:
@@ -600,14 +583,12 @@ class LotoFacilBot:
                 a_local.remove(rem)
                 a_local.append(add)
                 a_local.sort()
-                # recomputa comp imediatamente
                 comp_local[:] = [n for n in range(1, 26) if n not in a_local]
                 return True
             return False
 
         min_par, max_par = alvo_par
 
-        # Loop de convergência com recomputo de comp a cada passo
         for _ in range(40):
             comp = [n for n in range(1, 26) if n not in a]
             m1 = tentar_quebrar_sequencias(a, comp)
@@ -616,11 +597,8 @@ class LotoFacilBot:
             if not m1 and not m2:
                 break
 
-        # ===== Passe de selagem (hard-stop) =====
-        # Se ainda ficou fora de 7–8 ou com sequência > max_seq, faz uma última dupla passada.
         if not (min_par <= contar_pares(a) <= max_par) or max_seq_run(a) > max_seq:
             comp = [n for n in range(1, 26) if n not in a]
-            # força pelo menos uma tentativa de troca mesmo se comp estiver vazio
             fallback = [n for n in range(1, 26) if (n not in a) and (n not in anchors)]
             _ = tentar_ajustar_paridade(a, comp or fallback, min_par, max_par)
             comp = [n for n in range(1, 26) if n not in a]
@@ -637,7 +615,6 @@ class LotoFacilBot:
         L = list(last_sorted)
         C = list(comp_sorted)
 
-        # rotaciona último
         base = L[offset_last % len(L):] + L[:offset_last % len(L)]
         manter = base[:repeticoes]
 
@@ -652,7 +629,6 @@ class LotoFacilBot:
 
         aposta = sorted(set(manter + completar))
 
-        # completa se ainda faltar algo (quando C vazio ou houve deduplicação)
         if len(aposta) < 15:
             pool = [n for n in range(1, 26) if n not in aposta]
             for n in pool:
@@ -673,7 +649,7 @@ class LotoFacilBot:
         Gera uma semente estável baseada no usuário, chat e último resultado.
         Assim, cada usuário/chat recebe um pacote diferente, mas reprodutível.
         """
-        ultimo_str = "".join(f"{n:02d}" for n in ultimo_sorted)  # ex: "010203...25"
+        ultimo_str = "".join(f"{n:02d}" for n in ultimo_sorted)
         key = f"{user_id}|{chat_id}|{ultimo_str}"
         return self._stable_hash_int(key)
 
@@ -689,7 +665,6 @@ class LotoFacilBot:
         from collections import Counter
 
         comp_set = set(comp)
-        # 1) AUSENTES FORTES (ordem determinística)
         preferidos = [20, 22, 24, 10, 12, 14, 16, 18]
         ausentes_fortes = [n for n in preferidos if n in comp_set]
 
@@ -719,7 +694,6 @@ class LotoFacilBot:
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
                 apostas[idx] = a
 
-        # 2) LIMITAR REPETIÇÃO de dezenas do último resultado
         from collections import Counter as _Counter
         cnt = _Counter()
         for a in apostas:
@@ -743,12 +717,10 @@ class LotoFacilBot:
                     a.remove(dezena)
                     a.append(add)
                     a.sort()
-                    # REMOVIDO anchors=set(anchors) (não existe anchors aqui; Mestre usa âncoras leves)
                     a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
                     apostas[i] = a
                     cnt[dezena] -= 1
 
-        # 3) GARANTIR FAIXA MÉDIA (12..18)
         mid_lo, mid_hi = 12, 18
         for i, a in enumerate(apostas):
             a = sorted(a)
@@ -795,17 +767,14 @@ class LotoFacilBot:
           - garante len==15 (complementa por comp; se esgotar, usa pool 1..25 sem repetir).
         """
         def _fix_len15(a: list[int]) -> list[int]:
-            """Garante exatamente 15 dezenas sem repetir."""
             a = list(a)
             if len(a) < 15:
                 presentes = set(a)
-                # tenta primeiro do complemento informado
                 for c in comp:
                     if len(a) == 15:
                         break
                     if c not in presentes:
                         a.append(c); presentes.add(c)
-                # fallback: qualquer dezena de 1..25 que não esteja presente
                 if len(a) < 15:
                     for n in range(1, 26):
                         if n not in presentes:
@@ -813,7 +782,6 @@ class LotoFacilBot:
                             if len(a) == 15:
                                 break
             elif len(a) > 15:
-                # corta excedentes não âncora, depois quaisquer outros, preservando diversidade
                 s_anc = set(anchors)
                 i = len(a) - 1
                 while len(a) > 15 and i >= 0:
@@ -826,7 +794,6 @@ class LotoFacilBot:
             return sorted(a)
 
         comp_pool_base = sorted(set(comp))
-        # percorre algumas vezes para estabilizar
         for _outer in range(3):
             changed_any_outer = False
             for i in range(len(apostas)):
@@ -841,10 +808,8 @@ class LotoFacilBot:
                         if len(inter) <= max_overlap:
                             break
 
-                        # pool renovado a cada iteração (nunca descartamos sem repor)
                         comp_pool = [c for c in comp_pool_base if c not in a or c not in b]
 
-                        # tenta mexer em 'a' primeiro
                         out = next(
                             (x for x in inter if (x in ultimo) and (x not in anchors) and (x in a)),
                             None
@@ -860,8 +825,7 @@ class LotoFacilBot:
                                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                                 a = _fix_len15(a)
                                 changed_any_outer = True
-                                continue  # reavalia interseção
-                        # senão, tenta mexer em 'b'
+                                continue
                         out_b = next(
                             (x for x in inter if (x in ultimo) and (x not in anchors) and (x in b)),
                             None
@@ -878,10 +842,8 @@ class LotoFacilBot:
                                 b = _fix_len15(b)
                                 changed_any_outer = True
                                 continue
-                        # sem como reduzir mais
                         break
 
-                    # escreve de volta se mudou
                     if a != apostas[i]:
                         apostas[i] = _fix_len15(a)
                     if b != apostas[j]:
@@ -890,7 +852,6 @@ class LotoFacilBot:
             if not changed_any_outer:
                 break
 
-        # selagem final de segurança em todas
         apostas = [
             _fix_len15(self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors))
             for a in apostas
@@ -899,16 +860,10 @@ class LotoFacilBot:
 
     # --------- Passe final para garantir regras após ajustes ---------
     def _finalizar_regras_mestre(self, apostas, ultimo, comp, anchors):
-        """
-        Passes finais: reforça paridade 7–8 e max_seq<=3, reequilibra ausentes (min/max)
-        e aplica um anti-overlap final. Evita que passos anteriores reintroduzam falhas.
-        """
         from collections import Counter
 
-        # 1) Normalização individual (paridade e sequência)
         apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
 
-        # 2) Re-checagem de distribuição de ausentes (min/max)
         comp_set = set(comp)
         comp_list = sorted(comp_set)
         min_per_absent = 2 if len(comp_list) <= 10 else 1
@@ -920,7 +875,6 @@ class LotoFacilBot:
                 if n in comp_set:
                     cnt_abs[n] += 1
 
-        # 2a) Força mínimos de presença para ausentes
         for n in comp_list:
             while cnt_abs[n] < min_per_absent:
                 idx = min(range(len(apostas)), key=lambda k: sum(1 for x in apostas[k] if x in comp_set))
@@ -933,7 +887,6 @@ class LotoFacilBot:
                 apostas[idx] = alvo
                 cnt_abs[n] += 1
 
-        # 2b) Corta excessos acima do teto
         for n in comp_list:
             while cnt_abs[n] > max_per_absent:
                 idx = max(
@@ -953,7 +906,6 @@ class LotoFacilBot:
                 apostas[idx] = a
                 cnt_abs[n] -= 1
 
-        # 3) Normalização final + anti-overlap (anti-overlap é a porta de saída)
         apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=set(anchors))
         return apostas
@@ -968,11 +920,6 @@ class LotoFacilBot:
         return None
 
     def _quebrar_pares_ruins(self, aposta, comp, anchors=()):
-        """
-        Se a aposta contém algum par penalizado, substitui preferencialmente
-        o número NÃO âncora por um candidato do complemento que não crie
-        sequência longa, mantendo paridade alvo ao final.
-        """
         a = sorted(aposta)
         comp_list = [c for c in sorted(comp) if c not in a]
         while True:
@@ -980,13 +927,11 @@ class LotoFacilBot:
             if not par or not comp_list:
                 break
             x, y = par
-            # remove o que NÃO é âncora; se ambos forem âncora, remove o maior
             sair = y if x in anchors else x
             if x in anchors and y in anchors:
                 sair = max(x, y)
             if sair not in a:
                 break
-            # escolhe substituto que não estenda sequência
             sub = None
             for c in comp_list:
                 if (c - 1 not in a) and (c + 1 not in a):
@@ -998,15 +943,10 @@ class LotoFacilBot:
             a.append(sub)
             a.sort()
             comp_list.remove(sub)
-            # normaliza regras (AGORA protegendo âncoras)
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
         return a, True
 
     def _cap_frequencia_ruido(self, apostas, ultimo, comp, anchors=()):
-        """
-        Garante que cada dezena de RUIDOS não apareça em mais que RUIDO_CAP_POR_LOTE apostas.
-        Se exceder, substitui em apostas onde o ruído aparece por um candidato seguro do complemento.
-        """
         from collections import Counter
         pres = Counter()
         for a in apostas:
@@ -1036,7 +976,6 @@ class LotoFacilBot:
                 if rem is None or rem not in a:
                     break
                 a.remove(rem); a.append(add); a.sort()
-                # normalização protegendo âncoras
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
                 apostas[idx] = a
                 pres[r] -= 1
@@ -1047,18 +986,9 @@ class LotoFacilBot:
 
     # --------- Gerador mestre (com seed por usuário/chat) ---------
     def _gerar_mestre_por_ultimo_resultado(self, historico, seed: int | None = None):
-        """
-        Gera 10 apostas determinísticas a partir do último resultado:
-        - 1x com 8R
-        - 1x com 11R
-        - demais com 9–10R
-        Regras: paridade 7–8 e max_seq=3, cobrindo ausentes.
-        Personalizado por usuário/chat via seed (reprodutível).
-        """
-        ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
+        ultimo = self._ultimo_resultado(historico)
         comp = self._complemento(set(ultimo))
 
-        # ===== Anchors por janela curta (50) =====
         N_JANELA_ANCHOR = 50
         hist = list(historico)
         jan = hist[-N_JANELA_ANCHOR:] if len(hist) >= N_JANELA_ANCHOR else hist[:]
@@ -1067,7 +997,6 @@ class LotoFacilBot:
             for n in conc:
                 freq[n] += 1
 
-        # âncoras adaptativas:
         prefer = []
         if 13 in ultimo:
             prefer.append(13)
@@ -1077,14 +1006,11 @@ class LotoFacilBot:
         hot = sorted([n for n in ultimo if n not in prefer], key=lambda x: (-freq[x], x))
         anchors = (prefer + hot)[:3]
 
-        # índices onde exigimos 2 âncoras e onde empurramos 3 âncoras
-        want_two_anchor_idx = set(range(10)) - {7, 8}  # quase todos, exceto variações 8R/11R
+        want_two_anchor_idx = set(range(10)) - {7, 8}
         want_three_anchor_idx = {0, 5, 9, 2}
 
-        # plano de repetição (10 jogos): 10,10,9,9,10,9,10,8,11,10
         planos = [10, 10, 9, 9, 10, 9, 10, 8, 11, 10]
 
-        # semente para offsets
         seed = int(seed or 0)
 
         apostas = []
@@ -1100,7 +1026,6 @@ class LotoFacilBot:
                 offset_comp=off_comp,
             )
 
-            # injeta âncoras leves conforme o plano
             need = 2 if i in want_two_anchor_idx else 1
             if i in want_three_anchor_idx and len(anchors) >= 3:
                 need = 3
@@ -1120,7 +1045,6 @@ class LotoFacilBot:
             aposta, _ = self._quebrar_pares_ruins(aposta, comp=comp, anchors=set(anchors))
             apostas.append(aposta)
 
-        # cobertura de ausentes
         ausentes = set(comp)
         presentes_em_alguma = set(n for a in apostas for n in a)
         faltantes = [n for n in ausentes if n not in presentes_em_alguma]
@@ -1136,7 +1060,6 @@ class LotoFacilBot:
             a, _ = self._quebrar_pares_ruins(a, comp=comp, anchors=set(anchors))
             apostas[-1] = a
 
-        # ===== Balanceamento de AUSENTES (min/max por dezena) =====
         from collections import Counter
         comp_list = list(comp)
         min_per_absent = 2 if len(comp_list) <= 10 else 1
@@ -1148,7 +1071,6 @@ class LotoFacilBot:
                 if n in comp:
                     cnt_abs[n] += 1
 
-        # força mínimos
         faltantes_min = [n for n in comp_list if cnt_abs[n] < min_per_absent]
         if faltantes_min:
             for n in faltantes_min:
@@ -1162,7 +1084,6 @@ class LotoFacilBot:
                     apostas[idx] = alvo
                     cnt_abs[n] += 1
 
-        # corta excessos
         excessos = [n for n in comp_list if cnt_abs[n] > max_per_absent]
         if excessos:
             for n in excessos:
@@ -1180,25 +1101,19 @@ class LotoFacilBot:
                         if cnt_abs[n] <= max_per_absent:
                             break
 
-        # Diversificação e reequilíbrio final
         apostas = self._diversificar_mestre(
             apostas, ultimo=ultimo, comp=set(comp),
             max_rep_ultimo=7, min_mid=3, min_fortes=2
         )
-        # Cap de ruído + quebra de pares ruins mais uma vez
         apostas = self._cap_frequencia_ruido(apostas, ultimo=ultimo, comp=comp, anchors=set(anchors))
         apostas = [self._quebrar_pares_ruins(a, comp=comp, anchors=set(anchors))[0] for a in apostas]
-        # Anti-overlap final (interseção máxima = 11)
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11)
-        # Passe final (paridade/seq e distribuição de ausentes)
         apostas = self._finalizar_regras_mestre(apostas, ultimo=ultimo, comp=comp, anchors=anchors)
 
-        # ===== HARD SEAL DO PRESET MESTRE =====
         anchors_set = set(anchors)
         comp_list = list(comp)
 
         def _ensure_len_15(a: list[int]) -> list[int]:
-            # completa determinística até 15 dezenas (se alguma etapa anterior reduziu)
             if len(a) < 15:
                 pool = [n for n in range(1, 26) if n not in a]
                 for n in pool:
@@ -1207,7 +1122,6 @@ class LotoFacilBot:
                         break
             return sorted(a)
 
-        # 1) Tamanho 15 + convergência para paridade 7–8 e max_seq ≤ 3
         for i, a in enumerate(apostas):
             a = _ensure_len_15(a[:])
             for _ in range(14):
@@ -1216,12 +1130,10 @@ class LotoFacilBot:
                     break
             apostas[i] = sorted(a)
 
-        # 2) Deduplicação leve (evita pacotes idênticos)
         seen = set()
         for i, a in enumerate(apostas):
             key = tuple(a)
             if key in seen:
-                # troca um número do último (não-âncora) por um ausente ainda não usado
                 rem = next((x for x in reversed(a) if x in ultimo and x not in anchors_set), None)
                 add = next((c for c in comp_list if c not in a), None)
                 if rem is not None and add is not None:
@@ -1230,19 +1142,16 @@ class LotoFacilBot:
             seen.add(tuple(a))
             apostas[i] = a
 
-        # 3) Anti-overlap finalíssimo + selagem idempotente
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=11, anchors=anchors_set)
         for i, a in enumerate(apostas):
             a = _ensure_len_15(a[:])
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
             apostas[i] = sorted(a)
 
-        # 4) Dedup pós-anti-overlap (garante pacote 100% único)
         seen = set()
         for i, a in enumerate(apostas):
             key = tuple(a)
             if key in seen:
-                # troca 1 dezena do último (não-âncora) por um ausente ainda não usado
                 rem = next((x for x in reversed(a) if x in ultimo and x not in anchors_set), None)
                 add = next((c for c in comp_list if c not in a), None)
                 if rem is not None and add is not None and rem != add:
@@ -1252,7 +1161,6 @@ class LotoFacilBot:
                     a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
                     key = tuple(a)
 
-            # se ainda colidiu, faz uma segunda tentativa bem leve
             tries = 0
             while key in seen and tries < 2:
                 rem = next((x for x in reversed(a) if x not in anchors_set), None)
@@ -1276,29 +1184,18 @@ class LotoFacilBot:
     # ========================
 
     def _janela_recent_first(self, historico, janela: int):
-        """Recorta a janela e garante ordem 'mais recente primeiro'."""
         jan = ultimos_n_concursos(historico, janela)
         if HISTORY_ORDER_DESC:
-            # historico[0] já é o mais recente; ultimos_n_concursos costuma manter isso
             return list(jan)
         else:
-            # se a base vier crescente, invertimos para trabalhar recent-first
             return list(reversed(jan))
 
     def _selecionar_matriz19(self, historico) -> list[int]:
-        """
-        Seleciona 19 dezenas determinísticas para o 'fechamento virtual' (19 → 15):
-        - 10 repetidas do último, priorizadas por frequência (com viés aprendido) na janela 80
-        - 5–6 ausentes quentes (atraso <= 8)
-        - 2–4 neutras para cobrir zonas e paridade
-        - Âncoras (9,11) sempre presentes
-        """
         if not historico:
             raise ValueError("Histórico vazio.")
         ultimo = self._ultimo_resultado(historico)
         u_set = set(ultimo)
 
-        # Carrega estado/bias
         st = _bolao_load_state()
         bias = {int(k): float(v) for k, v in st.get("bias", {}).items()}
 
@@ -1306,16 +1203,13 @@ class LotoFacilBot:
         freq_eff = _freq_window(jan_rf, bias=bias)
         atrasos = _atrasos_recent_first(jan_rf)
 
-        # 1) Top-10 repetidas do último por frequência efetiva
         r10 = sorted(ultimo, key=lambda n: (-freq_eff[n], n))[:10]
 
-        # 2) Ausentes quentes (não estão no último) com atraso pequeno (<=8)
         ausentes = [n for n in range(1, 26) if n not in u_set]
         hot_abs = [n for n in ausentes if atrasos[n] <= 8]
         hot_abs.sort(key=lambda n: (atrasos[n], -freq_eff[n], n))
         hot_take = hot_abs[:6] if len(hot_abs) >= 6 else hot_abs[:max(0, 5)]
 
-        # 3) Neutras para fechar 19: prioriza faixa 12..18 e equilíbrio de paridade
         usados = set(r10) | set(hot_take)
         faltam = 19 - len(usados)
         neutrals_pool = [n for n in ausentes if n not in usados]
@@ -1327,13 +1221,11 @@ class LotoFacilBot:
 
         matriz = sorted(set(r10) | set(hot_take) | set(neutros))
 
-        # 4) Âncoras garantidas
         for anc in BOLAO_ANCHORS:
             if anc not in matriz:
                 candidatos = [n for n in matriz if n not in BOLAO_ANCHORS and n not in u_set]
                 if not candidatos:
                     candidatos = [n for n in matriz if n not in BOLAO_ANCHORS]
-                # rem= "menos valioso" segundo atraso alto e freq baixa (freq_eff)
                 rem = max(candidatos, key=lambda n: (atrasos[n], -freq_eff[n], n), default=None)
                 if rem is not None and rem != anc:
                     matriz.remove(rem)
@@ -1350,253 +1242,195 @@ class LotoFacilBot:
         return matriz
 
     def _subsets_19_para_15(self, matriz19: list[int]) -> list[list[int]]:
-    """
-    HARD-SEAL v2 — Gera 10 subconjuntos (15 dezenas) dentro de 'matriz19',
-    garantindo de forma agressiva:
-      • paridade ∈ [7, 8]
-      • max_seq ≤ BOLAO_MAX_SEQ (padrão=3)
-      • overlap interno ≤ 11
-    Tudo SEM sair da própria matriz19.
-    """
-    m = sorted(set(int(x) for x in matriz19))
-    L = len(m)
-    if L < 19:
-        # preenche defensivamente (não deve acontecer na prática)
-        pool = [n for n in range(1, 26) if n not in m]
-        for n in pool:
-            m.append(n)
-            if len(m) == 19:
-                break
-        m = sorted(m[:19])
+        m = sorted(set(int(x) for x in matriz19))
+        L = len(m)
+        if L < 19:
+            pool = [n for n in range(1, 26) if n not in m]
+            for n in pool:
+                m.append(n)
+                if len(m) == 19:
+                    break
+            m = sorted(m[:19])
 
-    anchors = set(BOLAO_ANCHORS)
-    MAX_SEQ = int(BOLAO_MAX_SEQ)
-    PAR_MIN, PAR_MAX = BOLAO_PARIDADE
+        anchors = set(BOLAO_ANCHORS)
+        MAX_SEQ = int(BOLAO_MAX_SEQ)
+        PAR_MIN, PAR_MAX = BOLAO_PARIDADE
 
-    # ---------- Helpers locais (só usam a própria matriz m) ----------
-    def contar_pares(a): return sum(1 for x in a if x % 2 == 0)
+        def contar_pares(a): return sum(1 for x in a if x % 2 == 0)
 
-    def max_seq_run(lst):
-        s = sorted(lst)
-        best = cur = 1
-        for i in range(1, len(s)):
-            if s[i] == s[i-1] + 1:
-                cur += 1
-                best = max(best, cur)
-            else:
-                cur = 1
-        return best
+        def max_seq_run(lst):
+            s = sorted(lst)
+            best = cur = 1
+            for i in range(1, len(s)):
+                if s[i] == s[i-1] + 1:
+                    cur += 1
+                    best = max(best, cur)
+                else:
+                    cur = 1
+            return best
 
-    def candidatos_add(a, prefer_par: int | None = None):
-        """
-        Candidatos para adicionar vindos de 'm' que:
-          1) não estão em 'a'
-          2) preferencialmente não encostam em vizinhos (anti-sequência)
-          3) se prefer_par in {0,1}, prioriza pares/ímpares
-        """
-        base = [x for x in m if x not in a]
-        anti_seq = [x for x in base if (x - 1 not in a) and (x + 1 not in a)]
-        prefer = anti_seq if anti_seq else base
-        if prefer_par in (0, 1):
-            prefer2 = [x for x in prefer if x % 2 == prefer_par]
-            if prefer2:
-                return prefer2
-        return prefer
+        def candidatos_add(a, prefer_par: int | None = None):
+            base = [x for x in m if x not in a]
+            anti_seq = [x for x in base if (x - 1 not in a) and (x + 1 not in a)]
+            prefer = anti_seq if anti_seq else base
+            if prefer_par in (0, 1):
+                prefer2 = [x for x in prefer if x % 2 == prefer_par]
+                if prefer2:
+                    return prefer2
+            return prefer
 
-    def remover_que_nao_ancora(a, prefer_par: int | None = None, dentro_sequencia: bool = False):
-        """
-        Escolhe um número para remover de 'a' (não âncora).
-        - Se dentro_sequencia=True, tenta remover alguém de uma sequência longa primeiro.
-        - Se prefer_par in {0,1}, tenta remover daquele tipo.
-        """
-        s = sorted(a)
-        # Mapeia sequências
-        runs = []
-        start = s[0]; run = 1
-        for i in range(1, len(s)):
-            if s[i] == s[i-1] + 1:
-                run += 1
-            else:
-                if run > 1: runs.append((start, s[i-1], run))
-                start = s[i]; run = 1
-        if run > 1: runs.append((start, s[-1], run))
-        runs.sort(key=lambda t: t[2], reverse=True)  # maiores primeiro
+        def remover_que_nao_ancora(a, prefer_par: int | None = None, dentro_sequencia: bool = False):
+            s = sorted(a)
+            runs = []
+            start = s[0]; run = 1
+            for i in range(1, len(s)):
+                if s[i] == s[i-1] + 1:
+                    run += 1
+                else:
+                    if run > 1: runs.append((start, s[i-1], run))
+                    start = s[i]; run = 1
+            if run > 1: runs.append((start, s[-1], run))
+            runs.sort(key=lambda t: t[2], reverse=True)
 
-        # 1) se queremos quebrar sequência, tente remover dentro da maior
-        if dentro_sequencia and runs:
-            st, fn, _r = runs[0]
-            seq_vals = list(range(st, fn + 1))
-            # remova do fim ao início, evitando âncoras
-            for x in reversed(seq_vals):
-                if x in a and x not in anchors:
-                    if prefer_par in (0, 1) and (x % 2 != prefer_par):
-                        continue
-                    return x
+            if dentro_sequencia and runs:
+                st, fn, _r = runs[0]
+                seq_vals = list(range(st, fn + 1))
+                for x in reversed(seq_vals):
+                    if x in a and x not in anchors:
+                        if prefer_par in (0, 1) and (x % 2 != prefer_par):
+                            continue
+                        return x
 
-        # 2) fallback: remove não âncora, preferindo o maior (estável)
-        candidatos = [x for x in reversed(s) if x not in anchors]
-        if prefer_par in (0, 1):
-            cand2 = [x for x in candidatos if x % 2 == prefer_par]
-            if cand2:
-                return cand2[0]
-        return candidatos[0] if candidatos else None
+            candidatos = [x for x in reversed(s) if x not in anchors]
+            if prefer_par in (0, 1):
+                cand2 = [x for x in candidatos if x % 2 == prefer_par]
+                if cand2:
+                    return cand2[0]
+            return candidatos[0] if candidatos else None
 
-    def hard_selar_regras(a):
-        """
-        Loop de convergência: força max_seq ≤ MAX_SEQ e paridade ∈ [PAR_MIN, PAR_MAX]
-        SEM sair da matriz 'm', evitando criar novas correntes.
-        """
-        a = sorted(set(a))
-        for _ in range(60):
-            pares = contar_pares(a)
-            ms = max_seq_run(a)
+        def hard_selar_regras(a):
+            a = sorted(set(a))
+            for _ in range(60):
+                pares = contar_pares(a)
+                ms = max_seq_run(a)
 
-            changed = False
+                changed = False
 
-            # 1) Corrigir sequências longas primeiro
-            if ms > MAX_SEQ:
-                # remover algo de dentro da maior sequência (não âncora)
-                rem = remover_que_nao_ancora(a, prefer_par=None, dentro_sequencia=True)
-                if rem is not None:
-                    # tenta escolher add que não encoste em ninguém
-                    add = None
-                    # leve empurrão de paridade: se já está fora, prefira o lado que corrige
+                if ms > MAX_SEQ:
+                    rem = remover_que_nao_ancora(a, prefer_par=None, dentro_sequencia=True)
+                    if rem is not None:
+                        add = None
+                        if pares > PAR_MAX:
+                            cand = candidatos_add(a, prefer_par=1)
+                            add = cand[0] if cand else None
+                        elif pares < PAR_MIN:
+                            cand = candidatos_add(a, prefer_par=0)
+                            add = cand[0] if cand else None
+                        if add is None:
+                            cand = candidatos_add(a, prefer_par=None)
+                            add = cand[0] if cand else None
+
+                        if add is not None and rem in a:
+                            a.remove(rem); a.append(add); a.sort()
+                            changed = True
+
+                pares = contar_pares(a)
+                if not changed:
                     if pares > PAR_MAX:
-                        # pares demais → adicionar ímpar
-                        cand = candidatos_add(a, prefer_par=1)
-                        add = cand[0] if cand else None
+                        rem = remover_que_nao_ancora(a, prefer_par=0, dentro_sequencia=False)
+                        add_list = candidatos_add(a, prefer_par=1)
+                        add = add_list[0] if add_list else None
+                        if rem is not None and add is not None and rem in a and add not in a:
+                            a.remove(rem); a.append(add); a.sort()
+                            changed = True
+
                     elif pares < PAR_MIN:
-                        # pares de menos → adicionar par
-                        cand = candidatos_add(a, prefer_par=0)
-                        add = cand[0] if cand else None
-                    if add is None:
-                        cand = candidatos_add(a, prefer_par=None)
-                        add = cand[0] if cand else None
+                        rem = remover_que_nao_ancora(a, prefer_par=1, dentro_sequencia=False)
+                        add_list = candidatos_add(a, prefer_par=0)
+                        add = add_list[0] if add_list else None
+                        if rem is not None and add is not None and rem in a and add not in a:
+                            a.remove(rem); a.append(add); a.sort()
+                            changed = True
 
-                    if add is not None and rem in a:
-                        a.remove(rem); a.append(add); a.sort()
-                        changed = True
-
-            # 2) Ajuste fino de paridade
-            pares = contar_pares(a)
-            if not changed:
-                if pares > PAR_MAX:
-                    # remover um PAR (não âncora) e adicionar ÍMPAR da matriz que não crie sequência
-                    rem = remover_que_nao_ancora(a, prefer_par=0, dentro_sequencia=False)
-                    add_list = candidatos_add(a, prefer_par=1)
-                    add = add_list[0] if add_list else None
+                if not changed and (pares < PAR_MIN or pares > PAR_MAX or max_seq_run(a) > MAX_SEQ):
+                    rem = remover_que_nao_ancora(a, prefer_par=None, dentro_sequencia=True)
+                    add = None
+                    pref = 0 if pares < PAR_MIN else (1 if pares > PAR_MAX else None)
+                    cand = candidatos_add(a, prefer_par=pref)
+                    add = cand[0] if cand else None
                     if rem is not None and add is not None and rem in a and add not in a:
                         a.remove(rem); a.append(add); a.sort()
                         changed = True
 
-                elif pares < PAR_MIN:
-                    # remover um ÍMPAR (não âncora) e adicionar PAR da matriz que não crie sequência
-                    rem = remover_que_nao_ancora(a, prefer_par=1, dentro_sequencia=False)
-                    add_list = candidatos_add(a, prefer_par=0)
-                    add = add_list[0] if add_list else None
-                    if rem is not None and add is not None and rem in a and add not in a:
-                        a.remove(rem); a.append(add); a.sort()
-                        changed = True
+                if not changed:
+                    if PAR_MIN <= contar_pares(a) <= PAR_MAX and max_seq_run(a) <= MAX_SEQ:
+                        break
 
-            # 3) Se nada mudou, tentamos um micro-ajuste neutro para sair de platôs
-            if not changed and (pares < PAR_MIN or pares > PAR_MAX or max_seq_run(a) > MAX_SEQ):
-                rem = remover_que_nao_ancora(a, prefer_par=None, dentro_sequencia=True)
-                add = None
-                pref = 0 if pares < PAR_MIN else (1 if pares > PAR_MAX else None)
-                cand = candidatos_add(a, prefer_par=pref)
-                add = cand[0] if cand else None
-                if rem is not None and add is not None and rem in a and add not in a:
-                    a.remove(rem); a.append(add); a.sort()
-                    changed = True
+            if contar_pares(a) < PAR_MIN:
+                rem = remover_que_nao_ancora(a, prefer_par=1, dentro_sequencia=False)
+                add_list = candidatos_add(a, prefer_par=0)
+                if rem is not None and add_list:
+                    a.remove(rem); a.append(add_list[0]); a.sort()
+            elif contar_pares(a) > PAR_MAX:
+                rem = remover_que_nao_ancora(a, prefer_par=0, dentro_sequencia=False)
+                add_list = candidatos_add(a, prefer_par=1)
+                if rem is not None and add_list:
+                    a.remove(rem); a.append(add_list[0]); a.sort()
 
-            # 4) Parou de mudar → checa se já está ok
-            if not changed:
-                if PAR_MIN <= contar_pares(a) <= PAR_MAX and max_seq_run(a) <= MAX_SEQ:
-                    break
-
-        # Selagem extra (idempotente)
-        if contar_pares(a) < PAR_MIN:
-            # força pelo menos 1 troca para aumentar pares
-            rem = remover_que_nao_ancora(a, prefer_par=1, dentro_sequencia=False)
-            add_list = candidatos_add(a, prefer_par=0)
-            if rem is not None and add_list:
-                a.remove(rem); a.append(add_list[0]); a.sort()
-        elif contar_pares(a) > PAR_MAX:
-            rem = remover_que_nao_ancora(a, prefer_par=0, dentro_sequencia=False)
-            add_list = candidatos_add(a, prefer_par=1)
-            if rem is not None and add_list:
-                a.remove(rem); a.append(add_list[0]); a.sort()
-
-        # Se ainda houver sequência > MAX_SEQ, tenta mais uma troca dentro da matriz
-        guard = 0
-        while max_seq_run(a) > MAX_SEQ and guard < 10:
-            guard += 1
-            rem = remover_que_nao_ancora(a, dentro_sequencia=True)
-            add_list = candidatos_add(a, prefer_par=None)
-            if rem is None or not add_list:
-                break
-            a.remove(rem); a.append(add_list[0]); a.sort()
-
-        return sorted(a)
-
-    # ---------- Construção inicial (mesma lógica de janelas/offsets) ----------
-    packs = []
-    offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
-    for off in offsets[:BOLAO_QTD_APOSTAS]:
-        s = []
-        idx = off
-        while len(s) < 15:
-            s.append(m[idx % L])
-            idx += 1
-        a = sorted(set(s))
-        # passo 1: selagem individual
-        a = hard_selar_regras(a)
-        packs.append(a)
-
-    # ---------- De-overlap interno (limite 11), SEM sair da matriz ----------
-    for i in range(len(packs)):
-        for j in range(i):
-            a = packs[i][:]
-            b = packs[j][:]
             guard = 0
-            while guard < 60:
+            while max_seq_run(a) > MAX_SEQ and guard < 10:
                 guard += 1
-                inter = sorted(set(a) & set(b))
-                if len(inter) <= 11:
+                rem = remover_que_nao_ancora(a, dentro_sequencia=True)
+                add_list = candidatos_add(a, prefer_par=None)
+                if rem is None or not add_list:
                     break
-                # tenta reduzir mexendo em 'a' primeiro
-                rem = next((x for x in reversed(a) if x in inter and x not in anchors), None)
-                add = next((x for x in m if x not in a and x not in b and (x-1 not in a) and (x+1 not in a)), None)
-                if rem is not None and add is not None:
-                    a.remove(rem); a.append(add); a.sort()
-                    a = hard_selar_regras(a)
-                    continue
-                # depois tenta 'b'
-                rem_b = next((x for x in reversed(b) if x in inter and x not in anchors), None)
-                add_b = next((x for x in m if x not in a and x not in b and (x-1 not in b) and (x+1 not in b)), None)
-                if rem_b is not None and add_b is not None:
-                    b.remove(rem_b); b.append(add_b); b.sort()
-                    b = hard_selar_regras(b)
-                    continue
-                # sem como reduzir mais
-                break
-            packs[i] = a
-            packs[j] = b
+                a.remove(rem); a.append(add_list[0]); a.sort()
 
-    # ---------- Selagem final individual (idempotente) ----------
-    packs = [hard_selar_regras(a) for a in packs]
+            return sorted(a)
 
-    return [sorted(a) for a in packs]
+        packs = []
+        offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
+        for off in offsets[:BOLAO_QTD_APOSTAS]:
+            s = []
+            idx = off
+            while len(s) < 15:
+                s.append(m[idx % L])
+                idx += 1
+            a = sorted(set(s))
+            a = hard_selar_regras(a)
+            packs.append(a)
 
+        for i in range(len(packs)):
+            for j in range(i):
+                a = packs[i][:]
+                b = packs[j][:]
+                guard = 0
+                while guard < 60:
+                    guard += 1
+                    inter = sorted(set(a) & set(b))
+                    if len(inter) <= 11:
+                        break
+                    rem = next((x for x in reversed(a) if x in inter and x not in anchors), None)
+                    add = next((x for x in m if x not in a and x not in b and (x-1 not in a) and (x+1 not in a)), None)
+                    if rem is not None and add is not None:
+                        a.remove(rem); a.append(add); a.sort()
+                        a = hard_selar_regras(a)
+                        continue
+                    rem_b = next((x for x in reversed(b) if x in inter and x not in anchors), None)
+                    add_b = next((x for x in m if x not in a and x not in b and (x-1 not in b) and (x+1 not in b)), None)
+                    if rem_b is not None and add_b is not None:
+                        b.remove(rem_b); b.append(add_b); b.sort()
+                        b = hard_selar_regras(b)
+                        continue
+                    break
+                packs[i] = a
+                packs[j] = b
+
+        packs = [hard_selar_regras(a) for a in packs]
+
+        return [sorted(a) for a in packs]
 
     async def mestre_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        /mestre_bolao
-        - Constrói 'fechamento virtual' 19→15 determinístico (jan=80, α=0.37)
-        - Gera 10 apostas de 15 dezenas com overlap ≤ 11 dentro da matriz19
-        - Paridade alvo 7–8 e max_seq ≤ 3 (ajuste interno)
-        - Mostra a matriz de 19 e cada aposta com Pares/Ímpares e R (repetições)
-        """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
@@ -1614,11 +1448,9 @@ class LotoFacilBot:
             matriz19 = self._selecionar_matriz19(historico)
             apostas = self._subsets_19_para_15(matriz19)
 
-            # métrica R (repetições vs último)
             u_set = set(ultimo)
             def _R(a): return sum(1 for n in a if n in u_set)
 
-            # Formatação
             linhas = []
             linhas.append("🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5 (19→15)</b>\n")
             linhas.append("<b>Matriz 19:</b> " + " ".join(f"{n:02d}" for n in matriz19))
@@ -1645,22 +1477,6 @@ class LotoFacilBot:
             await update.message.reply_text(f"Erro no /mestre_bolao: {e}")
 
     async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        /refinar_bolao
-        Uso 1 (recomendado): /refinar_bolao 01 03 04 07 09 10 12 14 15 16 19 21 22 24 25
-        Uso 2 (atalho):      /refinar_bolao   → usa o último resultado do history.csv
-
-        O que faz:
-        - Reconstroi matriz19/apostas do modo bolão no estado atual
-        - Compara com o resultado oficial informado
-        - Atualiza viés ('bias') por dezena em data/bolao_state.json
-          * +0.50 para cada dezena que ESTÁ no resultado oficial e estava na matriz19
-          * -0.20 para cada dezena da matriz19 que NÃO está no resultado oficial
-          * Âncoras têm amortecedor: metade do ajuste (±50%)
-          * Recorte do bias em [-2.0, +2.0]
-        - Salva estatísticas 'hits' e 'seen' (para relatórios futuros)
-        - Mostra relatório de acertos por aposta + resumo do aprendizado aplicado
-        """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
@@ -1674,7 +1490,6 @@ class LotoFacilBot:
             if not historico:
                 return await update.message.reply_text("Erro: histórico vazio.")
 
-            # 1) Obtém resultado oficial (args) ou último do histórico
             if context.args and len(context.args) >= 15:
                 try:
                     oficial = sorted({int(x) for x in context.args[:15]})
@@ -1685,20 +1500,17 @@ class LotoFacilBot:
             else:
                 oficial = self._ultimo_resultado(historico)
 
-            # 2) Reconstrói matriz19/apostas no estado ATUAL
             snap = self._latest_snapshot()
             ultimo = self._ultimo_resultado(historico)
             matriz19 = self._selecionar_matriz19(historico)
             apostas = self._subsets_19_para_15(matriz19)
 
-            # 3) Métricas de acerto
             of_set = set(oficial)
             def hits(a): return len(of_set & set(a))
             placar = [hits(a) for a in apostas]
             melhor = max(placar)
             media  = sum(placar)/len(placar)
 
-            # 4) Atualiza estado/bias
             st = _bolao_load_state()
             bias = {int(k): float(v) for k, v in st.get("bias", {}).items()}
             hits_map = {int(k): int(v) for k, v in st.get("hits", {}).items()}
@@ -1712,11 +1524,10 @@ class LotoFacilBot:
                 if n in of_set:
                     hits_map[n] = hits_map.get(n, 0) + 1
 
-            # regra de ajuste
             for n in mset:
                 delta = 0.5 if (n in of_set) else -0.2
                 if n in anch:
-                    delta *= 0.5  # amortecer âncoras
+                    delta *= 0.5
                 bias[n] = _clamp(float(bias.get(n, 0.0)) + delta, -2.0, 2.0)
 
             st["bias"] = {int(k): float(v) for k, v in bias.items()}
@@ -1725,7 +1536,6 @@ class LotoFacilBot:
             st["last_snapshot"] = snap.snapshot_id
             _bolao_save_state(st)
 
-            # 5) Relatório
             linhas = []
             linhas.append("🧠 <b>Refino aplicado ao Modo Bolão v5</b>\n")
             linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial))
@@ -1754,23 +1564,21 @@ class LotoFacilBot:
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
         if not historico:
             raise ValueError("Histórico vazio no Ciclo C.")
-        ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
+        ultimo = self._ultimo_resultado(historico)
         u_set = set(ultimo)
         comp = self._complemento(u_set)
         anchors = set(CICLO_C_ANCHORS)
 
         def _forcar_repeticoes(a: list[int], r_alvo: int) -> list[int]:
-            """Ajusta a contagem R (repetidos versus último) para r_alvo, preservando âncoras."""
             a = a[:]
             r_atual = sum(1 for n in a if n in u_set)
             if r_atual == r_alvo:
                 return a
 
             if r_atual < r_alvo:
-                # aumentar R: trocar ausentes por números do último que faltam (não-âncora preferencialmente)
                 faltam = [n for n in ultimo if n not in a]
                 for add in faltam:
-                    if add in anchors:  # será garantido de todo jeito
+                    if add in anchors:
                         pass
                     rem = next((x for x in a if x not in u_set and x not in anchors), None)
                     if rem is None:
@@ -1782,7 +1590,6 @@ class LotoFacilBot:
                     if r_atual == r_alvo:
                         break
             else:
-                # reduzir R: trocar números do último (não-âncora) por ausentes
                 for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
                     add = next((c for c in comp if c not in a), None)
                     if add is None:
@@ -1797,7 +1604,6 @@ class LotoFacilBot:
             pares = self._contar_pares(a)
             return (7 <= pares <= 8) and (self._max_seq(a) <= 3) and (sum(1 for n in a if n in u_set) == r_alvo)
 
-        # ===== Construção inicial (segue o plano definido) =====
         apostas: list[list[int]] = []
         for i, r_alvo in enumerate(CICLO_C_PLANOS):
             off_last = (i * 3) % 15
@@ -1811,7 +1617,6 @@ class LotoFacilBot:
                 offset_comp=off_comp,
             )
 
-            # Garantir âncoras
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in a if x in u_set and x not in anchors), None)
@@ -1820,10 +1625,8 @@ class LotoFacilBot:
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
 
-            # Forçar R do plano e normalizar (paridade/seq) com proteção às âncoras
             a = _forcar_repeticoes(a, r_alvo)
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            # Pelo menos 3 na faixa [12..18]
             mid_lo, mid_hi = 12, 18
             mid = [n for n in a if mid_lo <= n <= mid_hi]
             if len(mid) < 3:
@@ -1842,7 +1645,6 @@ class LotoFacilBot:
 
             apostas.append(sorted(a))
 
-        # ===== Cobertura de ausentes no pacote =====
         ausentes = set(comp)
         presentes = set(n for ap in apostas for n in ap)
         faltantes = [n for n in ausentes if n not in presentes]
@@ -1858,37 +1660,27 @@ class LotoFacilBot:
                     a = _forcar_repeticoes(a, CICLO_C_PLANOS[-1])
             apostas[-1] = a
 
-        # ===== Anti-overlap com proteção às âncoras =====
         apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors) for a in apostas]
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=anchors)
 
-        # ===== Reforço final com LOOP de convergência =====
-        # Garante simultaneamente: Âncoras 100%, R exato, paridade 7–8, max_seq ≤ 3.
         for i, r_alvo in enumerate(CICLO_C_PLANOS):
             a = apostas[i][:]
-            # reâncora (se algo escapou no anti-overlap)
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in reversed(a) if x not in anchors), None)
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
 
-            # loop de normalização até convergir ou atingir limite
             for _ in range(14):
-                # 1) paridade/seq
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                # 2) R-alvo
                 a = _forcar_repeticoes(a, r_alvo)
-                # 3) se já atende tudo, sai
                 if _ok(a, r_alvo):
                     break
-            # garantia hard-stop: uma passada final
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             a = _forcar_repeticoes(a, r_alvo)
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)  # <<< INSERIDO: selagem de paridade >>>
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             apostas[i] = sorted(a)
 
-        # ===== Segundo passe anti-overlap (rápido) + última normalização, só por segurança =====
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=11, anchors=anchors)
         for i, r_alvo in enumerate(CICLO_C_PLANOS):
             a = self._ajustar_paridade_e_seq(apostas[i], alvo_par=(7, 8), max_seq=3, anchors=anchors)
@@ -1904,25 +1696,16 @@ class LotoFacilBot:
 
     # --- Novo comando: /mestre ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Preset 'Mestre' baseado APENAS no último resultado do histórico.
-        - Gera 10 apostas determinísticas (9R–10R + 1x 8R + 1x 11R)
-        - Paridade 7–8 e máx. sequência = 3
-        - Cobre ausentes ao longo do pacote
-        - Personaliza por usuário/chat (seed reprodutível)
-        """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
             return
 
-        # cooldown por chat
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "mestre"):
             await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre novamente.")
             return
 
-        # carrega histórico e pega somente o último resultado
         try:
             historico = carregar_historico(HISTORY_PATH)
             if not historico:
@@ -1932,9 +1715,8 @@ class LotoFacilBot:
             await update.message.reply_text(f"Erro ao carregar histórico: {e}")
             return
 
-        # seed personalizada por usuário/chat/último resultado
         try:
-            ultimo_sorted = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
+            ultimo_sorted = self._ultimo_resultado(historico)
             seed = self._calc_mestre_seed(
                 user_id=update.effective_user.id,
                 chat_id=update.effective_chat.id,
@@ -1950,7 +1732,6 @@ class LotoFacilBot:
             await update.message.reply_text(f"Erro no preset Mestre: {e}")
             return
 
-        # formatação
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Preset Mestre</b> 🎰\n"]
         for i, aposta in enumerate(apostas, 1):
             pares = self._contar_pares(aposta)
@@ -1961,8 +1742,8 @@ class LotoFacilBot:
         if SHOW_TIMESTAMP:
             now_sp = datetime.now(ZoneInfo(TIMEZONE))
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-            hash_ult = _hash_dezenas(ultimo_sorted)  # ADIÇÃO
-            linhas.append(f"<i>base=último resultado | paridade=7–8 | max_seq=3 | hash={hash_ult} | {carimbo}</i>")  # ADIÇÃO
+            hash_ult = _hash_dezenas(ultimo_sorted)
+            linhas.append(f"<i>base=último resultado | paridade=7–8 | max_seq=3 | hash={hash_ult} | {carimbo}</i>")
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
@@ -1979,8 +1760,7 @@ class LotoFacilBot:
         )
         await update.message.reply_text(txt, parse_mode="HTML")
 
-    # >>> ADIÇÃO: comando /diagbase para inspecionar a base atual
-    async def diagbase(self, update: Update, context: ContextTypes.DEFAULT_TYPE):  # ADIÇÃO
+    async def diagbase(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             snap = self._latest_snapshot()
             await update.message.reply_text(
@@ -1993,7 +1773,7 @@ class LotoFacilBot:
         except Exception as e:
             await update.message.reply_text(f"Erro no diagbase: {e}")
 
-    # --- Auxiliares de acesso (repostos para corrigir o erro) ---
+    # --- Auxiliares de acesso ---
     async def meuid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         await update.message.reply_text(
@@ -2024,23 +1804,8 @@ class LotoFacilBot:
         else:
             await update.message.reply_text("ℹ️ Usuário não está na whitelist.")
 
-    # --- A/B técnico + Ciclo C: gera dois lotes (A/B) OU o Ciclo C baseado no último resultado ---
+    # --- A/B técnico + Ciclo C ---
     async def ab(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        /ab  → A/B padrão (mesma janela e qtd, variando alpha)
-        /ab ciclo  → executa o preset Ciclo C baseado no último resultado (âncoras 09 & 11)
-        /ab c     → atalho do Ciclo C
-
-        A/B padrão:
-          /ab [qtd] [janela] [alphaA] [alphaB]
-          Padrão: qtd=5 | janela=60 | alphaA=0.42 | alphaB=0.38
-
-        Ciclo C (ignora qtd/jan/alphas):
-          - 10 apostas
-          - Plano de repetição: [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
-          - Âncoras 09 e 11 em 100% dos jogos
-          - Paridade 7–8 e max_seq=3
-        """
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
@@ -2048,24 +1813,21 @@ class LotoFacilBot:
         if self._hit_cooldown(chat_id, "ab"):
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /ab novamente.")
 
-        # Se o primeiro argumento for "ciclo" ou "c", executa o preset Ciclo C
         mode_ciclo = (len(context.args) >= 1 and str(context.args[0]).lower() in {"ciclo", "c"})
         if mode_ciclo:
             try:
-                # >>> ADIÇÃO: snapshot capturado antes da geração
-                snap = self._latest_snapshot()  # ADIÇÃO
+                snap = self._latest_snapshot()
 
                 historico = carregar_historico(HISTORY_PATH)
                 if not historico:
                     return await update.message.reply_text("Erro: histórico vazio.")
                 apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
-                apostas = self._ciclo_c_fixup(apostas, historico)   # reforço final
-                ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
+                apostas = self._ciclo_c_fixup(apostas, historico)
+                ultimo = self._ultimo_resultado(historico)
             except Exception as e:
                 logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
                 return await update.message.reply_text(f"Erro ao gerar o Ciclo C: {e}")
 
-            # Sanity pass final local (extra proteção)
             anchors = set(CICLO_C_ANCHORS)
             u_set = set(ultimo)
 
@@ -2098,28 +1860,23 @@ class LotoFacilBot:
                             break
                 return a
 
-            # Convergência curta + selagem
             for i, ap in enumerate(apostas):
                 r_alvo = CICLO_C_PLANOS[i]
                 a = ap[:]
-                # Reâncorar defensivamente
                 for anc in anchors:
                     if anc not in a:
                         rem = next((x for x in reversed(a) if x not in anchors), None)
                         if rem is not None and rem != anc:
                             a.remove(rem); a.append(anc); a.sort()
-                # Convergência curta
                 for _ in range(12):
                     a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                     a = _forcar_repeticoes_local(a, r_alvo)
                     if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
                         break
-                # Selagem
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                 a = _forcar_repeticoes_local(a, r_alvo)
                 apostas[i] = sorted(a)
 
-            # >>> REFORÇO FINAL ANTES DE FORMATAR (hard seal de paridade/seq/R)
             def _ok_final(a: list[int], r_alvo: int) -> bool:
                 return (7 <= self._contar_pares(a) <= 8) and (self._max_seq(a) <= 3) and \
                        (sum(1 for n in a if n in u_set) == r_alvo)
@@ -2127,29 +1884,25 @@ class LotoFacilBot:
             for i in range(len(apostas)):
                 r_alvo = CICLO_C_PLANOS[i]
                 a = list(apostas[i])
-                # converge no máx. 20 passos (normalmente resolve em 3–6)
                 for _ in range(20):
                     a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                     a = _forcar_repeticoes_local(a, r_alvo)
                     if _ok_final(a, r_alvo):
                         break
-                # selagem final (idempotente)
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                 a = _forcar_repeticoes_local(a, r_alvo)
                 apostas[i] = sorted(a)
 
-            # >>> ADIÇÃO: sanity check entre snapshots
-            last_snap = _PROCESS_CACHE.get("ab:cicloC:last_snapshot")  # ADIÇÃO
-            last_pack = _PROCESS_CACHE.get("ab:cicloC:last_pack")      # ADIÇÃO
+            last_snap = _PROCESS_CACHE.get("ab:cicloC:last_snapshot")
+            last_pack = _PROCESS_CACHE.get("ab:cicloC:last_pack")
             if last_snap is not None and last_snap != snap.snapshot_id and last_pack == apostas:
                 await update.message.reply_text(
                     "⚠️ Aviso: lote idêntico ao anterior apesar de snapshot diferente. "
                     "Verifique se o history.csv corresponde ao concurso correto."
                 )
-            _PROCESS_CACHE["ab:cicloC:last_snapshot"] = snap.snapshot_id  # ADIÇÃO
-            _PROCESS_CACHE["ab:cicloC:last_pack"] = [a[:] for a in apostas]  # ADIÇÃO
+            _PROCESS_CACHE["ab:cicloC:last_snapshot"] = snap.snapshot_id
+            _PROCESS_CACHE["ab:cicloC:last_pack"] = [a[:] for a in apostas]
 
-            # formatação com rótulo de R por jogo
             linhas = ["🎯 <b>Ciclo C — baseado no último resultado</b>\n"
                       f"Âncoras: {CICLO_C_ANCHORS[0]:02d} e {CICLO_C_ANCHORS[1]:02d} | "
                       "paridade=7–8 | max_seq=3\n"]
@@ -2164,14 +1917,12 @@ class LotoFacilBot:
             if SHOW_TIMESTAMP:
                 now_sp = datetime.now(ZoneInfo(TIMEZONE))
                 carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                hash_ult = _hash_dezenas(ultimo)  # ADIÇÃO
-                linhas.append(f"<i>base=último resultado | hash={hash_ult} | {carimbo}</i>")  # ADIÇÃO
-                # >>> ADIÇÃO: rodapé com snapshot e contexto do comando
-                linhas.append(f"<i>snapshot={snap.snapshot_id} | tz={TIMEZONE} | ab:cicloC</i>")  # ADIÇÃO
+                hash_ult = _hash_dezenas(ultimo)
+                linhas.append(f"<i>base=último resultado | hash={hash_ult} | {carimbo}</i>")
+                linhas.append(f"<i>snapshot={snap.snapshot_id} | tz={TIMEZONE} | ab:cicloC</i>")
 
             return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
-        # --------- A/B padrão (com preditor) ---------
         try:
             qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
             janela = int(context.args[1]) if len(context.args) >= 2 else 60
@@ -2208,16 +1959,9 @@ class LotoFacilBot:
         await update.message.reply_text(msg, parse_mode="HTML")
 
     def _ciclo_c_fixup(self, apostas: list[list[int]], historico) -> list[list[int]]:
-        """Pós-processa o pacote do Ciclo C para garantir:
-        - Âncoras (09,11) presentes em 100%,
-        - R exatamente conforme CICLO_C_PLANOS,
-        - Paridade 7–8,
-        - max_seq <= 3,
-        mantendo o anti-overlap (<=11).
-        """
         if not historico:
             return apostas
-        ultimo = self._ultimo_resultado(historico)  # ADIÇÃO (troca do historico[-1])
+        ultimo = self._ultimo_resultado(historico)
         u_set = set(ultimo)
         anchors = set(CICLO_C_ANCHORS)
 
@@ -2228,7 +1972,6 @@ class LotoFacilBot:
                 return a
             comp = [n for n in range(1, 26) if n not in a]
             if r_atual < r_alvo:
-                # aumentar R
                 faltam = [n for n in ultimo if n not in a]
                 for add in faltam:
                     rem = next((x for x in a if x not in u_set and x not in anchors), None)
@@ -2241,7 +1984,6 @@ class LotoFacilBot:
                     if r_atual == r_alvo:
                         break
             else:
-                # reduzir R
                 for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
                     add = next((c for c in comp if c not in a), None)
                     if add is None:
@@ -2252,15 +1994,12 @@ class LotoFacilBot:
                         break
             return a
 
-        # 1) Reâncorar e normalizar cada aposta até convergir
         for i, a in enumerate(apostas):
-            # garantir âncoras
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in reversed(a) if x not in anchors), None)
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
-            # loop de convergência
             r_alvo = CICLO_C_PLANOS[i]
             for _ in range(14):
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
@@ -2268,13 +2007,11 @@ class LotoFacilBot:
                 pares = self._contar_pares(a)
                 if 7 <= pares <= 8 and self._max_seq(a) <= 3 and sum(1 for n in a if n in u_set) == r_alvo:
                     break
-            # passada final de segurança
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             a = _forcar_repeticoes(a, r_alvo)
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)  # <<< INSERIDO: selagem de paridade >>>
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             apostas[i] = sorted(a)
 
-        # 2) Anti-overlap e última normalização leve
         apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=[n for n in range(1,26) if n not in ultimo], max_overlap=11, anchors=anchors)
         for i, a in enumerate(apostas):
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
@@ -2285,10 +2022,6 @@ class LotoFacilBot:
 
     # ------------- Handler do backtest -------------
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Comando oculto /backtest – apenas admin.
-        Padrão: janela=30 | bilhetes=3 | α=0,55
-        """
         user_id = update.effective_user.id
         if not self._is_admin(user_id):
             return
