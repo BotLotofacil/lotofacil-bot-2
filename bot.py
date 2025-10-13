@@ -17,12 +17,6 @@ from dataclasses import dataclass  # ADIÇÃO
 # >>> BEGIN PATCH A (imports e constantes do Bolão) >>>
 import json  # necessário p/ persistência do estado do bolão
 
-# Caminho do estado do bolão (bias, hits, última matriz, etc.)
-BOLAO_STATE_PATH = "data/bolao_state.json"
-
-# Âncoras padrão utilizadas no modo Bolão (mantém alinhado ao teu projeto)
-BOLAO_ANCHORS = (9, 11)
-
 # Parâmetros do Bolão 19→15
 BOLAO_JANELA_FREQ = 80     # janela p/ frequência (aprox.)
 BOLAO_PLANOS_R = [10, 10, 9, 9, 10, 9, 10, 8, 11, 10]  # alvo de repetição vs último
@@ -1356,82 +1350,244 @@ class LotoFacilBot:
         return matriz
 
     def _subsets_19_para_15(self, matriz19: list[int]) -> list[list[int]]:
-        """
-        Gera 10 subconjuntos de 15 dezenas cobrindo a matriz de 19 com baixo overlap.
-        Estratégia: janelas rotativas + pequeno 'salt' → depois um de-overlap interno.
-        Mantém TODOS os números dentro da própria matriz19.
-        """
-        m = list(matriz19)
-        L = len(m)  # 19
-        packs = []
-        # janelas com deslocamentos diferentes para espalhar
-        offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
-        for off in offsets[:BOLAO_QTD_APOSTAS]:
-            s = []
-            idx = off
-            while len(s) < 15:
-                s.append(m[idx % L])
-                idx += 1
-            packs.append(sorted(set(s)))
+    """
+    HARD-SEAL v2 — Gera 10 subconjuntos (15 dezenas) dentro de 'matriz19',
+    garantindo de forma agressiva:
+      • paridade ∈ [7, 8]
+      • max_seq ≤ BOLAO_MAX_SEQ (padrão=3)
+      • overlap interno ≤ 11
+    Tudo SEM sair da própria matriz19.
+    """
+    m = sorted(set(int(x) for x in matriz19))
+    L = len(m)
+    if L < 19:
+        # preenche defensivamente (não deve acontecer na prática)
+        pool = [n for n in range(1, 26) if n not in m]
+        for n in pool:
+            m.append(n)
+            if len(m) == 19:
+                break
+        m = sorted(m[:19])
 
-        # de-overlap interno sem sair da matriz19 (limite 11)
-        anchors = set(BOLAO_ANCHORS)
-        for i in range(len(packs)):
-            for j in range(i):
-                a = packs[i][:]
-                b = packs[j][:]
-                guard = 0
-                while guard < 60:
-                    guard += 1
-                    inter = sorted(set(a) & set(b))
-                    if len(inter) <= 11:
-                        break
-                    # remove de 'a' um que não é âncora, preferindo o com maior índice (para estabilidade)
-                    rem = next((x for x in reversed(a) if x in inter and x not in anchors), None)
-                    add = next((x for x in m if (x not in a) and (x not in b)), None)
-                    if rem is None or add is None:
-                        break
+    anchors = set(BOLAO_ANCHORS)
+    MAX_SEQ = int(BOLAO_MAX_SEQ)
+    PAR_MIN, PAR_MAX = BOLAO_PARIDADE
+
+    # ---------- Helpers locais (só usam a própria matriz m) ----------
+    def contar_pares(a): return sum(1 for x in a if x % 2 == 0)
+
+    def max_seq_run(lst):
+        s = sorted(lst)
+        best = cur = 1
+        for i in range(1, len(s)):
+            if s[i] == s[i-1] + 1:
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 1
+        return best
+
+    def candidatos_add(a, prefer_par: int | None = None):
+        """
+        Candidatos para adicionar vindos de 'm' que:
+          1) não estão em 'a'
+          2) preferencialmente não encostam em vizinhos (anti-sequência)
+          3) se prefer_par in {0,1}, prioriza pares/ímpares
+        """
+        base = [x for x in m if x not in a]
+        anti_seq = [x for x in base if (x - 1 not in a) and (x + 1 not in a)]
+        prefer = anti_seq if anti_seq else base
+        if prefer_par in (0, 1):
+            prefer2 = [x for x in prefer if x % 2 == prefer_par]
+            if prefer2:
+                return prefer2
+        return prefer
+
+    def remover_que_nao_ancora(a, prefer_par: int | None = None, dentro_sequencia: bool = False):
+        """
+        Escolhe um número para remover de 'a' (não âncora).
+        - Se dentro_sequencia=True, tenta remover alguém de uma sequência longa primeiro.
+        - Se prefer_par in {0,1}, tenta remover daquele tipo.
+        """
+        s = sorted(a)
+        # Mapeia sequências
+        runs = []
+        start = s[0]; run = 1
+        for i in range(1, len(s)):
+            if s[i] == s[i-1] + 1:
+                run += 1
+            else:
+                if run > 1: runs.append((start, s[i-1], run))
+                start = s[i]; run = 1
+        if run > 1: runs.append((start, s[-1], run))
+        runs.sort(key=lambda t: t[2], reverse=True)  # maiores primeiro
+
+        # 1) se queremos quebrar sequência, tente remover dentro da maior
+        if dentro_sequencia and runs:
+            st, fn, _r = runs[0]
+            seq_vals = list(range(st, fn + 1))
+            # remova do fim ao início, evitando âncoras
+            for x in reversed(seq_vals):
+                if x in a and x not in anchors:
+                    if prefer_par in (0, 1) and (x % 2 != prefer_par):
+                        continue
+                    return x
+
+        # 2) fallback: remove não âncora, preferindo o maior (estável)
+        candidatos = [x for x in reversed(s) if x not in anchors]
+        if prefer_par in (0, 1):
+            cand2 = [x for x in candidatos if x % 2 == prefer_par]
+            if cand2:
+                return cand2[0]
+        return candidatos[0] if candidatos else None
+
+    def hard_selar_regras(a):
+        """
+        Loop de convergência: força max_seq ≤ MAX_SEQ e paridade ∈ [PAR_MIN, PAR_MAX]
+        SEM sair da matriz 'm', evitando criar novas correntes.
+        """
+        a = sorted(set(a))
+        for _ in range(60):
+            pares = contar_pares(a)
+            ms = max_seq_run(a)
+
+            changed = False
+
+            # 1) Corrigir sequências longas primeiro
+            if ms > MAX_SEQ:
+                # remover algo de dentro da maior sequência (não âncora)
+                rem = remover_que_nao_ancora(a, prefer_par=None, dentro_sequencia=True)
+                if rem is not None:
+                    # tenta escolher add que não encoste em ninguém
+                    add = None
+                    # leve empurrão de paridade: se já está fora, prefira o lado que corrige
+                    if pares > PAR_MAX:
+                        # pares demais → adicionar ímpar
+                        cand = candidatos_add(a, prefer_par=1)
+                        add = cand[0] if cand else None
+                    elif pares < PAR_MIN:
+                        # pares de menos → adicionar par
+                        cand = candidatos_add(a, prefer_par=0)
+                        add = cand[0] if cand else None
+                    if add is None:
+                        cand = candidatos_add(a, prefer_par=None)
+                        add = cand[0] if cand else None
+
+                    if add is not None and rem in a:
+                        a.remove(rem); a.append(add); a.sort()
+                        changed = True
+
+            # 2) Ajuste fino de paridade
+            pares = contar_pares(a)
+            if not changed:
+                if pares > PAR_MAX:
+                    # remover um PAR (não âncora) e adicionar ÍMPAR da matriz que não crie sequência
+                    rem = remover_que_nao_ancora(a, prefer_par=0, dentro_sequencia=False)
+                    add_list = candidatos_add(a, prefer_par=1)
+                    add = add_list[0] if add_list else None
+                    if rem is not None and add is not None and rem in a and add not in a:
+                        a.remove(rem); a.append(add); a.sort()
+                        changed = True
+
+                elif pares < PAR_MIN:
+                    # remover um ÍMPAR (não âncora) e adicionar PAR da matriz que não crie sequência
+                    rem = remover_que_nao_ancora(a, prefer_par=1, dentro_sequencia=False)
+                    add_list = candidatos_add(a, prefer_par=0)
+                    add = add_list[0] if add_list else None
+                    if rem is not None and add is not None and rem in a and add not in a:
+                        a.remove(rem); a.append(add); a.sort()
+                        changed = True
+
+            # 3) Se nada mudou, tentamos um micro-ajuste neutro para sair de platôs
+            if not changed and (pares < PAR_MIN or pares > PAR_MAX or max_seq_run(a) > MAX_SEQ):
+                rem = remover_que_nao_ancora(a, prefer_par=None, dentro_sequencia=True)
+                add = None
+                pref = 0 if pares < PAR_MIN else (1 if pares > PAR_MAX else None)
+                cand = candidatos_add(a, prefer_par=pref)
+                add = cand[0] if cand else None
+                if rem is not None and add is not None and rem in a and add not in a:
                     a.remove(rem); a.append(add); a.sort()
-                packs[i] = a
+                    changed = True
 
-        # selagem leve de paridade/seq SEM sair da matriz (ajuste interno)
-        for k, a in enumerate(packs):
-            pares = self._contar_pares(a)
-            # Se paridade ficou muito fora, troca 1-2 dezenas dentro da matriz para aproximar 7–8
-            if pares > 8:
-                # remover pares (não âncora) e colocar ímpares da matriz que não estão na aposta
-                rems = [x for x in reversed(a) if x % 2 == 0 and x not in anchors]
-                adds = [x for x in m if x % 2 == 1 and x not in a]
-                while pares > 8 and rems and adds:
-                    r = rems.pop(0); ad = adds.pop(0)
-                    a.remove(r); a.append(ad); a.sort()
-                    pares -= 1
-            elif pares < 7:
-                rems = [x for x in reversed(a) if x % 2 == 1 and x not in anchors]
-                adds = [x for x in m if x % 2 == 0 and x not in a]
-                while pares < 7 and rems and adds:
-                    r = rems.pop(0); ad = adds.pop(0)
-                    a.remove(r); a.append(ad); a.sort()
-                    pares += 1
-            # quebra de sequência > 3, trocando por número da matriz que não crie corrente
-            def max_seq_run(lst):
-                s = sorted(lst); best = cur = 1
-                for t in range(1, len(s)):
-                    if s[t] == s[t-1] + 1:
-                        cur += 1; best = max(best, cur)
-                    else:
-                        cur = 1
-                return best
-            guard = 0
-            while max_seq_run(a) > 3 and guard < 30:
-                guard += 1
-                seq_ok_add = next((x for x in m if x not in a and (x-1 not in a) and (x+1 not in a)), None)
-                rem = next((x for x in reversed(a) if x not in anchors), None)
-                if seq_ok_add is None or rem is None:
+            # 4) Parou de mudar → checa se já está ok
+            if not changed:
+                if PAR_MIN <= contar_pares(a) <= PAR_MAX and max_seq_run(a) <= MAX_SEQ:
                     break
-                a.remove(rem); a.append(seq_ok_add); a.sort()
-            packs[k] = sorted(a)
-        return packs
+
+        # Selagem extra (idempotente)
+        if contar_pares(a) < PAR_MIN:
+            # força pelo menos 1 troca para aumentar pares
+            rem = remover_que_nao_ancora(a, prefer_par=1, dentro_sequencia=False)
+            add_list = candidatos_add(a, prefer_par=0)
+            if rem is not None and add_list:
+                a.remove(rem); a.append(add_list[0]); a.sort()
+        elif contar_pares(a) > PAR_MAX:
+            rem = remover_que_nao_ancora(a, prefer_par=0, dentro_sequencia=False)
+            add_list = candidatos_add(a, prefer_par=1)
+            if rem is not None and add_list:
+                a.remove(rem); a.append(add_list[0]); a.sort()
+
+        # Se ainda houver sequência > MAX_SEQ, tenta mais uma troca dentro da matriz
+        guard = 0
+        while max_seq_run(a) > MAX_SEQ and guard < 10:
+            guard += 1
+            rem = remover_que_nao_ancora(a, dentro_sequencia=True)
+            add_list = candidatos_add(a, prefer_par=None)
+            if rem is None or not add_list:
+                break
+            a.remove(rem); a.append(add_list[0]); a.sort()
+
+        return sorted(a)
+
+    # ---------- Construção inicial (mesma lógica de janelas/offsets) ----------
+    packs = []
+    offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
+    for off in offsets[:BOLAO_QTD_APOSTAS]:
+        s = []
+        idx = off
+        while len(s) < 15:
+            s.append(m[idx % L])
+            idx += 1
+        a = sorted(set(s))
+        # passo 1: selagem individual
+        a = hard_selar_regras(a)
+        packs.append(a)
+
+    # ---------- De-overlap interno (limite 11), SEM sair da matriz ----------
+    for i in range(len(packs)):
+        for j in range(i):
+            a = packs[i][:]
+            b = packs[j][:]
+            guard = 0
+            while guard < 60:
+                guard += 1
+                inter = sorted(set(a) & set(b))
+                if len(inter) <= 11:
+                    break
+                # tenta reduzir mexendo em 'a' primeiro
+                rem = next((x for x in reversed(a) if x in inter and x not in anchors), None)
+                add = next((x for x in m if x not in a and x not in b and (x-1 not in a) and (x+1 not in a)), None)
+                if rem is not None and add is not None:
+                    a.remove(rem); a.append(add); a.sort()
+                    a = hard_selar_regras(a)
+                    continue
+                # depois tenta 'b'
+                rem_b = next((x for x in reversed(b) if x in inter and x not in anchors), None)
+                add_b = next((x for x in m if x not in a and x not in b and (x-1 not in b) and (x+1 not in b)), None)
+                if rem_b is not None and add_b is not None:
+                    b.remove(rem_b); b.append(add_b); b.sort()
+                    b = hard_selar_regras(b)
+                    continue
+                # sem como reduzir mais
+                break
+            packs[i] = a
+            packs[j] = b
+
+    # ---------- Selagem final individual (idempotente) ----------
+    packs = [hard_selar_regras(a) for a in packs]
+
+    return [sorted(a) for a in packs]
+
 
     async def mestre_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -1819,7 +1975,7 @@ class LotoFacilBot:
             f"🤖 Versão do bot\n"
             f"- BUILD_TAG: <code>{BUILD_TAG}</code>\n"
             f"- Import layout: <code>{LAYOUT}</code>\n"
-            f"- Comandos: /start /gerar /mestre /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao"
+            f"- Comandos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao"
         )
         await update.message.reply_text(txt, parse_mode="HTML")
 
