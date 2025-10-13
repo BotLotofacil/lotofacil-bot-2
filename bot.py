@@ -106,6 +106,74 @@ ALPHA_TEST_B = 0.38
 CICLO_C_ANCHORS = (9, 11)
 CICLO_C_PLANOS = [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
 
+# ========================
+# BOLÃO INTELIGENTE v5 (19 → 15)
+# ========================
+BOLAO_JANELA = 80
+BOLAO_ALPHA  = 0.37
+BOLAO_QTD_APOSTAS = 10
+BOLAO_ANCHORS = (9, 11)   # âncoras fixas
+BOLAO_STATE_PATH = "data/bolao_state.json"  # persistência leve
+
+def _freq_window(hist, bias: dict[int, float] | None = None):
+    """
+    Frequência simples na janela (hist já cortado).
+    Se 'bias' vier preenchido, aplica um reforço: freq_eff = freq + bias[n].
+    """
+    freq = {n: 0.0 for n in range(1, 26)}
+    for conc in hist:
+        for n in conc:
+            freq[n] += 1.0
+    if bias:
+        for n, v in bias.items():
+            if 1 <= n <= 25:
+                freq[n] = float(freq.get(n, 0.0)) + float(v)
+    return freq
+
+def _atrasos_recent_first(hist_recent_first):
+    """
+    Atraso determinístico: 0 = saiu no último, 1 = penúltimo, etc.
+    Se nunca saiu na janela, atraso = len(hist).
+    'hist_recent_first' precisa estar com o concurso mais recente em hist[0].
+    """
+    atrasos = {n: len(hist_recent_first) for n in range(1, 26)}
+    for idx, conc in enumerate(hist_recent_first):
+        s = set(conc)
+        for n in range(1, 26):
+            if atrasos[n] == len(hist_recent_first) and n in s:
+                atrasos[n] = idx
+    return atrasos
+
+# ------- Estado do Bolão (persistência simples) -------
+def _bolao_load_state(path: str = BOLAO_STATE_PATH) -> dict:
+    """Carrega estado/bias do bolão; retorna estrutura padrão se não existir."""
+    import json, os
+    if not os.path.exists(path):
+        return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # saneamento
+        data.setdefault("bias", {})
+        data.setdefault("hits", {})
+        data.setdefault("seen", {})
+        data.setdefault("last_snapshot", None)
+        return data
+    except Exception:
+        return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None}
+
+def _bolao_save_state(state: dict, path: str = BOLAO_STATE_PATH):
+    """Grava estado do bolão de forma atômica."""
+    import json, os, tempfile
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
 # >>> ADIÇÃO: estrutura de Snapshot para diagnosticar a base corrente
 @dataclass
 class _Snapshot:  # ADIÇÃO
@@ -343,7 +411,11 @@ class LotoFacilBot:
         # Diagnóstico
         self.app.add_handler(CommandHandler("ping", self.ping))
         self.app.add_handler(CommandHandler("versao", self.versao))
-        logger.info("Handlers ativos: /start /gerar /mestre /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao")
+                # --- Novo handler: /mestre_bolao (fechamento virtual 19→15) ---
+        self.app.add_handler(CommandHandler("mestre_bolao", self.mestre_bolao))
+                # --- Novo handler: /refinar_bolao ---
+        self.app.add_handler(CommandHandler("refinar_bolao", self.refinar_bolao))
+        logger.info("Handlers ativos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /start – mensagem de boas-vindas e aviso legal."""
@@ -1177,6 +1249,323 @@ class LotoFacilBot:
             apostas[i] = a
 
         return apostas
+
+        # ========================
+        # BOLÃO INTELIGENTE v5 (19 → 15)
+        # ========================
+
+        def _janela_recent_first(self, historico, janela: int):
+            """Recorta a janela e garante ordem 'mais recente primeiro'."""
+            jan = ultimos_n_concursos(historico, janela)
+            if HISTORY_ORDER_DESC:
+                # historico[0] já é o mais recente; ultimos_n_concursos costuma manter isso
+                return list(jan)
+            else:
+                # se a base vier crescente, invertimos para trabalhar recent-first
+                return list(reversed(jan))
+
+        def _selecionar_matriz19(self, historico) -> list[int]:
+            """
+            Seleciona 19 dezenas determinísticas para o 'fechamento virtual' (19 → 15):
+            - 10 repetidas do último, priorizadas por frequência (com viés aprendido) na janela 80
+            - 5–6 ausentes quentes (atraso <= 8)
+            - 2–4 neutras para cobrir zonas e paridade
+            - Âncoras (9,11) sempre presentes
+            """
+            if not historico:
+                raise ValueError("Histórico vazio.")
+            ultimo = self._ultimo_resultado(historico)
+            u_set = set(ultimo)
+
+            # Carrega estado/bias
+            st = _bolao_load_state()
+            bias = {int(k): float(v) for k, v in st.get("bias", {}).items()}
+
+            jan_rf = self._janela_recent_first(historico, BOLAO_JANELA)
+            freq_eff = _freq_window(jan_rf, bias=bias)
+            atrasos = _atrasos_recent_first(jan_rf)
+
+            # 1) Top-10 repetidas do último por frequência efetiva
+            r10 = sorted(ultimo, key=lambda n: (-freq_eff[n], n))[:10]
+
+            # 2) Ausentes quentes (não estão no último) com atraso pequeno (<=8)
+            ausentes = [n for n in range(1, 26) if n not in u_set]
+            hot_abs = [n for n in ausentes if atrasos[n] <= 8]
+            hot_abs.sort(key=lambda n: (atrasos[n], -freq_eff[n], n))
+            hot_take = hot_abs[:6] if len(hot_abs) >= 6 else hot_abs[:max(0, 5)]
+
+            # 3) Neutras para fechar 19: prioriza faixa 12..18 e equilíbrio de paridade
+            usados = set(r10) | set(hot_take)
+            faltam = 19 - len(usados)
+            neutrals_pool = [n for n in ausentes if n not in usados]
+            def score(n):
+                dist = 0 if 12 <= n <= 18 else min(abs(n-12), abs(n-18))
+                return (dist, -freq_eff[n], atrasos[n], n)
+            neutrals_pool.sort(key=score)
+            neutros = neutrals_pool[:max(0, faltam)]
+
+            matriz = sorted(set(r10) | set(hot_take) | set(neutros))
+
+            # 4) Âncoras garantidas
+            for anc in BOLAO_ANCHORS:
+                if anc not in matriz:
+                    candidatos = [n for n in matriz if n not in BOLAO_ANCHORS and n not in u_set]
+                    if not candidatos:
+                        candidatos = [n for n in matriz if n not in BOLAO_ANCHORS]
+                    # rem= “menos valioso” segundo atraso alto e freq baixa (freq_eff)
+                    rem = max(candidatos, key=lambda n: (atrasos[n], -freq_eff[n], n), default=None)
+                    if rem is not None and rem != anc:
+                        matriz.remove(rem)
+                        matriz.append(anc)
+            matriz = sorted(set(matriz))
+            if len(matriz) != 19:
+                pool = [n for n in range(1, 26) if n not in matriz]
+                for n in pool:
+                    matriz.append(n)
+                    if len(matriz) == 19:
+                        break
+                matriz = matriz[:19]
+                matriz.sort()
+            return matriz
+
+        def _subsets_19_para_15(self, matriz19: list[int]) -> list[list[int]]:
+            """
+            Gera 10 subconjuntos de 15 dezenas cobrindo a matriz de 19 com baixo overlap.
+            Estratégia: janelas rotativas + pequeno 'salt' → depois um de-overlap interno.
+            Mantém TODOS os números dentro da própria matriz19.
+            """
+            m = list(matriz19)
+            L = len(m)  # 19
+            packs = []
+            # janelas com deslocamentos diferentes para espalhar
+            offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
+            for off in offsets[:BOLAO_QTD_APOSTAS]:
+                s = []
+                idx = off
+                while len(s) < 15:
+                    s.append(m[idx % L])
+                    idx += 1
+                packs.append(sorted(set(s)))
+
+            # de-overlap interno sem sair da matriz19 (limite 11)
+            anchors = set(BOLAO_ANCHORS)
+            for i in range(len(packs)):
+                for j in range(i):
+                    a = packs[i][:]
+                    b = packs[j][:]
+                    guard = 0
+                    while guard < 60:
+                        guard += 1
+                        inter = sorted(set(a) & set(b))
+                        if len(inter) <= 11:
+                            break
+                        # remove de 'a' um que não é âncora, preferindo o com maior índice (para estabilidade)
+                        rem = next((x for x in reversed(a) if x in inter and x not in anchors), None)
+                        add = next((x for x in m if (x not in a) and (x not in b)), None)
+                        if rem is None or add is None:
+                            break
+                        a.remove(rem); a.append(add); a.sort()
+                    packs[i] = a
+
+            # selagem leve de paridade/seq SEM sair da matriz (ajuste interno)
+            for k, a in enumerate(packs):
+                pares = self._contar_pares(a)
+                # Se paridade ficou muito fora, troca 1-2 dezenas dentro da matriz para aproximar 7–8
+                if pares > 8:
+                    # remover pares (não âncora) e colocar ímpares da matriz que não estão na aposta
+                    rems = [x for x in reversed(a) if x % 2 == 0 and x not in anchors]
+                    adds = [x for x in m if x % 2 == 1 and x not in a]
+                    while pares > 8 and rems and adds:
+                        r = rems.pop(0); ad = adds.pop(0)
+                        a.remove(r); a.append(ad); a.sort()
+                        pares -= 1
+                elif pares < 7:
+                    rems = [x for x in reversed(a) if x % 2 == 1 and x not in anchors]
+                    adds = [x for x in m if x % 2 == 0 and x not in a]
+                    while pares < 7 and rems and adds:
+                        r = rems.pop(0); ad = adds.pop(0)
+                        a.remove(r); a.append(ad); a.sort()
+                        pares += 1
+                # quebra de sequência > 3, trocando por número da matriz que não crie corrente
+                def max_seq_run(lst):
+                    s = sorted(lst); best = cur = 1
+                    for t in range(1, len(s)):
+                        if s[t] == s[t-1] + 1:
+                            cur += 1; best = max(best, cur)
+                        else:
+                            cur = 1
+                    return best
+                guard = 0
+                while max_seq_run(a) > 3 and guard < 30:
+                    guard += 1
+                    seq_ok_add = next((x for x in m if x not in a and (x-1 not in a) and (x+1 not in a)), None)
+                    rem = next((x for x in reversed(a) if x not in anchors), None)
+                    if seq_ok_add is None or rem is None:
+                        break
+                    a.remove(rem); a.append(seq_ok_add); a.sort()
+                packs[k] = sorted(a)
+            return packs
+
+        async def mestre_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            /mestre_bolao
+            - Constrói 'fechamento virtual' 19→15 determinístico (jan=80, α=0.37)
+            - Gera 10 apostas de 15 dezenas com overlap ≤ 11 dentro da matriz19
+            - Paridade alvo 7–8 e max_seq ≤ 3 (ajuste interno)
+            - Mostra a matriz de 19 e cada aposta com Pares/Ímpares e R (repetições)
+            """
+            user_id = update.effective_user.id
+            if not self._usuario_autorizado(user_id):
+                return await update.message.reply_text("⛔ Você não está autorizado.")
+
+            chat_id = update.effective_chat.id
+            if self._hit_cooldown(chat_id, "mestre_bolao"):
+                return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre_bolao novamente.")
+
+            try:
+                historico = carregar_historico(HISTORY_PATH)
+                if not historico:
+                    return await update.message.reply_text("Erro: histórico vazio.")
+                snap = self._latest_snapshot()
+                ultimo = self._ultimo_resultado(historico)
+                matriz19 = self._selecionar_matriz19(historico)
+                apostas = self._subsets_19_para_15(matriz19)
+
+                # métrica R (repetições vs último)
+                u_set = set(ultimo)
+                def _R(a): return sum(1 for n in a if n in u_set)
+
+                # Formatação
+                linhas = []
+                linhas.append("🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5 (19→15)</b>\n")
+                linhas.append("<b>Matriz 19:</b> " + " ".join(f"{n:02d}" for n in matriz19))
+                linhas.append(f"Âncoras: {BOLAO_ANCHORS[0]:02d} e {BOLAO_ANCHORS[1]:02d} | janela={BOLAO_JANELA} | α={BOLAO_ALPHA:.2f}\n")
+
+                for i, a in enumerate(apostas, 1):
+                    pares = self._contar_pares(a)
+                    r = _R(a)
+                    linhas.append(
+                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                        f"🔢 Pares: {pares} | Ímpares: {15 - pares} | <i>{r}R</i>\n"
+                    )
+
+                if SHOW_TIMESTAMP:
+                    now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    linhas.append(
+                        f"<i>base=último resultado | hash={_hash_dezenas(ultimo)} | snapshot={snap.snapshot_id} | tz={TIMEZONE} | /mestre_bolao | {now_sp}</i>"
+                    )
+
+                await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+            except Exception as e:
+                logger.error("Erro no /mestre_bolao:\n" + traceback.format_exc())
+                await update.message.reply_text(f"Erro no /mestre_bolao: {e}")
+
+        async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """
+            /refinar_bolao
+            Uso 1 (recomendado): /refinar_bolao 01 03 04 07 09 10 12 14 15 16 19 21 22 24 25
+            Uso 2 (atalho):      /refinar_bolao   → usa o último resultado do history.csv
+
+            O que faz:
+            - Reconstroi matriz19/apostas do modo bolão no estado atual
+            - Compara com o resultado oficial informado
+            - Atualiza viés ('bias') por dezena em data/bolao_state.json
+              * +0.50 para cada dezena que ESTÁ no resultado oficial e estava na matriz19
+              * -0.20 para cada dezena da matriz19 que NÃO está no resultado oficial
+              * Âncoras têm amortecedor: metade do ajuste (±50%)
+              * Recorte do bias em [-2.0, +2.0]
+            - Salva estatísticas 'hits' e 'seen' (para relatórios futuros)
+            - Mostra relatório de acertos por aposta + resumo do aprendizado aplicado
+            """
+            user_id = update.effective_user.id
+            if not self._usuario_autorizado(user_id):
+                return await update.message.reply_text("⛔ Você não está autorizado.")
+
+            chat_id = update.effective_chat.id
+            if self._hit_cooldown(chat_id, "refinar_bolao"):
+                return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /refinar_bolao novamente.")
+
+            try:
+                historico = carregar_historico(HISTORY_PATH)
+                if not historico:
+                    return await update.message.reply_text("Erro: histórico vazio.")
+
+                # 1) Obtém resultado oficial (args) ou último do histórico
+                if context.args and len(context.args) >= 15:
+                    try:
+                        oficial = sorted({int(x) for x in context.args[:15]})
+                        if len(oficial) != 15 or any(n < 1 or n > 25 for n in oficial):
+                            return await update.message.reply_text("Forneça exatamente 15 dezenas válidas (1–25).")
+                    except Exception:
+                        return await update.message.reply_text("Argumentos inválidos. Ex.: /refinar_bolao 01 03 04 ... 25")
+                else:
+                    oficial = self._ultimo_resultado(historico)
+
+                # 2) Reconstrói matriz19/apostas no estado ATUAL
+                snap = self._latest_snapshot()
+                ultimo = self._ultimo_resultado(historico)
+                matriz19 = self._selecionar_matriz19(historico)
+                apostas = self._subsets_19_para_15(matriz19)
+
+                # 3) Métricas de acerto
+                of_set = set(oficial)
+                def hits(a): return len(of_set & set(a))
+                placar = [hits(a) for a in apostas]
+                melhor = max(placar)
+                media  = sum(placar)/len(placar)
+
+                # 4) Atualiza estado/bias
+                st = _bolao_load_state()
+                bias = {int(k): float(v) for k, v in st.get("bias", {}).items()}
+                hits_map = {int(k): int(v) for k, v in st.get("hits", {}).items()}
+                seen_map = {int(k): int(v) for k, v in st.get("seen", {}).items()}
+
+                mset = set(matriz19)
+                anch = set(BOLAO_ANCHORS)
+
+                for n in mset:
+                    seen_map[n] = seen_map.get(n, 0) + 1
+                    if n in of_set:
+                        hits_map[n] = hits_map.get(n, 0) + 1
+
+                # regra de ajuste
+                for n in mset:
+                    delta = 0.5 if (n in of_set) else -0.2
+                    if n in anch:
+                        delta *= 0.5  # amortecer âncoras
+                    bias[n] = _clamp(float(bias.get(n, 0.0)) + delta, -2.0, 2.0)
+
+                st["bias"] = {int(k): float(v) for k, v in bias.items()}
+                st["hits"] = hits_map
+                st["seen"] = seen_map
+                st["last_snapshot"] = snap.snapshot_id
+                _bolao_save_state(st)
+
+                # 5) Relatório
+                linhas = []
+                linhas.append("🧠 <b>Refino aplicado ao Modo Bolão v5</b>\n")
+                linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial))
+                linhas.append("<b>Matriz 19 (antes do refino de hoje):</b> " + " ".join(f"{n:02d}" for n in matriz19) + "\n")
+
+                for i, a in enumerate(apostas, 1):
+                    linhas.append(f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  → <b>{placar[i-1]} acertos</b>")
+
+                linhas.append(f"\n📊 <b>Resumo</b>\n• Melhor aposta: <b>{melhor}</b> acertos\n• Média do lote: <b>{media:.2f}</b> acertos")
+                linhas.append("• Ajuste de bias: +0.50 para hits da matriz, −0.20 para misses (âncoras ±50%)")
+                linhas.append("• Bias limitado em [-2.0, +2.0] e usado como reforço na frequência da janela (seleção das 19)\n")
+
+                if SHOW_TIMESTAMP:
+                    now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    linhas.append(
+                        f"<i>snapshot={snap.snapshot_id} | tz={TIMEZONE} | /refinar_bolao | {now_sp}</i>"
+                    )
+
+                await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+            except Exception as e:
+                logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
+                await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
     
     # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
