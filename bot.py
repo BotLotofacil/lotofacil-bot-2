@@ -83,7 +83,6 @@ BOLAO_ANCHORS = (9, 11)
 BOLAO_STATE_PATH = "data/bolao_state.json"
 
 # Parâmetros do Bolão 19→15
-BOLAO_JANELA_FREQ = 80
 BOLAO_PLANOS_R = [10, 10, 9, 9, 10, 9, 10, 8, 11, 10]
 BOLAO_MAX_OVERLAP = 11
 BOLAO_PARIDADE = (7, 8)
@@ -302,10 +301,11 @@ class LotoFacilBot:
     def _clamp_params(self, qtd: int, janela: int, alpha: float) -> Tuple[int, int, float]:
         qtd = max(BILH_MIN, min(BILH_MAX, int(qtd)))
         janela = max(JANELA_MIN, min(JANELA_MAX, int(janela)))
-        alpha = float(alpha)
-        if alpha < ALPHA_MIN or alpha > ALPHA_MAX:
-            alpha = ALPHA_PADRAO
+        # ANTES: alpha voltava para ALPHA_PADRAO se saísse do range
+        # DEPOIS: alpha é clampado no range permitido
+        alpha = max(ALPHA_MIN, min(ALPHA_MAX, float(alpha)))
         return qtd, janela, alpha
+
 
     def _ultimo_resultado(self, historico) -> List[int]:
         """
@@ -922,16 +922,20 @@ class LotoFacilBot:
     def _quebrar_pares_ruins(self, aposta, comp, anchors=()):
         a = sorted(aposta)
         comp_list = [c for c in sorted(comp) if c not in a]
+        changed = False
         while True:
             par = self._tem_par_penalizado(a)
             if not par or not comp_list:
                 break
             x, y = par
+            # escolha quem sai (evitando tirar âncoras)
             sair = y if x in anchors else x
             if x in anchors and y in anchors:
                 sair = max(x, y)
             if sair not in a:
                 break
+
+            # escolha substituto que não forme sequência
             sub = None
             for c in comp_list:
                 if (c - 1 not in a) and (c + 1 not in a):
@@ -939,12 +943,18 @@ class LotoFacilBot:
                     break
             if sub is None:
                 sub = comp_list[0]
+
+            # aplica troca
             a.remove(sair)
             a.append(sub)
             a.sort()
             comp_list.remove(sub)
+
+            # normaliza paridade/seq
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
-        return a, True
+            changed = True
+
+        return a, changed
 
     def _cap_frequencia_ruido(self, apostas, ultimo, comp, anchors=()):
         from collections import Counter
@@ -1454,7 +1464,9 @@ class LotoFacilBot:
             linhas = []
             linhas.append("🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5 (19→15)</b>\n")
             linhas.append("<b>Matriz 19:</b> " + " ".join(f"{n:02d}" for n in matriz19))
-            linhas.append(f"Âncoras: {BOLAO_ANCHORS[0]:02d} e {BOLAO_ANCHORS[1]:02d} | janela={BOLAO_JANELA} | α={BOLAO_ALPHA:.2f}\n")
+            linhas.append(
+    f"Âncoras: {BOLAO_ANCHORS[0]:02d} e {BOLAO_ANCHORS[1]:02d} | janela={BOLAO_JANELA}\n"
+)
 
             for i, a in enumerate(apostas, 1):
                 pares = self._contar_pares(a)
