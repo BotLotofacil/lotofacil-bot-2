@@ -32,6 +32,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ===== Autodetecção da ordem do histórico (ASC/DESC) =====
+def _parse_nums_from_line(line: str) -> List[int]:
+    # Extrai números da linha (CSV com vírgula, ponto e vírgula ou espaço)
+    nums = re.findall(r"\d+", line)
+    return [int(x) for x in nums]
+
+def _ler_primeira_e_ultima_linha_csv(path: str) -> Tuple[List[int] | None, List[int] | None]:
+    """Lê a primeira e a última linha não vazias do CSV bruto (sem depender do loader)."""
+    if not os.path.exists(path):
+        return None, None
+    first, last = None, None
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            nums = _parse_nums_from_line(line)
+            if len(nums) >= 15:
+                if first is None:
+                    first = sorted(nums[:15])
+                last = sorted(nums[:15])
+    return first, last
+
+def _autodetect_history_order() -> bool | None:
+    """
+    Compara o que o loader retornou (hist[0] e hist[-1]) com a primeira/última linha do CSV bruto.
+    Retorna:
+      True  -> histórico em DESC (hist[0] == última linha do CSV)
+      False -> histórico em ASC  (hist[-1] == última linha do CSV)
+      None  -> não conseguiu decidir (mantém o valor atual de HISTORY_ORDER_DESC)
+    """
+    try:
+        hist = carregar_historico(HISTORY_PATH)
+        if not hist:
+            return None
+
+        csv_first, csv_last = _ler_primeira_e_ultima_linha_csv(HISTORY_PATH)
+        if not csv_first or not csv_last:
+            return None
+
+        h0 = sorted(list(hist[0]))
+        h_last = sorted(list(hist[-1]))
+
+        if h0 == csv_last:
+            return True   # DESC
+        if h_last == csv_last:
+            return False  # ASC
+        return None
+    except Exception:
+        logger.warning("Falha ao autodetectar ordem do histórico.", exc_info=True)
+        return None
+
+
 # ========================
 # Imports do projeto (compatíveis: utils.* OU raiz)
 # ========================
@@ -217,6 +270,21 @@ class LotoFacilBot:
         # mapa de cooldown: {(chat_id, comando): timestamp}
         self._cooldown_map = {}
         self._setup_handlers()
+
+        # --- Autodetecta a ordem do histórico e ajusta a flag global ---
+        try:
+            detected = _autodetect_history_order()
+            if detected is not None:
+                # atualiza a flag global usada pelos métodos
+                global HISTORY_ORDER_DESC
+                HISTORY_ORDER_DESC = detected
+                logger.info(f"Ordem do histórico autodetectada: {'DESC' if detected else 'ASC'} "
+                            f"(HISTORY_ORDER_DESC={HISTORY_ORDER_DESC})")
+            else:
+                logger.info(f"Não foi possível autodetectar a ordem do histórico. "
+                            f"Usando configuração atual HISTORY_ORDER_DESC={HISTORY_ORDER_DESC}.")
+        except Exception:
+            logger.warning("Erro ao configurar autodetecção de ordem.", exc_info=True)
 
     # ------------- Utilidades internas -------------
     def _get_bot_token(self) -> str:
@@ -1464,10 +1532,10 @@ class LotoFacilBot:
             linhas = []
             linhas.append("🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5 (19→15)</b>\n")
             linhas.append("<b>Matriz 19:</b> " + " ".join(f"{n:02d}" for n in matriz19))
+            linhas.append("<b>Último:</b> " + " ".join(f"{n:02d}" for n in ultimo))
             linhas.append(
     f"Âncoras: {BOLAO_ANCHORS[0]:02d} e {BOLAO_ANCHORS[1]:02d} | janela={BOLAO_JANELA}\n"
 )
-
             for i, a in enumerate(apostas, 1):
                 pares = self._contar_pares(a)
                 r = _R(a)
