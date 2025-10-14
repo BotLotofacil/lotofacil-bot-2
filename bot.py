@@ -301,7 +301,8 @@ def _atrasos_recent_first(hist_recent_first):
 def _bolao_load_state(path: str = BOLAO_STATE_PATH) -> dict:
     """Carrega estado/bias do bolão; retorna estrutura padrão se não existir."""
     if not os.path.exists(path):
-        return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None}
+        # ↙️ inclua draw_counter no estado padrão
+        return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None, "draw_counter": {}}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -310,9 +311,10 @@ def _bolao_load_state(path: str = BOLAO_STATE_PATH) -> dict:
         data.setdefault("hits", {})
         data.setdefault("seen", {})
         data.setdefault("last_snapshot", None)
+        data.setdefault("draw_counter", {})   # ↙️ aqui também
         return data
     except Exception:
-        return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None}
+        return {"bias": {}, "hits": {}, "seen": {}, "last_snapshot": None, "draw_counter": {}}
 
 def _bolao_save_state(state: dict, path: str = BOLAO_STATE_PATH):
     """Grava estado do bolão de forma atômica."""
@@ -824,6 +826,22 @@ class LotoFacilBot:
         ultimo_str = "".join(f"{n:02d}" for n in ultimo_sorted)
         key = f"{user_id}|{chat_id}|{ultimo_str}"
         return self._stable_hash_int(key)
+
+    def _next_draw_seed(self, snapshot_id: str) -> int:
+        """
+        Retorna uma semente determinística que muda a cada execução para o MESMO snapshot.
+        A contagem é persistida em data/bolao_state.json -> draw_counter[snapshot_id].
+        Trocar de snapshot (histórico novo) gera um novo contador automaticamente.
+        """
+        st = _bolao_load_state()
+        cnt = st.get("draw_counter", {})
+        n = int(cnt.get(snapshot_id, 0)) + 1
+        cnt[snapshot_id] = n
+        st["draw_counter"] = cnt
+        _bolao_save_state(st)
+
+        # seed estável derivada de (snapshot_id, n)
+        return self._stable_hash_int(f"{snapshot_id}|{n}") & 0xFFFFFFFF
 
     # --------- Diversificador do Mestre ---------
     def _diversificar_mestre(self, apostas, ultimo, comp, max_rep_ultimo=7, min_mid=3, min_fortes=2):
@@ -1423,7 +1441,7 @@ class LotoFacilBot:
             matriz.sort()
         return matriz
 
-    def _subsets_19_para_15(self, matriz19: list[int]) -> list[list[int]]:
+    def _subsets_19_para_15(self, matriz19: list[int], seed: int | None = None) -> list[list[int]]:
         m = sorted(set(int(x) for x in matriz19))
         L = len(m)
         if L < 19:
@@ -1571,8 +1589,11 @@ class LotoFacilBot:
             return sorted(a)
 
         packs = []
-        offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
-        for off in offsets[:BOLAO_QTD_APOSTAS]:
+        base_offsets = [0, 3, 6, 9, 12, 1, 4, 7, 10, 13]
+        seed = int(seed or 0)
+        rot = seed % len(m)          # len(m) é 19 aqui
+        offsets = [ (o + rot) % len(m) for o in base_offsets ][:BOLAO_QTD_APOSTAS]
+        for off in offsets:
             s = []
             idx = off
             while len(s) < 15:
@@ -1639,7 +1660,12 @@ class LotoFacilBot:
             snap = self._latest_snapshot()
             ultimo = self._ultimo_resultado(historico)
             matriz19 = self._selecionar_matriz19(historico)
-            apostas = self._subsets_19_para_15(matriz19)
+
+            # nova seed incremental por snapshot (persistida)
+            seed = self._next_draw_seed(snap.snapshot_id)
+
+            # gira os offsets 19→15 com base nessa seed
+            apostas = self._subsets_19_para_15(matriz19, seed=seed)
 
             u_set = set(ultimo)
             def _R(a): return sum(1 for n in a if n in u_set)
