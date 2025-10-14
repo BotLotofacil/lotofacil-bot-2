@@ -39,7 +39,10 @@ def _parse_nums_from_line(line: str) -> List[int]:
     return [int(x) for x in nums]
 
 def _ler_primeira_e_ultima_linha_csv(path: str) -> Tuple[List[int] | None, List[int] | None]:
-    """Lê a primeira e a última linha não vazias do CSV bruto (sem depender do loader)."""
+    """Lê a primeira e a última linha não vazias do CSV bruto.
+    Cada linha é: <id_concurso>, d1, d2, ..., d15
+    Por isso, usamos os ÚLTIMOS 15 números da linha.
+    """
     if not os.path.exists(path):
         return None, None
     first, last = None, None
@@ -50,18 +53,19 @@ def _ler_primeira_e_ultima_linha_csv(path: str) -> Tuple[List[int] | None, List[
                 continue
             nums = _parse_nums_from_line(line)
             if len(nums) >= 15:
+                dezenas = sorted(nums[-15:])  # <- pega as 15 dezenas reais
                 if first is None:
-                    first = sorted(nums[:15])
-                last = sorted(nums[:15])
+                    first = dezenas
+                last = dezenas
     return first, last
 
 def _autodetect_history_order() -> bool | None:
     """
-    Compara o que o loader retornou (hist[0] e hist[-1]) com a primeira/última linha do CSV bruto.
-    Retorna:
-      True  -> histórico em DESC (hist[0] == última linha do CSV)
-      False -> histórico em ASC  (hist[-1] == última linha do CSV)
-      None  -> não conseguiu decidir (mantém o valor atual de HISTORY_ORDER_DESC)
+    Detecta se o histórico retornado por carregar_historico() está:
+      True  -> DESC (mais recente em hist[0])
+      False -> ASC  (mais recente em hist[-1])
+      None  -> indeterminado
+    A detecção compara hist[0]/hist[-1] com a PRIMEIRA e a ÚLTIMA linha do CSV bruto.
     """
     try:
         hist = carregar_historico(HISTORY_PATH)
@@ -75,15 +79,24 @@ def _autodetect_history_order() -> bool | None:
         h0 = sorted(list(hist[0]))
         h_last = sorted(list(hist[-1]))
 
+        # Se o loader preserva a ordem do arquivo:
+        # - Se hist[0] == primeira linha do CSV -> DESC (mais recente no topo)
+        # - Se hist[-1] == primeira linha do CSV -> ASC  (mais recente no fim)
+        if h0 == csv_first:
+            return True
+        if h_last == csv_first:
+            return False
+
+        # Fallbacks (casos em que loader inverteu em relação ao arquivo)
         if h0 == csv_last:
-            return True   # DESC
+            return False
         if h_last == csv_last:
-            return False  # ASC
+            return True
+
         return None
     except Exception:
         logger.warning("Falha ao autodetectar ordem do histórico.", exc_info=True)
         return None
-
 
 # ========================
 # Imports do projeto (compatíveis: utils.* OU raiz)
@@ -374,12 +387,11 @@ class LotoFacilBot:
         alpha = max(ALPHA_MIN, min(ALPHA_MAX, float(alpha)))
         return qtd, janela, alpha
 
-
     def _ultimo_resultado(self, historico) -> List[int]:
         """
         Retorna o concurso mais recente conforme HISTORY_ORDER_DESC.
-        - HISTORY_ORDER_DESC=True  -> historico[0]
-        - HISTORY_ORDER_DESC=False -> historico[-1]
+        - True  -> historico[0]  (DESC: mais recente no topo)
+        - False -> historico[-1] (ASC:  mais recente no fim)
         """
         if not historico:
             raise ValueError("Histórico vazio.")
