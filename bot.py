@@ -1733,9 +1733,11 @@ class LotoFacilBot:
                 oficial = self._ultimo_resultado(historico)
 
             snap = self._latest_snapshot()
-            ultimo = self._ultimo_resultado(historico)
             matriz19 = self._selecionar_matriz19(historico)
-            apostas = self._subsets_19_para_15(matriz19)
+
+            # mesma lógica do /mestre_bolao: seed incremental persistida por snapshot
+            seed = self._next_draw_seed(snap.snapshot_id)
+            apostas = self._subsets_19_para_15(matriz19, seed=seed)
 
             of_set = set(oficial)
             def hits(a): return len(of_set & set(a))
