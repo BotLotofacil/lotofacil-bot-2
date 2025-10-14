@@ -1960,22 +1960,36 @@ class LotoFacilBot:
             await update.message.reply_text(f"Erro ao carregar histórico: {e}")
             return
 
+        # --- seed composta: incremental por snapshot ^ seed estável por usuário/chat ---
         try:
             ultimo_sorted = self._ultimo_resultado(historico)
-            seed = self._calc_mestre_seed(
+            snap = self._latest_snapshot()
+            seed_inc = self._next_draw_seed(snap.snapshot_id)   # incremental por snapshot
+            user_seed = self._calc_mestre_seed(
                 user_id=update.effective_user.id,
                 chat_id=update.effective_chat.id,
                 ultimo_sorted=ultimo_sorted,
             )
+            seed = (seed_inc ^ (user_seed & 0xFFFFFFFF)) & 0xFFFFFFFF
         except Exception:
+            # fallbacks para continuar mesmo se algo acima falhar
             seed = 0
+        ultimo_sorted = locals().get("ultimo_sorted", self._ultimo_resultado(historico))
+        try:
+            snap = locals().get("snap", self._latest_snapshot())
+        except Exception:
+            snap = None
 
+        # --- gera as apostas usando a seed calculada ---
         try:
             apostas = self._gerar_mestre_por_ultimo_resultado(historico, seed=seed)
         except Exception as e:
             logger.error("Erro no preset Mestre (último resultado):\n" + traceback.format_exc())
             await update.message.reply_text(f"Erro no preset Mestre: {e}")
             return
+
+        # --- formatação da resposta ---
+        snap_id = snap.snapshot_id if snap else "n/a"
 
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Preset Mestre</b> 🎰\n"]
         for i, aposta in enumerate(apostas, 1):
@@ -1984,11 +1998,15 @@ class LotoFacilBot:
                 f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
                 f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
             )
+
         if SHOW_TIMESTAMP:
             now_sp = datetime.now(ZoneInfo(TIMEZONE))
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
             hash_ult = _hash_dezenas(ultimo_sorted)
-            linhas.append(f"<i>base=último resultado | paridade=7–8 | max_seq=3 | hash={hash_ult} | {carimbo}</i>")
+            linhas.append(
+                f"<i>base=último resultado | paridade=7–8 | max_seq=3 | "
+                f"hash={hash_ult} | snapshot={snap_id} | {carimbo}</i>"
+            )
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
