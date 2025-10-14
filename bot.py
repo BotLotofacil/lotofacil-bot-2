@@ -7,6 +7,8 @@ import asyncio
 import re
 import hashlib
 import json
+import time
+from collections import deque
 from functools import partial
 from typing import List, Set, Tuple
 from datetime import datetime
@@ -15,7 +17,7 @@ from pathlib import Path
 from os import getenv
 from dataclasses import dataclass
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
 
 # ========================
@@ -31,6 +33,63 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ===== Anti-abuso / rate limit =====
+MAX_CMDS_PER_MIN = 12           # comandos totais por minuto (qualquer comando)
+MAX_UNKNOWN_PER_MIN = 5         # comandos desconhecidos por minuto
+TEMP_BLOCK_SECONDS = 15 * 60    # 15 minutos bloqueado
+WARN_THRESHOLD = 0.75           # avisa antes de bloquear (75% do limite)
+
+# Estado em memória
+_ABUSE_EVENTS = {}   # user_id -> {"all": deque[timestamps], "unk": deque[timestamps], "until": epoch}
+
+# ===== Utilitários anti-abuso =====
+def _abuse_get(user_id: int):
+    s = _ABUSE_EVENTS.get(user_id)
+    if not s:
+        s = {"all": deque(), "unk": deque(), "until": 0.0}
+        _ABUSE_EVENTS[user_id] = s
+    return s
+
+def _abuse_prune(q: deque, now: float, window: float = 60.0):
+    while q and now - q[0] > window:
+        q.popleft()
+
+def _is_temporarily_blocked(user_id: int) -> bool:
+    s = _abuse_get(user_id)
+    return time.time() < s["until"]
+
+def _register_command_event(user_id: int, is_unknown: bool) -> tuple[bool, str]:
+    """
+    Registra evento e retorna (permitido, mensagem_de_erro_ou_vazio).
+    Bloqueia se estourar limites por minuto.
+    """
+    now = time.time()
+    s = _abuse_get(user_id)
+
+    # limpa janela de 60s
+    _abuse_prune(s["all"], now)
+    _abuse_prune(s["unk"], now)
+
+    # registra
+    s["all"].append(now)
+    if is_unknown:
+        s["unk"].append(now)
+
+    # checa bloqueio
+    total = len(s["all"])
+    unk = len(s["unk"])
+
+    if total > MAX_CMDS_PER_MIN or unk > MAX_UNKNOWN_PER_MIN:
+        s["until"] = now + TEMP_BLOCK_SECONDS
+        return (False, f"🚫 Proteção ativada: muitas tentativas em curto período. "
+                       f"Tente novamente depois de {TEMP_BLOCK_SECONDS//60} min.")
+
+    # aviso preventivo (não bloqueia ainda)
+    if total >= int(MAX_CMDS_PER_MIN * WARN_THRESHOLD) or unk >= int(MAX_UNKNOWN_PER_MIN * WARN_THRESHOLD):
+        return (True, "⚠️ Muitas solicitações em um curto período. Vá com calma para evitar bloqueio temporário.")
+
+    return (True, "")
 
 # ===== Autodetecção da ordem do histórico (ASC/DESC) =====
 def _parse_nums_from_line(line: str) -> List[int]:
@@ -504,7 +563,29 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("versao", self.versao))
         self.app.add_handler(CommandHandler("mestre_bolao", self.mestre_bolao))
         self.app.add_handler(CommandHandler("refinar_bolao", self.refinar_bolao))
-        logger.info("Handlers ativos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao")
+        # Handler para comandos desconhecidos (precisa vir DEPOIS dos conhecidos)
+        self.app.add_handler(MessageHandler(filters.COMMAND, self._unknown_command))
+        logger.info("Handlers ativos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao + unknown command handler")
+
+    async def _unknown_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+
+        # Admin nunca bloqueia
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+
+            allowed, warn = _register_command_event(user_id, is_unknown=True)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+
+        # Resposta "neutra" que não revela nada
+        await update.message.reply_text(
+            "🤖 Comando não reconhecido.\n"
+            "Use /start para ver como interagir ou /versao para listar comandos disponíveis."
+        )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /start – mensagem de boas-vindas e aviso legal."""
@@ -528,6 +609,17 @@ class LotoFacilBot:
         if not self._usuario_autorizado(user_id):
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
             return
+
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
 
         qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
 
@@ -1242,7 +1334,7 @@ class LotoFacilBot:
         for i, a in enumerate(apostas):
             key = tuple(a)
             if key in seen:
-                rem = next((x for x in reversed(a) if x in ultimo and x not in anchors_set), None)
+                rem = next((x for x in reversed(a) if x not in anchors_set), None)
                 add = next((c for c in comp_list if c not in a), None)
                 if rem is not None and add is not None and rem != add:
                     a.remove(rem)
@@ -1525,6 +1617,17 @@ class LotoFacilBot:
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
 
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
+
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "mestre_bolao"):
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre_bolao novamente.")
@@ -1572,6 +1675,17 @@ class LotoFacilBot:
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
+
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
 
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "refinar_bolao"):
@@ -1793,6 +1907,17 @@ class LotoFacilBot:
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
             return
 
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
+
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "mestre"):
             await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre novamente.")
@@ -1901,6 +2026,18 @@ class LotoFacilBot:
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado.")
+
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
+
         chat_id = update.effective_chat.id
         if self._hit_cooldown(chat_id, "ab"):
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /ab novamente.")
@@ -2117,6 +2254,18 @@ class LotoFacilBot:
         user_id = update.effective_user.id
         if not self._is_admin(user_id):
             return
+
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
+
         janela, bilhetes_por_concurso, alpha = self._parse_backtest_args(context.args)
         await update.message.reply_text(
             f"Executando backtest com janela={janela}, bilhetes={bilhetes_por_concurso}, α={alpha:.2f}..."
