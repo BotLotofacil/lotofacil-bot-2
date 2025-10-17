@@ -1773,7 +1773,7 @@ class LotoFacilBot:
 
         # >>> anti-abuso
         if not self._is_admin(user_id):
-            if _is_temporariamente_blocked(user_id):
+            if _is_temporarily_blocked(user_id):  # <- corrigido (inglês)
                 return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
             allowed, warn = _register_command_event(user_id, is_unknown=False)
             if not allowed:
@@ -1885,12 +1885,16 @@ class LotoFacilBot:
             linhas.append("• Bias limitado em [-2.0, +2.0] e usado como reforço na frequência da janela (seleção das 19)")
 
             if dup_count > 0:
-                linhas.append(f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino. "
-                              f"Isto não deve ocorrer com frequência. Se persistir, verifique history.csv e seeds.")
+                linhas.append(
+                    f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino. "
+                    f"Isto não deve ocorrer com frequência. Se persistir, verifique history.csv e seeds."
+                )
 
             if SHOW_TIMESTAMP:
                 now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
-                linhas.append(f"\n<i>snapshot={snap.snapshot_id} | seed={seed_nova} | tz={TIMEZONE} | /refinar_bolao | {now_sp}</i>")
+                linhas.append(
+                    f"\n<i>snapshot={snap.snapshot_id} | seed={seed_nova} | tz={TIMEZONE} | /refinar_bolao | {now_sp}</i>"
+                )
 
             linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
             await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
@@ -1898,67 +1902,6 @@ class LotoFacilBot:
         except Exception as e:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
-
-        # Telemetria e placar (acertos vs 'oficial')
-        def hits(a): return len(of_set & set(a))
-        placar = [hits(a) for a in apostas]
-        melhor = max(placar) if placar else 0
-        media = (sum(placar) / len(placar)) if placar else 0.0
-
-        # Sinaliza duplicidades se houver
-        uniq = {tuple(a) for a in apostas}
-        dup_count = len(apostas) - len(uniq)
-
-        # Conformidade (paridade/seq) por aposta
-        ultimo_para_telemetria = oficial  # no refino usamos o 'oficial' como referência de repetição/seq
-        ok_count = 0
-        telems = []
-        for a in apostas:
-            t = self._telemetria(a, ultimo_para_telemetria, alvo_par=(7, 8), max_seq=3)
-            telems.append(t)
-            if t.ok_total:
-                ok_count += 1
-
-        # === 5) Formata resposta ===
-        linhas = []
-        linhas.append("🧠 <b>Refino aplicado ao Modo Bolão v5</b>\n")
-        linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial))
-        linhas.append("<b>Matriz 19 (antes do refino de hoje):</b> " + " ".join(f"{n:02d}" for n in matriz19_antes))
-        linhas.append("<b>Matriz 19 (após refino de hoje):</b>  " + " ".join(f"{n:02d}" for n in matriz19_depois) + "\n")
-
-        for i, a in enumerate(apostas, 1):
-            t = telems[i-1]
-            linhas.append(
-                f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  → <b>{placar[i-1]} acertos</b>\n"
-                f"🔢 Pares: {t.pares} | Ímpares: {t.impares} | SeqMax: {t.max_seq} | <i>{t.repeticoes}R</i>\n"
-            )
-
-        linhas.append(
-            f"\n📊 <b>Resumo</b>\n"
-            f"• Melhor aposta: <b>{melhor}</b> acertos\n"
-            f"• Média do lote: <b>{media:.2f}</b> acertos\n"
-            f"• Conformidade: <b>{ok_count}/{len(apostas)}</b> dentro de (paridade 7–8, seq≤3)"
-        )
-        linhas.append("• Ajuste de bias: +0.50 para hits da matriz, −0.20 para misses (âncoras ±50%)")
-        linhas.append("• Bias limitado em [-2.0, +2.0] e usado como reforço na frequência da janela (seleção das 19)")
-
-        if dup_count > 0:
-            linhas.append(f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino. "
-                          f"Isto não deve ocorrer com frequência. Se persistir, verifique history.csv e seeds.")
-
-        if SHOW_TIMESTAMP:
-            now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
-            linhas.append(
-                f"\n<i>snapshot={snap.snapshot_id} | seed={seed_nova} | tz={TIMEZONE} | /refinar_bolao | {now_sp}</i>"
-            )
-
-        linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
-        await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
-
-    except Exception as e:
-        logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
-        await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
-
 
     # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
