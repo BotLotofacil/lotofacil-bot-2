@@ -1773,7 +1773,7 @@ class LotoFacilBot:
 
         # >>> anti-abuso
         if not self._is_admin(user_id):
-            if _is_temporarily_blocked(user_id):
+            if _is_temporariamente_blocked(user_id):
                 return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
             allowed, warn = _register_command_event(user_id, is_unknown=False)
             if not allowed:
@@ -1804,10 +1804,10 @@ class LotoFacilBot:
 
             snap = self._latest_snapshot()
 
-            # === 1) Seleciona Matriz 19 com o bias ATUAL (antes do refino)
+            # 1) Matriz 19 ANTES do refino
             matriz19_antes = self._selecionar_matriz19(historico)
 
-            # === 2) Aplica REFINO de bias com base no 'oficial' e na matriz atual ===
+            # 2) Atualiza bias com base no 'oficial'
             st = _bolao_load_state()
             bias = {int(k): float(v) for k, v in st.get("bias", {}).items()}
             hits_map = {int(k): int(v) for k, v in st.get("hits", {}).items()}
@@ -1817,13 +1817,11 @@ class LotoFacilBot:
             of_set = set(oficial)
             anch = set(BOLAO_ANCHORS)
 
-            # registra exposição e acertos por dezena na Matriz 19
             for n in mset:
                 seen_map[n] = seen_map.get(n, 0) + 1
                 if n in of_set:
                     hits_map[n] = hits_map.get(n, 0) + 1
 
-            # atualiza bias (+0.5 hit, -0.2 miss; âncoras com ±50%)
             for n in mset:
                 delta = BOLAO_BIAS_HIT if (n in of_set) else BOLAO_BIAS_MISS
                 if n in anch:
@@ -1836,18 +1834,70 @@ class LotoFacilBot:
             st["last_snapshot"] = snap.snapshot_id
             _bolao_save_state(st)
 
-            # === 3) RESELECIONA a Matriz 19 JÁ COM O BIAS ATUALIZADO ===
+            # 3) Matriz 19 DEPOIS do refino
             matriz19_depois = self._selecionar_matriz19(historico)
 
-            # === 4) Gera novos 19→15 com NOVA seed incremental e PÓS-PROCESSA ===
-            seed_nova = self._next_draw_seed(snap.snapshot_id)  # nova rotação para o mesmo snapshot
+            # 4) Gera novos 19→15 com nova seed e pós-processa
+            seed_nova = self._next_draw_seed(snap.snapshot_id)
             apostas = self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
-
-            # Pós-processador determinístico: paridade 7–8, seq≤3, anti-overlap≤11
             try:
                 apostas = self._pos_processador_basico(apostas, ultimo=oficial)
             except Exception:
                 logger.warning("Falha no pós-processador do /refinar_bolao; usando apostas pré-normalizadas.", exc_info=True)
+
+            # 5) Telemetria, placar e resposta
+            def hits(a): return len(of_set & set(a))
+            placar = [hits(a) for a in apostas]
+            melhor = max(placar) if placar else 0
+            media = (sum(placar) / len(placar)) if placar else 0.0
+
+            uniq = {tuple(a) for a in apostas}
+            dup_count = len(apostas) - len(uniq)
+
+            ok_count = 0
+            telems = []
+            for a in apostas:
+                t = self._telemetria(a, oficial, alvo_par=(7, 8), max_seq=3)
+                telems.append(t)
+                if t.ok_total:
+                    ok_count += 1
+
+            linhas = []
+            linhas.append("🧠 <b>Refino aplicado ao Modo Bolão v5</b>\n")
+            linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial))
+            linhas.append("<b>Matriz 19 (antes do refino de hoje):</b> " + " ".join(f"{n:02d}" for n in matriz19_antes))
+            linhas.append("<b>Matriz 19 (após refino de hoje):</b>  " + " ".join(f"{n:02d}" for n in matriz19_depois) + "\n")
+
+            for i, a in enumerate(apostas, 1):
+                t = telems[i-1]
+                linhas.append(
+                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  → <b>{placar[i-1]} acertos</b>\n"
+                    f"🔢 Pares: {t.pares} | Ímpares: {t.impares} | SeqMax: {t.max_seq} | <i>{t.repeticoes}R</i>\n"
+                )
+
+            linhas.append(
+                f"\n📊 <b>Resumo</b>\n"
+                f"• Melhor aposta: <b>{melhor}</b> acertos\n"
+                f"• Média do lote: <b>{media:.2f}</b> acertos\n"
+                f"• Conformidade: <b>{ok_count}/{len(apostas)}</b> dentro de (paridade 7–8, seq≤3)"
+            )
+            linhas.append("• Ajuste de bias: +0.50 para hits da matriz, −0.20 para misses (âncoras ±50%)")
+            linhas.append("• Bias limitado em [-2.0, +2.0] e usado como reforço na frequência da janela (seleção das 19)")
+
+            if dup_count > 0:
+                linhas.append(f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino. "
+                              f"Isto não deve ocorrer com frequência. Se persistir, verifique history.csv e seeds.")
+
+            if SHOW_TIMESTAMP:
+                now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+                linhas.append(f"\n<i>snapshot={snap.snapshot_id} | seed={seed_nova} | tz={TIMEZONE} | /refinar_bolao | {now_sp}</i>")
+
+            linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
+            await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+        except Exception as e:
+            logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
+            await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
 
         # Telemetria e placar (acertos vs 'oficial')
         def hits(a): return len(of_set & set(a))
@@ -2473,5 +2523,12 @@ class LotoFacilBot:
 # Execução
 # ========================
 if __name__ == "__main__":
-    bot = LotoFacilBot()
-    bot.run()
+    try:
+        logger.info("Inicializando bot...")
+        bot = LotoFacilBot()
+        logger.info("Iniciando polling...")
+        bot.run()
+    except Exception:
+        logger.critical("Falha fatal ao iniciar o bot:\n%s", traceback.format_exc())
+        import time as _t; _t.sleep(3)
+        raise
