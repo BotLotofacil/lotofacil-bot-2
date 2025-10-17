@@ -1762,6 +1762,10 @@ class LotoFacilBot:
 
             await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
+        except Exception as e:  # ⬅️ alinhar exatamente com o try acima
+            logger.error("Erro no /mestre_bolao:\n" + traceback.format_exc())
+            return await update.message.reply_text(f"Erro no /mestre_bolao: {e}")
+
     async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
