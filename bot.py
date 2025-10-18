@@ -651,21 +651,42 @@ class LotoFacilBot:
                 await update.message.reply_text(warn)
         # <<< anti-abuso
 
+        # Defaults
         qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
 
+        # Parse argumentos posicionais (opcionais)
         try:
-            if context.args and len(context.args) >= 1: qtd = int(context.args[0])
-            if context.args and len(context.args) >= 2: janela = int(context.args[1])
-            if context.args and len(context.args) >= 3: alpha = float(context.args[2].replace(",", "."))
+            if context.args and len(context.args) >= 1:
+                qtd = int(context.args[0])
+            if context.args and len(context.args) >= 2:
+                janela = int(context.args[1])
+            if context.args and len(context.args) >= 3:
+                alpha = float(context.args[2].replace(",", "."))
         except Exception:
+            # mantém defaults se parsing falhar
             pass
 
+        # Clamps defensivos
         qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
 
         try:
+            # 1) Geração bruta pelo preditor
             apostas = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alpha)
+
+            # 2) Pós-processamento determinístico (paridade 7–8, seq≤3) + anti-overlap + dedup
+            try:
+                historico = carregar_historico(HISTORY_PATH)
+                ultimo = self._ultimo_resultado(historico)
+                apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
+                apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
+            except Exception:
+                # se algo falhar no pós-processador, segue com as apostas geradas
+                pass
+
+            # 3) Formatação e envio
             resposta = self._formatar_resposta(apostas, janela, alpha)
             await update.message.reply_text(resposta, parse_mode="HTML")
+
         except Exception:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
@@ -1102,6 +1123,79 @@ class LotoFacilBot:
             for a in norm
         ]
         return [sorted(a) for a in norm]
+        
+        # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
+
+    def _enforce_rules(self, a: list[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
+        """
+        Garante paridade 7–8 e seq<=3, preservando âncoras quando possível.
+        """
+        a = sorted(set(a))
+        for _ in range(16):
+            a = self._ajustar_paridade_e_seq(a, alvo_par=alvo_par, max_seq=max_seq, anchors=set(anchors))
+            if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+                break
+        return sorted(a)
+
+    def _dedup_apostas(self, apostas: list[list[int]], ultimo: list[int], max_overlap: int | None = None, anchors=frozenset()) -> list[list[int]]:
+        """
+        Remove duplicadas e 'cura' cada clone localmente sem perder tamanho.
+        Estratégia:
+          - varre pares duplicados;
+          - para o clone, troca uma dezena do 'último' por uma do complemento que
+            não quebre paridade/seq; se não houver, usa qualquer complemento;
+          - aplica enforce_rules após cada cura;
+          - ao final, executa anti-overlap (opcional) e sela regras novamente.
+        """
+        seen = {}
+        comp = [n for n in range(1, 26) if n not in ultimo]
+
+        # 1) normaliza cada aposta antes (evita clones por ordenação)
+        apostas = [sorted(a) for a in apostas]
+
+        # 2) dedup com cura local
+        for i, a in enumerate(apostas):
+            key = tuple(a)
+            if key not in seen:
+                seen[key] = i
+                continue
+
+            # Curar clone: remover uma do último e inserir um ausente
+            a2 = a[:]
+            rem = next((x for x in reversed(a2) if x in ultimo and x not in anchors), None)
+            add = next((c for c in comp if c not in a2 and (c-1 not in a2) and (c+1 not in a2)), None)
+            if add is None:
+                add = next((c for c in comp if c not in a2), None)
+
+            if rem is not None and add is not None and rem != add:
+                a2.remove(rem)
+                a2.append(add)
+                a2.sort()
+                a2 = self._enforce_rules(a2, anchors=anchors)
+            else:
+                # fallback mínimo: gira um dos elementos não âncora
+                rot = next((x for x in a2 if x not in anchors), None)
+                if rot is not None:
+                    a2.remove(rot)
+                    add2 = next((c for c in comp if c not in a2), None)
+                    if add2 is not None:
+                        a2.append(add2)
+                        a2.sort()
+                        a2 = self._enforce_rules(a2, anchors=anchors)
+
+            apostas[i] = a2
+            seen[tuple(a2)] = i  # registra novo hash
+
+        # 3) anti-overlap opcional (se pedido) + selagem final
+        if max_overlap is not None:
+            try:
+                apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=[n for n in range(1, 26) if n not in ultimo],
+                                             max_overlap=max_overlap, anchors=set(anchors))
+            except Exception:
+                pass
+
+        apostas = [self._enforce_rules(a, anchors=anchors) for a in apostas]
+        return [sorted(a) for a in apostas]
 
     # --------- Passe final para garantir regras após ajustes ---------
     def _finalizar_regras_mestre(self, apostas, ultimo, comp, anchors):
@@ -1690,7 +1784,12 @@ class LotoFacilBot:
                 packs[j] = b
 
         packs = [hard_selar_regras(a) for a in packs]
-
+        # Dedup/selagem final para garantir diversidade do lote 19→15
+        try:
+            ultimo_dummy = []  # aqui não temos 'ultimo'; usamos dedup sem anti-overlap forte
+            packs = self._dedup_apostas(packs, ultimo=ultimo_dummy or [26], max_overlap=None, anchors=set(BOLAO_ANCHORS))
+        except Exception:
+            pass
         return [sorted(a) for a in packs]
 
     async def mestre_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1730,6 +1829,7 @@ class LotoFacilBot:
             # --- ✅ Pós-processador determinístico (paridade 7–8, seq≤3 e anti-overlap≤BOLAO_MAX_OVERLAP)
             try:
                 apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
+                apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
             except Exception:
                 logger.warning("Falha no pós-processador do /mestre_bolao; usando apostas pré-normalizadas.", exc_info=True)
 
@@ -1842,6 +1942,7 @@ class LotoFacilBot:
             apostas = self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
             try:
                 apostas = self._pos_processador_basico(apostas, ultimo=oficial)
+                apostas = self._dedup_apostas(apostas, ultimo=oficial, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
             except Exception:
                 logger.warning("Falha no pós-processador do /refinar_bolao; usando apostas pré-normalizadas.", exc_info=True)
 
@@ -1853,6 +1954,11 @@ class LotoFacilBot:
 
             uniq = {tuple(a) for a in apostas}
             dup_count = len(apostas) - len(uniq)
+            if dup_count > 0:
+                # segunda passada de cura (caso o pós-processo crie novos clones)
+                apostas = self._dedup_apostas(apostas, ultimo=oficial, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
+                uniq = {tuple(a) for a in apostas}
+                dup_count = len(apostas) - len(uniq)
 
             ok_count = 0
             telems = []
