@@ -636,6 +636,8 @@ class LotoFacilBot:
         Uso: /gerar [qtd] [janela] [alpha]
         Padrão: 5 apostas | janela=60 | α=0,42
         """
+        import asyncio  # import local para garantir disponibilidade
+
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
@@ -724,6 +726,8 @@ class LotoFacilBot:
                 apostas = [self._enforce_rules(a) for a in apostas]
                 if ultimo:
                     apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
+                else:
+                    logger.warning("Barreira final: sem 'ultimo' — aplicado apenas enforce_rules.")
             except Exception:
                 logger.warning("Falha na barreira de saída (enforce/dedup final).", exc_info=True)
 
@@ -741,6 +745,7 @@ class LotoFacilBot:
                         f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
                     )
                 resposta = "\n".join(linhas)
+
             await update.message.reply_text(resposta, parse_mode="HTML")
 
         except Exception:
