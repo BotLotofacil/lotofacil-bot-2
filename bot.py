@@ -1872,6 +1872,7 @@ class LotoFacilBot:
             pass
         return [sorted(a) for a in packs]
 
+    # --- /mestre_bolao: matriz 19→15 com selagem final e timeout ---
     async def mestre_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -1893,32 +1894,74 @@ class LotoFacilBot:
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre_bolao novamente.")
 
         try:
+            # imports locais (evita dependências no topo)
+            import asyncio, traceback
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            # --- histórico e snapshot ---
             historico = carregar_historico(HISTORY_PATH)
             if not historico:
                 return await update.message.reply_text("Erro: histórico vazio.")
             snap = self._latest_snapshot()
-            ultimo = self._ultimo_resultado(historico)
-            matriz19 = self._selecionar_matriz19(historico)
+            try:
+                ultimo = self._ultimo_resultado(historico)
+            except Exception:
+                ultimo = []
 
-            # nova seed incremental por snapshot (persistida)
+            # --- matriz 19 e seed incremental por snapshot ---
+            matriz19 = self._selecionar_matriz19(historico)
             seed = self._next_draw_seed(snap.snapshot_id)
 
-            # gira os offsets 19→15 com base nessa seed
-            apostas = self._subsets_19_para_15(matriz19, seed=seed)
+            # --- gerador 19→15 em thread com timeout (evita travas) ---
+            async def _gen_bolao():
+                return await asyncio.to_thread(self._subsets_19_para_15, matriz19, seed=seed)
 
-            # --- ✅ Pós-processador determinístico (paridade 7–8, seq≤3 e anti-overlap≤BOLAO_MAX_OVERLAP)
             try:
-                apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
-                apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
+                apostas = await asyncio.wait_for(_gen_bolao(), timeout=8.0)
+            except asyncio.TimeoutError:
+                # Fallback determinístico simples: janelas rotativas de 15 sobre a matriz19
+                logger.warning("mestre_bolao: geração excedeu 8s; aplicando fallback simples 19→15.")
+                n = max(10, 10)  # 10 bilhetes por padrão
+                apostas = []
+                base = list(matriz19)
+                for i in range(n):
+                    # fatia rotativa de 15 elementos
+                    start = (seed + i) % len(base)
+                    janela = (base[start:] + base[:start])[:15]
+                    apostas.append(sorted(janela))
+
+            # --- pós-processador determinístico básico (se disponível) ---
+            try:
+                if ultimo:
+                    apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
+                    apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
             except Exception:
                 logger.warning("Falha no pós-processador do /mestre_bolao; usando apostas pré-normalizadas.", exc_info=True)
 
-            # --- Telemetria + resposta formatada
+            # --- SELAGEM FINAL DO BOLÃO (paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras ---
+            try:
+                apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=BOLAO_ANCHORS)
+            except Exception:
+                logger.warning("Falha na selagem via _fechar_ciclo_c; seguindo com apostas atuais.", exc_info=True)
+
+            # --- Barreira FINAL extra (defensiva) ---
+            try:
+                apostas = [self._enforce_rules(a, anchors=set(BOLAO_ANCHORS)) for a in apostas]
+                if ultimo:
+                    apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
+            except Exception:
+                logger.warning("Barreira final (enforce/dedup) falhou; retornando melhor esforço.", exc_info=True)
+
+            # --- Telemetria + resposta formatada ---
             linhas = []
             linhas.append("🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5 (19→15)</b>\n")
             linhas.append("<b>Matriz 19:</b> " + " ".join(f"{n:02d}" for n in matriz19))
             linhas.append("<b>Último:</b> " + " ".join(f"{n:02d}" for n in ultimo))
-            linhas.append(f"Âncoras: {BOLAO_ANCHORS[0]:02d} e {BOLAO_ANCHORS[1]:02d} | janela={BOLAO_JANELA}\n")
+            try:
+                linhas.append(f"Âncoras: {BOLAO_ANCHORS[0]:02d} e {BOLAO_ANCHORS[1]:02d} | janela={BOLAO_JANELA}\n")
+            except Exception:
+                linhas.append("Âncoras: — | janela=—\n")
 
             ok_count = 0
             for i, a in enumerate(apostas, 1):
@@ -1932,20 +1975,29 @@ class LotoFacilBot:
                 )
 
             linhas.append(f"\n<b>Conformidade</b>: {ok_count}/{len(apostas)} dentro de (paridade 7–8, seq≤3)")
-            linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
+            try:
+                linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
+            except Exception:
+                linhas.append("<i>Regras: paridade 7–8, seq≤3</i>")
 
             if SHOW_TIMESTAMP:
                 now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+                try:
+                    hash_ult = _hash_dezenas(ultimo)
+                    snap_id = snap.snapshot_id
+                except Exception:
+                    hash_ult, snap_id = "--", getattr(snap, "snapshot_id", "n/a")
                 linhas.append(
-                    f"<i>base=último resultado | hash={_hash_dezenas(ultimo)} | snapshot={snap.snapshot_id} | tz={TIMEZONE} | /mestre_bolao | {now_sp}</i>"
+                    f"<i>base=último resultado | hash={hash_ult} | snapshot={snap_id} | tz={TIMEZONE} | /mestre_bolao | {now_sp}</i>"
                 )
 
             await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
-        except Exception as e:  # ⬅️ alinhar exatamente com o try acima
+        except Exception as e:
             logger.error("Erro no /mestre_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /mestre_bolao: {e}")
 
+    # --- /refinar_bolao: aplica bias na matriz 19 e gera 19→15 com selagem final ---
     async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -1967,6 +2019,10 @@ class LotoFacilBot:
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /refinar_bolao novamente.")
 
         try:
+            import asyncio, traceback
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
             historico = carregar_historico(HISTORY_PATH)
             if not historico:
                 return await update.message.reply_text("Erro: histórico vazio.")
@@ -2017,14 +2073,44 @@ class LotoFacilBot:
             # 3) Matriz 19 DEPOIS do refino
             matriz19_depois = self._selecionar_matriz19(historico)
 
-            # 4) Gera novos 19→15 com nova seed e pós-processa
+            # 4) Gera novos 19→15 com nova seed (em thread + timeout) e pós-processa
             seed_nova = self._next_draw_seed(snap.snapshot_id)
-            apostas = self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
+
+            async def _gen_19_15():
+                return await asyncio.to_thread(self._subsets_19_para_15, matriz19_depois, seed=seed_nova)
+
+            try:
+                apostas = await asyncio.wait_for(_gen_19_15(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning("/refinar_bolao: geração 19→15 excedeu 8s; usando fallback simples.")
+                # Fallback determinístico: fatias rotativas (garante 10 bilhetes)
+                base = list(matriz19_depois)
+                n = 10
+                apostas = []
+                for i in range(n):
+                    start = (seed_nova + i) % len(base)
+                    janela = (base[start:] + base[:start])[:15]
+                    apostas.append(sorted(janela))
+
             try:
                 apostas = self._pos_processador_basico(apostas, ultimo=oficial)
                 apostas = self._dedup_apostas(apostas, ultimo=oficial, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
             except Exception:
                 logger.warning("Falha no pós-processador do /refinar_bolao; usando apostas pré-normalizadas.", exc_info=True)
+
+            # >>> SELAGEM FINAL (paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras
+            try:
+                apostas = self._fechar_ciclo_c(apostas, ultimo=oficial, anchors=BOLAO_ANCHORS)
+            except Exception:
+                logger.warning("Falha na selagem via _fechar_ciclo_c; seguindo com apostas atuais.", exc_info=True)
+
+            # Barreira FINAL extra (defensiva)
+            try:
+                apostas = [self._enforce_rules(a, anchors=set(BOLAO_ANCHORS)) for a in apostas]
+                apostas = self._dedup_apostas(apostas, ultimo=oficial, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(BOLAO_ANCHORS))
+            except Exception:
+                logger.warning("Barreira final (enforce/dedup) falhou; retornando melhor esforço.", exc_info=True)
+            # <<< FIM SELAGEM
 
             # 5) Telemetria, placar e resposta
             def hits(a): return len(of_set & set(a))
@@ -2069,7 +2155,6 @@ class LotoFacilBot:
             )
             linhas.append("• Ajuste de bias: +0.50 para hits da matriz, −0.20 para misses (âncoras ±50%)")
             linhas.append("• Bias limitado em [-2.0, +2.0] e usado como reforço na frequência da janela (seleção das 19)")
-
             if dup_count > 0:
                 linhas.append(
                     f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino. "
@@ -2093,9 +2178,10 @@ class LotoFacilBot:
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
         if not historico:
             raise ValueError("Histórico vazio no Ciclo C.")
+
         ultimo = self._ultimo_resultado(historico)
         u_set = set(ultimo)
-        comp = self._complemento(u_set)
+        comp_list = sorted(self._complemento(u_set))  # <- garante lista ordenada
         anchors = set(CICLO_C_ANCHORS)
 
         def _forcar_repeticoes(a: list[int], r_alvo: int) -> list[int]:
@@ -2107,8 +2193,7 @@ class LotoFacilBot:
             if r_atual < r_alvo:
                 faltam = [n for n in ultimo if n not in a]
                 for add in faltam:
-                    if add in anchors:
-                        pass
+                    # preserva âncoras, troca um não-último quando possível
                     rem = next((x for x in a if x not in u_set and x not in anchors), None)
                     if rem is None:
                         rem = next((x for x in a if x not in u_set), None)
@@ -2119,8 +2204,9 @@ class LotoFacilBot:
                     if r_atual == r_alvo:
                         break
             else:
+                # r_atual > r_alvo: remova um do último (não âncora) e insira do complemento
                 for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
-                    add = next((c for c in comp if c not in a), None)
+                    add = next((c for c in comp_list if c not in a), None)
                     if add is None:
                         break
                     a.remove(rem); a.append(add); a.sort()
@@ -2136,16 +2222,17 @@ class LotoFacilBot:
         apostas: list[list[int]] = []
         for i, r_alvo in enumerate(CICLO_C_PLANOS):
             off_last = (i * 3) % 15
-            off_comp = (i * 5) % len(comp) if len(comp) > 0 else 0
+            off_comp = (i * 5) % len(comp_list) if len(comp_list) > 0 else 0
 
             a = self._construir_aposta_por_repeticao(
                 last_sorted=ultimo,
-                comp_sorted=comp,
+                comp_sorted=comp_list,
                 repeticoes=r_alvo,
                 offset_last=off_last,
                 offset_comp=off_comp,
             )
 
+            # força âncoras (trocando preferencialmente um número do último que não é âncora)
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in a if x in u_set and x not in anchors), None)
@@ -2154,13 +2241,16 @@ class LotoFacilBot:
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
 
+            # forma-base: repetição alvo + paridade/seq
             a = _forcar_repeticoes(a, r_alvo)
             a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+
+            # reforço “miolo”: garantir pelo menos 3 na faixa 12..18
             mid_lo, mid_hi = 12, 18
             mid = [n for n in a if mid_lo <= n <= mid_hi]
             if len(mid) < 3:
                 need = 3 - len(mid)
-                cand_add = [n for n in comp if mid_lo <= n <= mid_hi and n not in a]
+                cand_add = [n for n in comp_list if mid_lo <= n <= mid_hi and n not in a]
                 cand_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi) and x not in anchors]
                 j = 0
                 while need > 0 and j < len(cand_add) and j < len(cand_rem):
@@ -2174,7 +2264,8 @@ class LotoFacilBot:
 
             apostas.append(sorted(a))
 
-        ausentes = set(comp)
+        # cobertura de ausentes do complemento (se algum não apareceu em nenhuma aposta)
+        ausentes = set(comp_list)
         presentes = set(n for ap in apostas for n in ap)
         faltantes = [n for n in ausentes if n not in presentes]
         if faltantes:
@@ -2189,32 +2280,29 @@ class LotoFacilBot:
                     a = _forcar_repeticoes(a, CICLO_C_PLANOS[-1])
             apostas[-1] = a
 
+        # normalização de forma + anti-overlap antes da selagem
         apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors) for a in apostas]
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
 
+        # estabilização por plano
         for i, r_alvo in enumerate(CICLO_C_PLANOS):
+            if i >= len(apostas):
+                break
             a = apostas[i][:]
             for anc in anchors:
                 if anc not in a:
                     rem = next((x for x in reversed(a) if x not in anchors), None)
                     if rem is not None and rem != anc:
                         a.remove(rem); a.append(anc); a.sort()
-
-            for _ in range(14):
+            for _ in range(12):  # limite defensivo
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
                 a = _forcar_repeticoes(a, r_alvo)
                 if _ok(a, r_alvo):
                     break
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            a = _forcar_repeticoes(a, r_alvo)
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
             apostas[i] = sorted(a)
 
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
-        for i, r_alvo in enumerate(CICLO_C_PLANOS):
-            a = self._ajustar_paridade_e_seq(apostas[i], alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            a = _forcar_repeticoes(a, r_alvo)
-            apostas[i] = sorted(a)
+        # anti-overlap adicional antes da selagem final
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
 
         # >>> Selagem final do Ciclo C (paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras
         apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=tuple(anchors))
@@ -2222,10 +2310,12 @@ class LotoFacilBot:
 
         return apostas
 
+
     @staticmethod
     def _contar_repeticoes(aposta, ultimo):
         u = set(ultimo)
         return sum(1 for n in aposta if n in u)
+
 
     # --- Novo comando: /mestre ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2245,7 +2335,7 @@ class LotoFacilBot:
                 await update.message.reply_text(warn)
         # <<< anti-abuso
 
-        chat_id = update.effective_chat.id
+        chat_id = update.message.chat_id if update.message else update.effective_chat.id
         if self._hit_cooldown(chat_id, "mestre"):
             await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre novamente.")
             return
@@ -2267,12 +2357,11 @@ class LotoFacilBot:
             seed_inc = self._next_draw_seed(snap.snapshot_id)   # incremental por snapshot
             user_seed = self._calc_mestre_seed(
                 user_id=update.effective_user.id,
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 ultimo_sorted=ultimo_sorted,
             )
             seed = (seed_inc ^ (user_seed & 0xFFFFFFFF)) & 0xFFFFFFFF
         except Exception:
-            # fallbacks para continuar mesmo se algo acima falhar
             seed = 0
         ultimo_sorted = locals().get("ultimo_sorted", self._ultimo_resultado(historico))
         try:
@@ -2295,12 +2384,11 @@ class LotoFacilBot:
         except Exception:
             logger.warning("Falha no pós-processador básico; usando apostas originais.", exc_info=True)
 
-        # <<< BLOCO NOVO — Selagem/Dedup FINAL do Preset Mestre >>>
+        # <<< Selagem/Dedup FINAL do Preset Mestre >>>
         try:
             # 1) Selagem forte por aposta (garante Paridade 7–8 e Seq≤3)
             apostas = [self._enforce_rules(a) for a in apostas]
-
-            # 2) Dedup FINAL + anti-overlap FINAL (clones podem surgir após a selagem)
+            # 2) Dedup FINAL + anti-overlap FINAL
             if ultimo_sorted is not None:
                 apostas = self._dedup_apostas(apostas, ultimo=ultimo_sorted, max_overlap=BOLAO_MAX_OVERLAP)
             else:
@@ -2310,6 +2398,9 @@ class LotoFacilBot:
         # >>> FIM DO BLOCO NOVO
 
         # --- Telemetria e formatação da resposta ---
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
         snap_id = snap.snapshot_id if snap else "n/a"
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Preset Mestre</b> 🎰\n"]
 
