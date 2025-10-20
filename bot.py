@@ -629,19 +629,17 @@ class LotoFacilBot:
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
 
-    # --- /gerar: geração robusta, com timeout e selagem final ---
+    # --- /gerar: rápido, determinístico e com lock duro de forma ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando /gerar – Gera apostas inteligentes.
         Uso: /gerar [qtd] [janela] [alpha]
         Padrão: 5 apostas | janela=60 | α=0,42
         """
-        import asyncio  # import local para garantir disponibilidade
-
+        import asyncio
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
-            await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
-            return
+            return await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
 
         # >>> anti-abuso
         if not self._is_admin(user_id):
@@ -668,10 +666,10 @@ class LotoFacilBot:
         except Exception:
             pass  # mantém defaults se parsing falhar
 
-        # Clamps defensivos
+        # Clamps
         qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
 
-        # Carrega histórico de forma segura (não quebra o comando se faltar arquivo)
+        # Histórico/último
         try:
             historico = carregar_historico(HISTORY_PATH)
         except Exception:
@@ -680,64 +678,161 @@ class LotoFacilBot:
             ultimo = self._ultimo_resultado(historico) if historico else []
         except Exception:
             ultimo = []
+        comp = [n for n in range(1, 26) if n not in set(ultimo)]
 
-        # Gerador com timeout (evita travas longas)
-        async def _gen_async():
-            # roda o gerador pesado fora do loop (thread)
-            return await asyncio.to_thread(
-                self._gerar_apostas_inteligentes, qtd, janela, alpha
-            )
+        # ---------- Auxiliares locais de lock/validação ----------
+        def _is_valid(a: list[int]) -> bool:
+            return 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3 and len(a) == 15
 
+        def _hard_lock(a: list[int], anchors=frozenset()) -> list[int]:
+            """
+            Força (pares∈[7,8] ∧ seq≤3) preservando âncoras sempre que possível.
+            Usa trocas com o complemento; reavalia comp a cada passo.
+            """
+            a = sorted(set(a))[:15]
+            for _ in range(40):
+                # 1) quebra sequências >3
+                comp_local = [n for n in range(1, 26) if n not in a]
+                # quebra a maior sequência trocando um membro não-âncora por um número isolado
+                while self._max_seq(a) > 3 and comp_local:
+                    seq_break_done = False
+                    s = sorted(a)
+                    # localizar blocos
+                    runs = []
+                    st = s[0]
+                    run = 1
+                    for i in range(1, len(s)):
+                        if s[i] == s[i-1] + 1:
+                            run += 1
+                        else:
+                            if run > 1:
+                                runs.append((st, s[i-1], run))
+                            st, run = s[i], 1
+                    if run > 1:
+                        runs.append((st, s[-1], run))
+                    runs.sort(key=lambda t: t[2], reverse=True)
+                    rem = None
+                    for st, fn, _r in runs:
+                        for x in range(fn, st - 1, -1):
+                            if x in a and x not in anchors:
+                                rem = x
+                                break
+                        if rem is not None:
+                            break
+                    add = next((c for c in comp_local if (c-1 not in a) and (c+1 not in a)), None)
+                    if rem is not None and add is not None:
+                        a.remove(rem); a.append(add); a.sort()
+                        seq_break_done = True
+                    comp_local = [n for n in range(1, 26) if n not in a]
+                    if not seq_break_done:
+                        break
+
+                # 2) ajusta paridade para [7,8]
+                comp_local = [n for n in range(1, 26) if n not in a]
+                pares = self._contar_pares(a)
+                if pares > 8:
+                    rem = next((x for x in a if x % 2 == 0 and x not in anchors), None)
+                    add = next((c for c in comp_local if c % 2 == 1), None)
+                    if rem is not None and add is not None:
+                        a.remove(rem); a.append(add); a.sort()
+                elif pares < 7:
+                    rem = next((x for x in a if x % 2 == 1 and x not in anchors), None)
+                    add = next((c for c in comp_local if c % 2 == 0), None)
+                    if rem is not None and add is not None:
+                        a.remove(rem); a.append(add); a.sort()
+
+                # 3) normalização fina usando o seu utilitário
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=frozenset())
+                if _is_valid(a):
+                    break
+            return sorted(a)[:15]
+
+        def _fallback_det(qty: int) -> list[list[int]]:
+            """
+            Fallback determinístico: monta apostas a partir de (último, comp)
+            já dentro de pares 7–8 e seq≤3.
+            """
+            base = []
+            L = list(ultimo) or list(range(1, 16))
+            C = comp or [n for n in range(1, 26) if n not in L]
+            for i in range(max(1, qty)):
+                off_last = (i * 3) % len(L)
+                off_comp = (i * 5) % len(C)
+                manter = (L[off_last:] + L[:off_last])[:8]  # 8 do último
+                add = (C[off_comp:] + C[:off_comp])[:7]     # 7 do comp
+                a = sorted(set(manter + add))[:15]
+                a = _hard_lock(a)
+                base.append(a)
+            return base
+
+        # ---------- Cache leve do preditor ----------
         try:
-            # 1) Geração bruta (timeout duro de 8s)
-            try:
-                apostas = await asyncio.wait_for(_gen_async(), timeout=8.0)
-            except asyncio.TimeoutError:
-                logger.warning("Gerador preditivo excedeu 8s; usando fallback rápido.")
-                import random
-                rng = random.Random()
-                apostas = [sorted(rng.sample(range(1, 26), 15)) for _ in range(max(1, qtd))]
+            snap = self._latest_snapshot()
+            snap_id = snap.snapshot_id
+        except Exception:
+            snap_id = "n/a"
 
-            # 2) Pós-processamento determinístico (paridade 7–8, seq≤3) + anti-overlap + dedup
+        cache_key = ("gerar", snap_id, janela, round(float(alpha), 4))
+        cache_map = _PROCESS_CACHE.setdefault("pred_cache", {})
+        cached = cache_map.get(cache_key)
+
+        async def _gen_pred():
+            # se cache existe, usa direto
+            if cached and isinstance(cached, list):
+                return [a[:] for a in cached][:qtd]
+            # senão, gera em thread
+            res = await asyncio.to_thread(self._gerar_apostas_inteligentes, qtd, janela, alpha)
+            # guarda só 10 para não crescer demais
+            cache_map[cache_key] = res[:10]
+            return res
+
+        # ---------- Geração com timeout curto ----------
+        try:
             try:
-                if not ultimo and historico:
-                    ultimo = self._ultimo_resultado(historico)
+                apostas = await asyncio.wait_for(_gen_pred(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Predictor levou >3s; usando fallback determinístico.")
+                apostas = _fallback_det(qtd)
+
+            # Pós-processamento (se tivermos 'ultimo')
+            try:
                 if ultimo:
                     apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
-                    apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
             except Exception:
-                logger.warning("Falha no pós-processador básico; seguindo com as apostas brutas.", exc_info=True)
+                logger.warning("Pós-processador básico falhou; seguindo com apostas atuais.", exc_info=True)
 
-            # 3) Selagem final (garante P∈[7,8] e seq≤3 por aposta)
-            try:
-                apostas_corrigidas = []
-                for a in apostas:
-                    for _ in range(8):  # até estabilizar
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                        if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
-                            break
-                    apostas_corrigidas.append(sorted(a))
-                apostas = apostas_corrigidas
-            except Exception:
-                logger.warning("Falha na selagem final de paridade/seq.", exc_info=True)
-
-            # 4) Barreira de saída: enforce forte + dedup/overlap FINAL
+            # Selagem leve
             try:
                 apostas = [self._enforce_rules(a) for a in apostas]
-                if ultimo:
-                    apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
-                else:
-                    logger.warning("Barreira final: sem 'ultimo' — aplicado apenas enforce_rules.")
             except Exception:
-                logger.warning("Falha na barreira de saída (enforce/dedup final).", exc_info=True)
+                logger.warning("Falha no enforce inicial.", exc_info=True)
 
-            # 5) Formatação e envio
+            # ---------- Auditoria/lock final por aposta ----------
+            apostas_ok = []
+            for a in apostas:
+                a = _hard_lock(a)
+                if not _is_valid(a):
+                    # última cura determinística
+                    a = _hard_lock(self._construir_aposta_por_repeticao(
+                        last_sorted=ultimo or list(range(1, 26))[:15],
+                        comp_sorted=comp or [n for n in range(1, 26) if n not in (ultimo or [])],
+                        repeticoes=8, offset_last=1, offset_comp=2
+                    ))
+                apostas_ok.append(sorted(a)[:15])
+
+            # Dedup/overlap finais (rápidos)
             try:
-                resposta = self._formatar_resposta(apostas, janela, alpha)
+                if ultimo:
+                    apostas_ok = self._dedup_apostas(apostas_ok, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
             except Exception:
-                # Fallback de formatação, caso seu _formatar_resposta não esteja disponível
+                logger.warning("Dedup/overlap final falhou.", exc_info=True)
+
+            # Formatação
+            try:
+                resposta = self._formatar_resposta(apostas_ok, janela, alpha)
+            except Exception:
                 linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
-                for i, a in enumerate(apostas, 1):
+                for i, a in enumerate(apostas_ok, 1):
                     pares = self._contar_pares(a)
                     seq = self._max_seq(a)
                     linhas.append(
@@ -751,6 +846,7 @@ class LotoFacilBot:
         except Exception:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
+
 
     # ---------- Utilitários Mestre (baseado só no último resultado) ----------
     @staticmethod
@@ -1169,43 +1265,134 @@ class LotoFacilBot:
         ]
         return [sorted(a) for a in norm]
     
-    def _fechar_ciclo_c(self, apostas: list[list[int]], ultimo: list[int], anchors: tuple[int, int] = (9, 11)) -> list[list[int]]:
-        """Pós-processa determinístico o lote do Ciclo C com âncoras, garantindo:
-           - Paridade 7–8 e seq≤3 por aposta
-           - Deduplicação com cura local
-           - Anti-overlap ≤ BOLAO_MAX_OVERLAP
-           - Selagem final (reaplica regras se algo sair do trilho)
+    def _fechar_ciclo_c(
+        self,
+        apostas: list[list[int]],
+        ultimo: list[int],
+        anchors: tuple[int, int] = (9, 11),
+    ) -> list[list[int]]:
+        """
+        Selagem determinística do Ciclo C com metas rígidas:
+          - Paridade 7–8
+          - SeqMax ≤ 3
+          - Repetições (R) EXATAS por aposta, conforme CICLO_C_PLANOS[i]
+          - Dedup + anti-overlap ≤ BOLAO_MAX_OVERLAP
+        Preserva ÂNCORAS sempre que possível.
         """
         anchors_set = set(anchors)
-        comp = [n for n in range(1, 26) if n not in ultimo]
+        u_set = set(ultimo)
+        comp_all = [n for n in range(1, 26) if n not in u_set]
 
-        # 1) Normaliza a forma respeitando âncoras
+        def _is_ok_shape(a: list[int]) -> bool:
+            return (7 <= self._contar_pares(a) <= 8) and (self._max_seq(a) <= 3) and (len(a) == 15)
+
+        def _force_R(a: list[int], r_alvo: int) -> list[int]:
+            """Ajusta R exato com trocas mínimas (ancoras preservadas).
+            Depois de bater o R, normaliza forma."""
+            a = sorted(a[:])
+            r_atual = sum(1 for n in a if n in u_set)
+            if r_atual == r_alvo:
+                return a
+
+            comp_local = [n for n in range(1, 26) if n not in a]
+            if r_atual < r_alvo:
+                # Precisamos AUMENTAR R ⇒ trazer números do último (prioriza não-âncora de fora)
+                faltam = [n for n in ultimo if n not in a]
+                for add in faltam:
+                    # retirar um não-último (evitando âncoras)
+                    rem = next((x for x in a if x not in u_set and x not in anchors_set), None)
+                    if rem is None:
+                        rem = next((x for x in a if x not in u_set), None)
+                    if rem is None:
+                        break
+                    a.remove(rem); a.append(add); a.sort()
+                    r_atual += 1
+                    if r_atual == r_alvo:
+                        break
+            else:
+                # Precisamos REDUZIR R ⇒ expulsar números do último e colocar ausentes
+                for rem in [x for x in reversed(a) if x in u_set and x not in anchors_set]:
+                    add = next((c for c in comp_all if c not in a), None)
+                    if add is None:
+                        break
+                    a.remove(rem); a.append(add); a.sort()
+                    r_atual -= 1
+                    if r_atual == r_alvo:
+                        break
+
+            # Normaliza forma
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            # Pode ter mexido na forma; se R saiu do alvo por causa da normalização, passa mais 1x
+            r_fix = sum(1 for n in a if n in u_set)
+            if r_fix != r_alvo:
+                # uma rodada curta extra só de correção fina
+                if r_fix < r_alvo:
+                    faltam = [n for n in ultimo if n not in a]
+                    for add in faltam:
+                        rem = next((x for x in a if x not in u_set and x not in anchors_set), None)
+                        if rem is None:
+                            rem = next((x for x in a if x not in u_set), None)
+                        if rem is None:
+                            break
+                        a.remove(rem); a.append(add); a.sort()
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+                        r_fix = sum(1 for n in a if n in u_set)
+                        if r_fix == r_alvo:
+                            break
+                else:
+                    for rem in [x for x in reversed(a) if x in u_set and x not in anchors_set]:
+                        add = next((c for c in comp_all if c not in a), None)
+                        if add is None:
+                            break
+                        a.remove(rem); a.append(add); a.sort()
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+                        r_fix = sum(1 for n in a if n in u_set)
+                        if r_fix == r_alvo:
+                            break
+
+            return sorted(a)
+
+        # 0) Normaliza cada aposta “crua”
         apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set) for a in apostas]
 
-        # 2) Dedup com cura local (passa âncoras)
+        # 1) Força R exato conforme plano
+        for i in range(min(len(apostas), len(CICLO_C_PLANOS))):
+            r_alvo = CICLO_C_PLANOS[i]
+            apostas[i] = _force_R(apostas[i], r_alvo)
+
+        # 2) Dedup com cura local (respeita âncoras)
         apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=None, anchors=anchors_set)
 
         # 3) Anti-overlap global
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_all, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
 
-        # 4) Selagem final por aposta
-        apostas = [self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3) for a in apostas]
-
-        # 5) Passada extra de dedup (barreira dupla contra clones após anti-overlap)
-        apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
-
-        # 6) Telemetria e correção forçada se algo escapou
-        corrigidas = []
-        for a in apostas:
-            for _ in range(8):
-                if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+        # 4) Selagem final por aposta (forma e R)
+        final = []
+        for i, a in enumerate(apostas):
+            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
+            for _ in range(12):
+                a = self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3)
+                a = _force_R(a, r_alvo)
+                if _is_ok_shape(a) and sum(1 for n in a if n in u_set) == r_alvo:
                     break
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            final.append(sorted(a))
+
+        # 5) Passada extra de dedup + selagem (pós anti-overlap pode gerar colisões)
+        final = self._dedup_apostas(final, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
+        final = [self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3) for a in final]
+
+        # 6) Garantia teimosa (última barreira)
+        corrigidas = []
+        for i, a in enumerate(final):
+            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
+            for _ in range(6):
+                if _is_ok_shape(a) and sum(1 for n in a if n in u_set) == r_alvo:
+                    break
+                a = _force_R(a, r_alvo)
             corrigidas.append(sorted(a))
         return corrigidas
 
         # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
-
     def _enforce_rules(self, a: list[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
         """
         Garante paridade 7–8 e seq<=3, preservando âncoras quando possível.
