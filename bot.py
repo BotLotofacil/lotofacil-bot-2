@@ -629,6 +629,7 @@ class LotoFacilBot:
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
 
+    # --- /gerar: geração robusta, com timeout e selagem final ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando /gerar – Gera apostas inteligentes.
@@ -663,28 +664,49 @@ class LotoFacilBot:
             if context.args and len(context.args) >= 3:
                 alpha = float(context.args[2].replace(",", "."))
         except Exception:
-            # mantém defaults se parsing falhar
-            pass
+            pass  # mantém defaults se parsing falhar
 
         # Clamps defensivos
         qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
 
+        # Carrega histórico de forma segura (não quebra o comando se faltar arquivo)
         try:
-            # 1) Geração bruta pelo preditor
-            apostas = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alpha)
+            historico = carregar_historico(HISTORY_PATH)
+        except Exception:
+            historico = []
+        try:
+            ultimo = self._ultimo_resultado(historico) if historico else []
+        except Exception:
+            ultimo = []
+
+        # Gerador com timeout (evita travas longas)
+        async def _gen_async():
+            # roda o gerador pesado fora do loop (thread)
+            return await asyncio.to_thread(
+                self._gerar_apostas_inteligentes, qtd, janela, alpha
+            )
+
+        try:
+            # 1) Geração bruta (timeout duro de 8s)
+            try:
+                apostas = await asyncio.wait_for(_gen_async(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning("Gerador preditivo excedeu 8s; usando fallback rápido.")
+                import random
+                rng = random.Random()
+                apostas = [sorted(rng.sample(range(1, 26), 15)) for _ in range(max(1, qtd))]
 
             # 2) Pós-processamento determinístico (paridade 7–8, seq≤3) + anti-overlap + dedup
             try:
-                historico = carregar_historico(HISTORY_PATH)
-                ultimo = self._ultimo_resultado(historico)
-                apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
-                apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
+                if not ultimo and historico:
+                    ultimo = self._ultimo_resultado(historico)
+                if ultimo:
+                    apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
+                    apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
             except Exception:
-                # se algo falhar no pós-processador, segue com as apostas geradas
-                ultimo = None  # garante variável definida para uso posterior
-                pass
+                logger.warning("Falha no pós-processador básico; seguindo com as apostas brutas.", exc_info=True)
 
-            # 3) Selagem final de regras (garante paridade 7–8 e seq≤3)
+            # 3) Selagem final (garante P∈[7,8] e seq≤3 por aposta)
             try:
                 apostas_corrigidas = []
                 for a in apostas:
@@ -695,33 +717,30 @@ class LotoFacilBot:
                     apostas_corrigidas.append(sorted(a))
                 apostas = apostas_corrigidas
             except Exception:
-                logger.warning("Falha na selagem final de paridade/seq.")
+                logger.warning("Falha na selagem final de paridade/seq.", exc_info=True)
 
-            # >>> BLOCO NOVO: Selagem/dedup FINAL (barreira de saída)
+            # 4) Barreira de saída: enforce forte + dedup/overlap FINAL
             try:
-                # se 'ultimo' não existir por alguma falha acima, tenta obter de forma segura
-                if ultimo is None:
-                    try:
-                        historico = carregar_historico(HISTORY_PATH)
-                        ultimo = self._ultimo_resultado(historico)
-                    except Exception:
-                        ultimo = None
-
-                # 5) Sela forte por aposta (loop interno do enforce)
                 apostas = [self._enforce_rules(a) for a in apostas]
-
-                # 6) Dedup FINAL + anti-overlap FINAL (podem surgir clones após a selagem)
-                if ultimo is not None:
+                if ultimo:
                     apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
-                else:
-                    # se não der para obter 'ultimo', ainda garantimos a forma por aposta
-                    logger.warning("Dedup final sem 'ultimo' — executando apenas enforce_rules.")
             except Exception:
-                logger.warning("Falha na selagem/dedup final.")
-            # <<< FIM DO BLOCO NOVO
+                logger.warning("Falha na barreira de saída (enforce/dedup final).", exc_info=True)
 
-            # 4) Formatação e envio (agora sim, com apostas seladas)
-            resposta = self._formatar_resposta(apostas, janela, alpha)
+            # 5) Formatação e envio
+            try:
+                resposta = self._formatar_resposta(apostas, janela, alpha)
+            except Exception:
+                # Fallback de formatação, caso seu _formatar_resposta não esteja disponível
+                linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
+                for i, a in enumerate(apostas, 1):
+                    pares = self._contar_pares(a)
+                    seq = self._max_seq(a)
+                    linhas.append(
+                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                        f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
+                    )
+                resposta = "\n".join(linhas)
             await update.message.reply_text(resposta, parse_mode="HTML")
 
         except Exception:
