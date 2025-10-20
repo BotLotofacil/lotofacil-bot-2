@@ -681,31 +681,52 @@ class LotoFacilBot:
                 apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
             except Exception:
                 # se algo falhar no pós-processador, segue com as apostas geradas
+                ultimo = None  # garante variável definida para uso posterior
                 pass
 
-            # 3) Formatação e envio
+            # 3) Selagem final de regras (garante paridade 7–8 e seq≤3)
+            try:
+                apostas_corrigidas = []
+                for a in apostas:
+                    for _ in range(8):  # até estabilizar
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+                            break
+                    apostas_corrigidas.append(sorted(a))
+                apostas = apostas_corrigidas
+            except Exception:
+                logger.warning("Falha na selagem final de paridade/seq.")
+
+            # >>> BLOCO NOVO: Selagem/dedup FINAL (barreira de saída)
+            try:
+                # se 'ultimo' não existir por alguma falha acima, tenta obter de forma segura
+                if ultimo is None:
+                    try:
+                        historico = carregar_historico(HISTORY_PATH)
+                        ultimo = self._ultimo_resultado(historico)
+                    except Exception:
+                        ultimo = None
+
+                # 5) Sela forte por aposta (loop interno do enforce)
+                apostas = [self._enforce_rules(a) for a in apostas]
+
+                # 6) Dedup FINAL + anti-overlap FINAL (podem surgir clones após a selagem)
+                if ultimo is not None:
+                    apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
+                else:
+                    # se não der para obter 'ultimo', ainda garantimos a forma por aposta
+                    logger.warning("Dedup final sem 'ultimo' — executando apenas enforce_rules.")
+            except Exception:
+                logger.warning("Falha na selagem/dedup final.")
+            # <<< FIM DO BLOCO NOVO
+
+            # 4) Formatação e envio (agora sim, com apostas seladas)
             resposta = self._formatar_resposta(apostas, janela, alpha)
             await update.message.reply_text(resposta, parse_mode="HTML")
 
         except Exception:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
-
-    def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
-        """Formata a resposta com apostas + rodapé informativo."""
-        linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
-        for i, aposta in enumerate(apostas, 1):
-            pares = sum(1 for n in aposta if n % 2 == 0)
-            linhas.append(
-                f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
-                f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
-            )
-        linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
-        if SHOW_TIMESTAMP:
-            now_sp = datetime.now(ZoneInfo(TIMEZONE))
-            carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-            linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
-        return "\n".join(linhas)
 
     # ---------- Utilitários Mestre (baseado só no último resultado) ----------
     @staticmethod
@@ -1123,7 +1144,42 @@ class LotoFacilBot:
             for a in norm
         ]
         return [sorted(a) for a in norm]
-        
+    
+    def _fechar_ciclo_c(self, apostas: list[list[int]], ultimo: list[int], anchors: tuple[int, int] = (9, 11)) -> list[list[int]]:
+        """Pós-processa determinístico o lote do Ciclo C com âncoras, garantindo:
+           - Paridade 7–8 e seq≤3 por aposta
+           - Deduplicação com cura local
+           - Anti-overlap ≤ BOLAO_MAX_OVERLAP
+           - Selagem final (reaplica regras se algo sair do trilho)
+        """
+        anchors_set = set(anchors)
+        comp = [n for n in range(1, 26) if n not in ultimo]
+
+        # 1) Normaliza a forma respeitando âncoras
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set) for a in apostas]
+
+        # 2) Dedup com cura local (passa âncoras)
+        apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=None, anchors=anchors_set)
+
+        # 3) Anti-overlap global
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
+
+        # 4) Selagem final por aposta
+        apostas = [self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3) for a in apostas]
+
+        # 5) Passada extra de dedup (barreira dupla contra clones após anti-overlap)
+        apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
+
+        # 6) Telemetria e correção forçada se algo escapou
+        corrigidas = []
+        for a in apostas:
+            for _ in range(8):
+                if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+                    break
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            corrigidas.append(sorted(a))
+        return corrigidas
+
         # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
 
     def _enforce_rules(self, a: list[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
@@ -2136,6 +2192,10 @@ class LotoFacilBot:
             a = _forcar_repeticoes(a, r_alvo)
             apostas[i] = sorted(a)
 
+        # >>> Selagem final do Ciclo C (paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras
+        apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=tuple(anchors))
+        # <<<
+
         return apostas
 
     @staticmethod
@@ -2166,6 +2226,7 @@ class LotoFacilBot:
             await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre novamente.")
             return
 
+        # --- carrega histórico ---
         try:
             historico = carregar_historico(HISTORY_PATH)
             if not historico:
@@ -2209,6 +2270,20 @@ class LotoFacilBot:
             apostas = self._pos_processador_basico(apostas, ultimo=ultimo_sorted)
         except Exception:
             logger.warning("Falha no pós-processador básico; usando apostas originais.", exc_info=True)
+
+        # <<< BLOCO NOVO — Selagem/Dedup FINAL do Preset Mestre >>>
+        try:
+            # 1) Selagem forte por aposta (garante Paridade 7–8 e Seq≤3)
+            apostas = [self._enforce_rules(a) for a in apostas]
+
+            # 2) Dedup FINAL + anti-overlap FINAL (clones podem surgir após a selagem)
+            if ultimo_sorted is not None:
+                apostas = self._dedup_apostas(apostas, ultimo=ultimo_sorted, max_overlap=BOLAO_MAX_OVERLAP)
+            else:
+                logger.warning("Preset Mestre: sem 'ultimo' — aplicado apenas enforce_rules.")
+        except Exception:
+            logger.warning("Preset Mestre: falha na selagem/dedup final.")
+        # >>> FIM DO BLOCO NOVO
 
         # --- Telemetria e formatação da resposta ---
         snap_id = snap.snapshot_id if snap else "n/a"
@@ -2317,117 +2392,86 @@ class LotoFacilBot:
         if self._hit_cooldown(chat_id, "ab"):
             return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /ab novamente.")
 
+        # ---------------------------------------------------------
+        # MODO CICLO C ("/ab c" ou "/ab ciclo")
+        # ---------------------------------------------------------
         mode_ciclo = (len(context.args) >= 1 and str(context.args[0]).lower() in {"ciclo", "c"})
         if mode_ciclo:
             try:
+                # imports locais para evitar dependência no topo do arquivo
+                import hashlib
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+
                 snap = self._latest_snapshot()
 
                 historico = carregar_historico(HISTORY_PATH)
                 if not historico:
                     return await update.message.reply_text("Erro: histórico vazio.")
-                # gera Ciclo C bruto
-                apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
-                # ajustes específicos do Ciclo C já existentes
-                apostas = self._ciclo_c_fixup(apostas, historico)
+
+                # 1) geração bruta do Ciclo C
                 ultimo = self._ultimo_resultado(historico)
+                apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
 
-                # --- ✅ PÓS-PROCESSADOR DETERMINÍSTICO (paridade 7–8, seq≤3, anti-overlap≤11) ---
+                # 2) SELAGEM FINAL do Ciclo C (paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras
                 try:
-                    apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
+                    anchors = tuple(CICLO_C_ANCHORS)  # ex.: (9, 11)
                 except Exception:
-                    logger.warning("Falha no pós-processador básico do Ciclo C; usando apostas pré-normalizadas.", exc_info=True)
+                    anchors = (9, 11)
+                try:
+                    apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=anchors)
+                except Exception:
+                    logger.warning("Falha ao selar Ciclo C via _fechar_ciclo_c; seguindo com apostas atuais.")
 
-            except Exception as e:
-                logger.error("Erro no /ab (Ciclo C): %s\n%s", str(e), traceback.format_exc())
-                return await update.message.reply_text(f"Erro ao gerar o Ciclo C: {e}")
+                # 3) Telemetria opcional (não falha se o utilitário não existir)
+                try:
+                    self._log_forma_lote("CICLO_C", apostas)
+                except Exception:
+                    pass
 
-            anchors = set(CICLO_C_ANCHORS)
-            u_set = set(ultimo)
-
-            def _forcar_repeticoes_local(a: list[int], r_alvo: int) -> list[int]:
-                a = a[:]
-                r_atual = sum(1 for n in a if n in u_set)
-                if r_atual == r_alvo:
-                    return a
-                comp_local = [n for n in range(1, 26) if n not in a]
-                if r_atual < r_alvo:
-                    faltam = [n for n in ultimo if n not in a]
-                    for add in faltam:
-                        rem = next((x for x in a if x not in u_set and x not in anchors), None)
-                        if rem is None:
-                            rem = next((x for x in a if x not in u_set), None)
-                        if rem is None:
-                            break
-                        a.remove(rem); a.append(add); a.sort()
-                        r_atual += 1
-                        if r_atual == r_alvo:
-                            break
+                # 4) Formatação da resposta
+                linhas = []
+                linhas.append("🎯 Ciclo C — baseado no último resultado")
+                if len(anchors) >= 2:
+                    linhas.append(f"Âncoras: {anchors[0]:02d} e {anchors[1]:02d} | paridade=7–8 | max_seq=3")
                 else:
-                    for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
-                        add = next((c for c in comp_local if c not in a), None)
-                        if add is None:
-                            break
-                        a.remove(rem); a.append(add); a.sort()
-                        r_atual -= 1
-                        if r_atual == r_alvo:
-                            break
-                return a
+                    linhas.append("Âncoras: — | paridade=7–8 | max_seq=3")
 
-            # --- Normaliza âncoras + reforça repetição alvo por plano (após pós-processar) ---
-            for i, ap in enumerate(apostas):
-                r_alvo = CICLO_C_PLANOS[i]
-                a = ap[:]
-                for anc in anchors:
-                    if anc not in a:
-                        rem = next((x for x in reversed(a) if x not in anchors), None)
-                        if rem is not None and rem != anc:
-                            a.remove(rem); a.append(anc); a.sort()
-                # duas passagens leves para garantir regra + R
-                for _ in range(8):
-                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                    a = _forcar_repeticoes_local(a, r_alvo)
-                apostas[i] = sorted(a)
+                u_set = set(ultimo)
+                for i, a in enumerate(apostas, 1):
+                    pares = self._contar_pares(a)
+                    seq = self._max_seq(a)
+                    rep = sum(1 for n in a if n in u_set)
+                    alvo = CICLO_C_PLANOS[i - 1] if (i - 1) < len(CICLO_C_PLANOS) else rep
+                    linhas.append(
+                        f"\nAposta {i}: " + " ".join(f"{n:02d}" for n in a) + f"  [{rep}R; alvo={alvo}R]"
+                    )
+                    linhas.append(f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}")
 
-            # --- Telemetria + resposta formatada ---
-            linhas = ["🎯 <b>Ciclo C — baseado no último resultado</b>\n"
-                      f"Âncoras: {CICLO_C_ANCHORS[0]:02d} e {CICLO_C_ANCHORS[1]:02d} | "
-                      "paridade=7–8 | max_seq=3\n"]
+                # rodapé (hash/snapshot/carimbo)
+                try:
+                    hash_ult = hashlib.md5("".join(f"{n:02d}" for n in ultimo).encode()).hexdigest()[:8]
+                except Exception:
+                    hash_ult = "--"
+                try:
+                    snap_id = getattr(snap, "snapshot_id", "--")
+                except Exception:
+                    snap_id = "--"
+                carimbo = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d %H:%M:%S %z")
 
-            ok_count = 0
-            for i, a in enumerate(apostas, 1):
-                r_alvo = CICLO_C_PLANOS[i-1]
-                # telemetria por aposta
-                t = self._telemetria(a, ultimo, alvo_par=(7, 8), max_seq=3)
-                # garante rótulo de R, mas sinaliza alvo do plano
-                status = "✅ OK" if t.ok_total and (t.repeticoes == r_alvo) else "🛠️ REPARAR"
-                if status == "✅ OK":
-                    ok_count += 1
                 linhas.append(
-                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  "
-                    f"<i>[{t.repeticoes}R; alvo={r_alvo}R]</i>\n"
-                    f"🔢 Pares: {t.pares} | Ímpares: {t.impares} | SeqMax: {t.max_seq} | {status}\n"
+                    f"\n<i>base=último resultado | paridade=7–8 | max_seq=3 | hash={hash_ult} | snapshot={snap_id} | {carimbo}</i>"
                 )
 
-            linhas.append(f"\n<b>Conformidade</b>: {ok_count}/{len(apostas)} dentro de (paridade 7–8, seq≤3) <i>(e R conforme alvo)</i>")
-            linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
+                return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
-            # avisos de repetição de lote entre snapshots (mantido do seu código)
-            last_snap = _PROCESS_CACHE.get("ab:cicloC:last_snapshot")
-            last_pack = _PROCESS_CACHE.get("ab:cicloC:last_pack")
-            if last_snap is not None and last_snap != snap.snapshot_id and last_pack == apostas:
-                linhas.append("\n⚠️ Aviso: lote idêntico ao anterior apesar de snapshot diferente. Verifique se o history.csv corresponde ao concurso correto.")
-            _PROCESS_CACHE["ab:cicloC:last_snapshot"] = snap.snapshot_id
-            _PROCESS_CACHE["ab:cicloC:last_pack"] = [a[:] for a in apostas]
+            except Exception as e:
+                logger.error("Erro no /ab ciclo C:\n" + traceback.format_exc())
+                return await update.message.reply_text(f"Erro ao executar Ciclo C: {e}")
 
-            if SHOW_TIMESTAMP:
-                now_sp = datetime.now(ZoneInfo(TIMEZONE))
-                carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                hash_ult = _hash_dezenas(ultimo)
-                linhas.append(f"<i>base=último resultado | hash={hash_ult} | {carimbo}</i>")
-                linhas.append(f"<i>snapshot={snap.snapshot_id} | tz={TIMEZONE} | ab:cicloC</i>")
-
-            return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
-
+        # ---------------------------------------------------------
+        # MODO A/B TÉCNICO (padrão quando NÃO é ciclo)
+        # ---------------------------------------------------------
         try:
             qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
             janela = int(context.args[1]) if len(context.args) >= 2 else 60
