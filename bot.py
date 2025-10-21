@@ -847,6 +847,20 @@ class LotoFacilBot:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
 
+    def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
+        """Formata a resposta com apostas + rodapé informativo."""
+        linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
+        for i, aposta in enumerate(apostas, 1):
+            pares = sum(1 for n in aposta if n % 2 == 0)
+            linhas.append(
+                f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
+                f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
+            )
+        if SHOW_TIMESTAMP:
+            now_sp = datetime.now(ZoneInfo(TIMEZONE))
+            carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+            linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
+        return "\n".join(linhas)
 
     # ---------- Utilitários Mestre (baseado só no último resultado) ----------
     @staticmethod
@@ -1034,108 +1048,231 @@ class LotoFacilBot:
         # seed estável derivada de (snapshot_id, n)
         return self._stable_hash_int(f"{snapshot_id}|{n}") & 0xFFFFFFFF
 
-    # --------- Diversificador do Mestre ---------
-    def _diversificar_mestre(self, apostas, ultimo, comp, max_rep_ultimo=7, min_mid=3, min_fortes=2):
-        """
-        Aplica refinamentos determinísticos nas apostas geradas pelo Mestre:
-        - Garante pelo menos 'min_fortes' dezenas de AUSENTES FORTES por aposta
-        - Limita a repetição de cada dezena do último resultado a 'max_rep_ultimo'
-        - Garante pelo menos 'min_mid' dezenas na faixa [12..18] em cada aposta
-        Mantém paridade (7–8) e max_seq<=3 após cada ajuste.
-        """
-        from collections import Counter
+    # --- Wrapper de telemetria usando métodos da classe ---
+    def _telemetria(self, aposta: List[int], ultimo: List[int], alvo_par=(7, 8), max_seq=3) -> TelemetriaAposta:
+        t = _telemetria_aposta(aposta, ultimo, alvo_par=alvo_par, max_seq=max_seq)
+        t.max_seq = self._max_seq(aposta)
+        t.repeticoes = self._contar_repeticoes(aposta, ultimo)
+        t.ok_seq = (t.max_seq <= max_seq)
+        t.ok_total = t.ok_paridade and t.ok_seq
+        return t
 
-        comp_set = set(comp)
-        preferidos = [20, 22, 24, 10, 12, 14, 16, 18]
-        ausentes_fortes = [n for n in preferidos if n in comp_set]
+    # --- Pós-processador básico (paridade 7–8, max_seq<=3 e anti-overlap<=11) ---
+    def _pos_processador_basico(self, apostas: List[List[int]], ultimo: List[int]) -> List[List[int]]:
+        comp = [n for n in range(1, 26) if n not in ultimo]
+        # normaliza cada aposta para paridade/seq
+        norm = [
+            self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=frozenset())
+            for a in apostas
+        ]
+        # reduz interseções fortes
+        norm = self._anti_overlap(norm, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=frozenset())
+        # última passada de selagem
+        norm = [
+            self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=frozenset())
+            for a in norm
+        ]
+        return [sorted(a) for a in norm]
+    
+    def _fechar_ciclo_c(
+        self,
+        apostas: list[list[int]],
+        ultimo: list[int],
+        anchors: tuple[int, int] = (9, 11),
+    ) -> list[list[int]]:
+        """
+        Selagem determinística do Ciclo C com metas rígidas:
+          - Paridade 7–8
+          - SeqMax ≤ 3
+          - Repetições (R) EXATAS por aposta (CICLO_C_PLANOS)
+          - Dedup + anti-overlap ≤ BOLAO_MAX_OVERLAP
+        Preserva ÂNCORAS sempre que possível.
+        """
+        anchors_set = set(anchors)
+        u_set = set(ultimo)
 
-        for idx, a in enumerate(apostas):
-            a = sorted(a)
-            fortes_na_aposta = sum(1 for n in a if n in ausentes_fortes)
-            if fortes_na_aposta < min_fortes and ausentes_fortes:
-                faltam = min_fortes - fortes_na_aposta
-                removiveis = sorted([x for x in a if x in ultimo], reverse=True)
-                for _ in range(faltam):
-                    add = next((c for c in ausentes_fortes if c not in a), None)
-                    if add is None:
-                        break
-                    rem = None
-                    for r in list(removiveis):
-                        if r in a:
-                            rem = r
-                            removiveis.remove(r)
-                            break
+        def _safe_remove(lst: list[int], x: int) -> bool:
+            if x in lst:
+                lst.remove(x)
+                return True
+            return False
+
+        def _is_ok_shape(a: list[int]) -> bool:
+            return (len(a) == 15) and (7 <= self._contar_pares(a) <= 8) and (self._max_seq(a) <= 3)
+
+        def _force_R(a_in: list[int], r_alvo: int) -> list[int]:
+            """Ajusta a_in para ter exatamente r_alvo repetições do 'ultimo', preservando âncoras."""
+            a = sorted(a_in[:])
+            r_atual = sum(1 for n in a if n in u_set)
+            if r_atual == r_alvo:
+                return a
+
+            def comp_now() -> list[int]:
+                return [n for n in range(1, 26) if n not in a]
+
+            if r_atual < r_alvo:
+                # precisa adicionar números do último que ainda não estão na aposta
+                faltam = [n for n in ultimo if n not in a]
+                for add in faltam:
+                    # retire primeiro um NÃO repetido e que não seja âncora
+                    rem = next((x for x in a if (x not in u_set) and (x not in anchors_set)), None)
                     if rem is None:
-                        rem = a[-1]
-                    if rem == add:
+                        # se não houver, retire um não-repetido qualquer
+                        rem = next((x for x in a if x not in u_set), None)
+                    if rem is None or add in a:
                         continue
-                    a.remove(rem)
-                    a.append(add)
-                    a.sort()
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                apostas[idx] = a
-
-        from collections import Counter as _Counter
-        cnt = _Counter()
-        for a in apostas:
-            for n in a:
-                if n in ultimo:
-                    cnt[n] += 1
-
-        excesso = [(n, cnt[n]) for n in sorted(ultimo, reverse=True) if cnt[n] > max_rep_ultimo]
-        if excesso and comp_set:
-            comp_ord = sorted(comp_set)
-            for dezena, _ in excesso:
-                for i in range(len(apostas) - 1, -1, -1):
-                    if cnt[dezena] <= max_rep_ultimo:
-                        break
-                    a = apostas[i][:]
-                    if dezena not in a:
-                        continue
-                    add = next((c for c in comp_ord if c not in a), None)
+                    if _safe_remove(a, rem):
+                        a.append(add); a.sort()
+                        r_atual += 1
+                        if r_atual == r_alvo:
+                            break
+            else:
+                # r_atual > r_alvo ⇒ trocar repetidos (não âncora) por ausentes do comp
+                for rem in [x for x in sorted(a, reverse=True) if (x in u_set) and (x not in anchors_set)]:
+                    add = next((c for c in comp_now() if c not in a), None)
                     if add is None:
                         break
-                    a.remove(dezena)
-                    a.append(add)
-                    a.sort()
-                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                    apostas[i] = a
-                    cnt[dezena] -= 1
+                    if _safe_remove(a, rem):
+                        a.append(add); a.sort()
+                        r_atual -= 1
+                        if r_atual == r_alvo:
+                            break
 
-        mid_lo, mid_hi = 12, 18
+            # estabiliza forma (paridade/seq) e revalida R finamente
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            for _ in range(6):
+                r_fix = sum(1 for n in a if n in u_set)
+                if r_fix == r_alvo:
+                    break
+                if r_fix < r_alvo:
+                    add = next((n for n in ultimo if n not in a), None)
+                    rem = next((x for x in a if (x not in u_set) and (x not in anchors_set)), None)
+                    if add is None or rem is None:
+                        break
+                    if _safe_remove(a, rem):
+                        a.append(add); a.sort()
+                else:
+                    rem = next((x for x in a if (x in u_set) and (x not in anchors_set)), None)
+                    add = next((c for c in range(1, 26) if (c not in a)), None)
+                    if rem is None or add is None:
+                        break
+                    if _safe_remove(a, rem):
+                        a.append(add); a.sort()
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            return sorted(a)
+
+        # 0) Normaliza forma inicial por aposta
+        apostas = [self._ajustar_paridade_e_seq(a[:], alvo_par=(7, 8), max_seq=3, anchors=anchors_set) for a in apostas]
+
+        # 1) Força R exato conforme plano
+        for i in range(min(len(apostas), len(CICLO_C_PLANOS))):
+            apostas[i] = _force_R(apostas[i], CICLO_C_PLANOS[i])
+
+        # 2) Dedup com cura local (respeita âncoras)
+        apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=None, anchors=anchors_set)
+
+        # 3) Anti-overlap global
+        comp_all = [n for n in range(1, 26) if n not in u_set]
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_all, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
+
+        # 4) Selagem final (forma + R)
+        final: list[list[int]] = []
         for i, a in enumerate(apostas):
-            a = sorted(a)
-            mid = [n for n in a if mid_lo <= n <= mid_hi]
-            if len(mid) < min_mid:
-                need = min_mid - len(mid)
-                candidatos_add = [n for n in sorted(comp_set) if mid_lo <= n <= mid_hi and n not in a]
-                if len(candidatos_add) < need:
-                    extras = [n for n in range(mid_lo, mid_hi + 1) if n not in a]
-                    for x in extras:
-                        if x not in candidatos_add:
-                            candidatos_add.append(x)
-                candidatos_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi) and x in ultimo]
-                if len(candidatos_rem) < need:
-                    outros = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi)]
-                    for x in outros:
-                        if x not in candidatos_rem:
-                            candidatos_rem.append(x)
-                j = 0
-                while need > 0 and j < len(candidatos_add) and j < len(candidatos_rem):
-                    add = candidatos_add[j]
-                    rem = candidatos_rem[j]
-                    if add == rem:
-                        j += 1
-                        continue
-                    if rem in a and add not in a:
-                        a.remove(rem)
-                        a.append(add)
-                        a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                        need -= 1
-                    j += 1
-                apostas[i] = a
+            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
+            for _ in range(12):
+                a = self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3)
+                a = _force_R(a, r_alvo)
+                if _is_ok_shape(a) and (sum(1 for n in a if n in u_set) == r_alvo):
+                    break
+            final.append(sorted(a))
 
+        # 5) Dedup + selagem pós-anti-overlap (eventuais colisões)
+        final = self._dedup_apostas(final, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
+        final = [self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3) for a in final]
+
+        # 6) Garantia teimosa final (R + forma)
+        corrigidas: list[list[int]] = []
+        for i, a in enumerate(final):
+            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
+            for _ in range(6):
+                if _is_ok_shape(a) and (sum(1 for n in a if n in u_set) == r_alvo):
+                    break
+                a = _force_R(a, r_alvo)
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
+            corrigidas.append(sorted(a))
+
+        return corrigidas
+
+        # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
+    def _enforce_rules(self, a: list[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
+        """
+        Garante paridade 7–8 e seq<=3, preservando âncoras quando possível.
+        """
+        a = sorted(set(a))
+        for _ in range(16):
+            a = self._ajustar_paridade_e_seq(a, alvo_par=alvo_par, max_seq=max_seq, anchors=set(anchors))
+            if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
+                break
+        return sorted(a)
+
+    def _dedup_apostas(self, apostas: list[list[int]], ultimo: list[int], max_overlap: int | None = None, anchors=frozenset()) -> list[list[int]]:
+        """
+        Remove duplicadas e 'cura' cada clone localmente sem perder tamanho.
+        Estratégia:
+          - varre pares duplicados;
+          - para o clone, troca uma dezena do 'último' por uma do complemento que
+            não quebre paridade/seq; se não houver, usa qualquer complemento;
+          - aplica enforce_rules após cada cura;
+          - ao final, executa anti-overlap (opcional) e sela regras novamente.
+        """
+        seen = {}
+        comp = [n for n in range(1, 26) if n not in ultimo]
+
+        # 1) normaliza cada aposta antes (evita clones por ordenação)
+        apostas = [sorted(a) for a in apostas]
+
+        # 2) dedup com cura local
+        for i, a in enumerate(apostas):
+            key = tuple(a)
+            if key not in seen:
+                seen[key] = i
+                continue
+
+            # Curar clone: remover uma do último e inserir um ausente
+            a2 = a[:]
+            rem = next((x for x in reversed(a2) if x in ultimo and x not in anchors), None)
+            add = next((c for c in comp if c not in a2 and (c-1 not in a2) and (c+1 not in a2)), None)
+            if add is None:
+                add = next((c for c in comp if c not in a2), None)
+
+            if rem is not None and add is not None and rem != add:
+                a2.remove(rem)
+                a2.append(add)
+                a2.sort()
+                a2 = self._enforce_rules(a2, anchors=anchors)
+            else:
+                # fallback mínimo: gira um dos elementos não âncora
+                rot = next((x for x in a2 if x not in anchors), None)
+                if rot is not None:
+                    a2.remove(rot)
+                    add2 = next((c for c in comp if c not in a2), None)
+                    if add2 is not None:
+                        a2.append(add2)
+                        a2.sort()
+                        a2 = self._enforce_rules(a2, anchors=anchors)
+
+            apostas[i] = a2
+            seen[tuple(a2)] = i  # registra novo hash
+
+        # 3) anti-overlap opcional (se pedido) + selagem final
+        if max_overlap is not None:
+            try:
+                apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=[n for n in range(1, 26) if n not in ultimo],
+                                             max_overlap=max_overlap, anchors=set(anchors))
+            except Exception:
+                pass
+
+        apostas = [self._enforce_rules(a, anchors=anchors) for a in apostas]
         return [sorted(a) for a in apostas]
 
     # --------- Anti-overlap robusto (NUNCA muda o tamanho das apostas) -------
@@ -1237,367 +1374,6 @@ class LotoFacilBot:
             _fix_len15(self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors))
             for a in apostas
         ]
-        return apostas
-
-        # --- Wrapper de telemetria usando métodos da classe ---
-    def _telemetria(self, aposta: List[int], ultimo: List[int], alvo_par=(7, 8), max_seq=3) -> TelemetriaAposta:
-        t = _telemetria_aposta(aposta, ultimo, alvo_par=alvo_par, max_seq=max_seq)
-        t.max_seq = self._max_seq(aposta)
-        t.repeticoes = self._contar_repeticoes(aposta, ultimo)
-        t.ok_seq = (t.max_seq <= max_seq)
-        t.ok_total = t.ok_paridade and t.ok_seq
-        return t
-
-    # --- Pós-processador básico (paridade 7–8, max_seq<=3 e anti-overlap<=11) ---
-    def _pos_processador_basico(self, apostas: List[List[int]], ultimo: List[int]) -> List[List[int]]:
-        comp = [n for n in range(1, 26) if n not in ultimo]
-        # normaliza cada aposta para paridade/seq
-        norm = [
-            self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=frozenset())
-            for a in apostas
-        ]
-        # reduz interseções fortes
-        norm = self._anti_overlap(norm, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=frozenset())
-        # última passada de selagem
-        norm = [
-            self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=frozenset())
-            for a in norm
-        ]
-        return [sorted(a) for a in norm]
-    
-    def _fechar_ciclo_c(
-        self,
-        apostas: list[list[int]],
-        ultimo: list[int],
-        anchors: tuple[int, int] = (9, 11),
-    ) -> list[list[int]]:
-        """
-        Selagem determinística do Ciclo C com metas rígidas:
-          - Paridade 7–8
-          - SeqMax ≤ 3
-          - Repetições (R) EXATAS por aposta, conforme CICLO_C_PLANOS[i]
-          - Dedup + anti-overlap ≤ BOLAO_MAX_OVERLAP
-        Preserva ÂNCORAS sempre que possível.
-        """
-        anchors_set = set(anchors)
-        u_set = set(ultimo)
-        comp_all = [n for n in range(1, 26) if n not in u_set]
-
-        def _is_ok_shape(a: list[int]) -> bool:
-            return (7 <= self._contar_pares(a) <= 8) and (self._max_seq(a) <= 3) and (len(a) == 15)
-
-        def _force_R(a: list[int], r_alvo: int) -> list[int]:
-            """Ajusta R exato com trocas mínimas (ancoras preservadas).
-            Depois de bater o R, normaliza forma."""
-            a = sorted(a[:])
-            r_atual = sum(1 for n in a if n in u_set)
-            if r_atual == r_alvo:
-                return a
-
-            comp_local = [n for n in range(1, 26) if n not in a]
-            if r_atual < r_alvo:
-                # Precisamos AUMENTAR R ⇒ trazer números do último (prioriza não-âncora de fora)
-                faltam = [n for n in ultimo if n not in a]
-                for add in faltam:
-                    # retirar um não-último (evitando âncoras)
-                    rem = next((x for x in a if x not in u_set and x not in anchors_set), None)
-                    if rem is None:
-                        rem = next((x for x in a if x not in u_set), None)
-                    if rem is None:
-                        break
-                    a.remove(rem); a.append(add); a.sort()
-                    r_atual += 1
-                    if r_atual == r_alvo:
-                        break
-            else:
-                # Precisamos REDUZIR R ⇒ expulsar números do último e colocar ausentes
-                for rem in [x for x in reversed(a) if x in u_set and x not in anchors_set]:
-                    add = next((c for c in comp_all if c not in a), None)
-                    if add is None:
-                        break
-                    a.remove(rem); a.append(add); a.sort()
-                    r_atual -= 1
-                    if r_atual == r_alvo:
-                        break
-
-            # Normaliza forma
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-            # Pode ter mexido na forma; se R saiu do alvo por causa da normalização, passa mais 1x
-            r_fix = sum(1 for n in a if n in u_set)
-            if r_fix != r_alvo:
-                # uma rodada curta extra só de correção fina
-                if r_fix < r_alvo:
-                    faltam = [n for n in ultimo if n not in a]
-                    for add in faltam:
-                        rem = next((x for x in a if x not in u_set and x not in anchors_set), None)
-                        if rem is None:
-                            rem = next((x for x in a if x not in u_set), None)
-                        if rem is None:
-                            break
-                        a.remove(rem); a.append(add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-                        r_fix = sum(1 for n in a if n in u_set)
-                        if r_fix == r_alvo:
-                            break
-                else:
-                    for rem in [x for x in reversed(a) if x in u_set and x not in anchors_set]:
-                        add = next((c for c in comp_all if c not in a), None)
-                        if add is None:
-                            break
-                        a.remove(rem); a.append(add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-                        r_fix = sum(1 for n in a if n in u_set)
-                        if r_fix == r_alvo:
-                            break
-
-            return sorted(a)
-
-        # 0) Normaliza cada aposta “crua”
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set) for a in apostas]
-
-        # 1) Força R exato conforme plano
-        for i in range(min(len(apostas), len(CICLO_C_PLANOS))):
-            r_alvo = CICLO_C_PLANOS[i]
-            apostas[i] = _force_R(apostas[i], r_alvo)
-
-        # 2) Dedup com cura local (respeita âncoras)
-        apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=None, anchors=anchors_set)
-
-        # 3) Anti-overlap global
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_all, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
-
-        # 4) Selagem final por aposta (forma e R)
-        final = []
-        for i, a in enumerate(apostas):
-            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
-            for _ in range(12):
-                a = self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3)
-                a = _force_R(a, r_alvo)
-                if _is_ok_shape(a) and sum(1 for n in a if n in u_set) == r_alvo:
-                    break
-            final.append(sorted(a))
-
-        # 5) Passada extra de dedup + selagem (pós anti-overlap pode gerar colisões)
-        final = self._dedup_apostas(final, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
-        final = [self._enforce_rules(a, anchors=anchors_set, alvo_par=(7, 8), max_seq=3) for a in final]
-
-        # 6) Garantia teimosa (última barreira)
-        corrigidas = []
-        for i, a in enumerate(final):
-            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
-            for _ in range(6):
-                if _is_ok_shape(a) and sum(1 for n in a if n in u_set) == r_alvo:
-                    break
-                a = _force_R(a, r_alvo)
-            corrigidas.append(sorted(a))
-        return corrigidas
-
-        # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
-    def _enforce_rules(self, a: list[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
-        """
-        Garante paridade 7–8 e seq<=3, preservando âncoras quando possível.
-        """
-        a = sorted(set(a))
-        for _ in range(16):
-            a = self._ajustar_paridade_e_seq(a, alvo_par=alvo_par, max_seq=max_seq, anchors=set(anchors))
-            if 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3:
-                break
-        return sorted(a)
-
-    def _dedup_apostas(self, apostas: list[list[int]], ultimo: list[int], max_overlap: int | None = None, anchors=frozenset()) -> list[list[int]]:
-        """
-        Remove duplicadas e 'cura' cada clone localmente sem perder tamanho.
-        Estratégia:
-          - varre pares duplicados;
-          - para o clone, troca uma dezena do 'último' por uma do complemento que
-            não quebre paridade/seq; se não houver, usa qualquer complemento;
-          - aplica enforce_rules após cada cura;
-          - ao final, executa anti-overlap (opcional) e sela regras novamente.
-        """
-        seen = {}
-        comp = [n for n in range(1, 26) if n not in ultimo]
-
-        # 1) normaliza cada aposta antes (evita clones por ordenação)
-        apostas = [sorted(a) for a in apostas]
-
-        # 2) dedup com cura local
-        for i, a in enumerate(apostas):
-            key = tuple(a)
-            if key not in seen:
-                seen[key] = i
-                continue
-
-            # Curar clone: remover uma do último e inserir um ausente
-            a2 = a[:]
-            rem = next((x for x in reversed(a2) if x in ultimo and x not in anchors), None)
-            add = next((c for c in comp if c not in a2 and (c-1 not in a2) and (c+1 not in a2)), None)
-            if add is None:
-                add = next((c for c in comp if c not in a2), None)
-
-            if rem is not None and add is not None and rem != add:
-                a2.remove(rem)
-                a2.append(add)
-                a2.sort()
-                a2 = self._enforce_rules(a2, anchors=anchors)
-            else:
-                # fallback mínimo: gira um dos elementos não âncora
-                rot = next((x for x in a2 if x not in anchors), None)
-                if rot is not None:
-                    a2.remove(rot)
-                    add2 = next((c for c in comp if c not in a2), None)
-                    if add2 is not None:
-                        a2.append(add2)
-                        a2.sort()
-                        a2 = self._enforce_rules(a2, anchors=anchors)
-
-            apostas[i] = a2
-            seen[tuple(a2)] = i  # registra novo hash
-
-        # 3) anti-overlap opcional (se pedido) + selagem final
-        if max_overlap is not None:
-            try:
-                apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=[n for n in range(1, 26) if n not in ultimo],
-                                             max_overlap=max_overlap, anchors=set(anchors))
-            except Exception:
-                pass
-
-        apostas = [self._enforce_rules(a, anchors=anchors) for a in apostas]
-        return [sorted(a) for a in apostas]
-
-    # --------- Passe final para garantir regras após ajustes ---------
-    def _finalizar_regras_mestre(self, apostas, ultimo, comp, anchors):
-        from collections import Counter
-
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
-
-        comp_set = set(comp)
-        comp_list = sorted(comp_set)
-        min_per_absent = 2 if len(comp_list) <= 10 else 1
-        max_per_absent = 5
-
-        cnt_abs = Counter()
-        for a in apostas:
-            for n in a:
-                if n in comp_set:
-                    cnt_abs[n] += 1
-
-        for n in comp_list:
-            while cnt_abs[n] < min_per_absent:
-                idx = min(range(len(apostas)), key=lambda k: sum(1 for x in apostas[k] if x in comp_set))
-                alvo = apostas[idx][:]
-                rem = next((x for x in sorted(alvo, reverse=True) if x in ultimo and x not in anchors), None)
-                if rem is None or n in alvo:
-                    break
-                alvo.remove(rem); alvo.append(n); alvo.sort()
-                alvo = self._ajustar_paridade_e_seq(alvo, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
-                apostas[idx] = alvo
-                cnt_abs[n] += 1
-
-        for n in comp_list:
-            while cnt_abs[n] > max_per_absent:
-                idx = max(
-                    range(len(apostas)),
-                    key=lambda k: (n in apostas[k]) + sum(1 for x in apostas[k] if x in comp_set)
-                )
-                a = apostas[idx][:]
-                if n not in a:
-                    break
-                cand_add = next((u for u in ultimo if u not in a and u not in anchors), None)
-                if cand_add is None:
-                    cand_add = next((u for u in ultimo if u not in a), None)
-                if cand_add is None:
-                    break
-                a.remove(n); a.append(cand_add); a.sort()
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
-                apostas[idx] = a
-                cnt_abs[n] -= 1
-
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(anchors))
-        return apostas
-
-    # --------- Funções auxiliares (pares penalizados e cap de ruído) ---------
-    @staticmethod
-    def _tem_par_penalizado(aposta):
-        s = set(aposta)
-        for a, b in PARES_PENALIZADOS:
-            if a in s and b in s:
-                return (a, b)
-        return None
-
-    def _quebrar_pares_ruins(self, aposta, comp, anchors=()):
-        a = sorted(aposta)
-        comp_list = [c for c in sorted(comp) if c not in a]
-        changed = False
-        while True:
-            par = self._tem_par_penalizado(a)
-            if not par or not comp_list:
-                break
-            x, y = par
-            # escolha quem sai (evitando tirar âncoras)
-            sair = y if x in anchors else x
-            if x in anchors and y in anchors:
-                sair = max(x, y)
-            if sair not in a:
-                break
-
-            # escolha substituto que não forme sequência
-            sub = None
-            for c in comp_list:
-                if (c - 1 not in a) and (c + 1 not in a):
-                    sub = c
-                    break
-            if sub is None:
-                sub = comp_list[0]
-
-            # aplica troca
-            a.remove(sair)
-            a.append(sub)
-            a.sort()
-            comp_list.remove(sub)
-
-            # normaliza paridade/seq
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
-            changed = True
-
-        return a, changed
-
-    def _cap_frequencia_ruido(self, apostas, ultimo, comp, anchors=()):
-        from collections import Counter
-        pres = Counter()
-        for a in apostas:
-            sa = set(a)
-            for r in RUIDOS:
-                if r in sa:
-                    pres[r] += 1
-        if not any(pres[r] > RUIDO_CAP_POR_LOTE for r in RUIDOS):
-            return apostas
-        comp_pool = sorted(set(comp))
-        for r in sorted(RUIDOS):
-            while pres[r] > RUIDO_CAP_POR_LOTE and comp_pool:
-                idx = next((i for i in range(len(apostas)-1, -1, -1) if r in apostas[i]), None)
-                if idx is None:
-                    break
-                a = apostas[idx][:]
-                add = None
-                for c in comp_pool:
-                    if c not in a and (c-1 not in a) and (c+1 not in a):
-                        add = c
-                        break
-                if add is None:
-                    add = comp_pool[0] if comp_pool else None
-                if add is None:
-                    break
-                rem = r if r not in anchors else next((x for x in reversed(a) if x not in anchors), None)
-                if rem is None or rem not in a:
-                    break
-                a.remove(rem); a.append(add); a.sort()
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
-                apostas[idx] = a
-                pres[r] -= 1
-                comp_pool.remove(add)
-                if pres[r] <= RUIDO_CAP_POR_LOTE:
-                    break
         return apostas
 
     # --------- Gerador mestre (com seed por usuário/chat) ---------
@@ -1793,6 +1569,246 @@ class LotoFacilBot:
             seen.add(key)
             apostas[i] = a
 
+        return apostas
+
+    # --------- Diversificador do Mestre ---------
+    def _diversificar_mestre(self, apostas, ultimo, comp, max_rep_ultimo=7, min_mid=3, min_fortes=2):
+        """
+        Aplica refinamentos determinísticos nas apostas geradas pelo Mestre:
+        - Garante pelo menos 'min_fortes' dezenas de AUSENTES FORTES por aposta
+        - Limita a repetição de cada dezena do último resultado a 'max_rep_ultimo'
+        - Garante pelo menos 'min_mid' dezenas na faixa [12..18] em cada aposta
+        Mantém paridade (7–8) e max_seq<=3 após cada ajuste.
+        """
+        from collections import Counter
+
+        comp_set = set(comp)
+        preferidos = [20, 22, 24, 10, 12, 14, 16, 18]
+        ausentes_fortes = [n for n in preferidos if n in comp_set]
+
+        for idx, a in enumerate(apostas):
+            a = sorted(a)
+            fortes_na_aposta = sum(1 for n in a if n in ausentes_fortes)
+            if fortes_na_aposta < min_fortes and ausentes_fortes:
+                faltam = min_fortes - fortes_na_aposta
+                removiveis = sorted([x for x in a if x in ultimo], reverse=True)
+                for _ in range(faltam):
+                    add = next((c for c in ausentes_fortes if c not in a), None)
+                    if add is None:
+                        break
+                    rem = None
+                    for r in list(removiveis):
+                        if r in a:
+                            rem = r
+                            removiveis.remove(r)
+                            break
+                    if rem is None:
+                        rem = a[-1]
+                    if rem == add:
+                        continue
+                    a.remove(rem)
+                    a.append(add)
+                    a.sort()
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                apostas[idx] = a
+
+        from collections import Counter as _Counter
+        cnt = _Counter()
+        for a in apostas:
+            for n in a:
+                if n in ultimo:
+                    cnt[n] += 1
+
+        excesso = [(n, cnt[n]) for n in sorted(ultimo, reverse=True) if cnt[n] > max_rep_ultimo]
+        if excesso and comp_set:
+            comp_ord = sorted(comp_set)
+            for dezena, _ in excesso:
+                for i in range(len(apostas) - 1, -1, -1):
+                    if cnt[dezena] <= max_rep_ultimo:
+                        break
+                    a = apostas[i][:]
+                    if dezena not in a:
+                        continue
+                    add = next((c for c in comp_ord if c not in a), None)
+                    if add is None:
+                        break
+                    a.remove(dezena)
+                    a.append(add)
+                    a.sort()
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                    apostas[i] = a
+                    cnt[dezena] -= 1
+
+        mid_lo, mid_hi = 12, 18
+        for i, a in enumerate(apostas):
+            a = sorted(a)
+            mid = [n for n in a if mid_lo <= n <= mid_hi]
+            if len(mid) < min_mid:
+                need = min_mid - len(mid)
+                candidatos_add = [n for n in sorted(comp_set) if mid_lo <= n <= mid_hi and n not in a]
+                if len(candidatos_add) < need:
+                    extras = [n for n in range(mid_lo, mid_hi + 1) if n not in a]
+                    for x in extras:
+                        if x not in candidatos_add:
+                            candidatos_add.append(x)
+                candidatos_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi) and x in ultimo]
+                if len(candidatos_rem) < need:
+                    outros = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi)]
+                    for x in outros:
+                        if x not in candidatos_rem:
+                            candidatos_rem.append(x)
+                j = 0
+                while need > 0 and j < len(candidatos_add) and j < len(candidatos_rem):
+                    add = candidatos_add[j]
+                    rem = candidatos_rem[j]
+                    if add == rem:
+                        j += 1
+                        continue
+                    if rem in a and add not in a:
+                        a.remove(rem)
+                        a.append(add)
+                        a.sort()
+                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        need -= 1
+                    j += 1
+                apostas[i] = a
+
+        return [sorted(a) for a in apostas]
+
+    # --------- Passe final para garantir regras após ajustes ---------
+    def _finalizar_regras_mestre(self, apostas, ultimo, comp, anchors):
+        from collections import Counter
+
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
+
+        comp_set = set(comp)
+        comp_list = sorted(comp_set)
+        min_per_absent = 2 if len(comp_list) <= 10 else 1
+        max_per_absent = 5
+
+        cnt_abs = Counter()
+        for a in apostas:
+            for n in a:
+                if n in comp_set:
+                    cnt_abs[n] += 1
+
+        for n in comp_list:
+            while cnt_abs[n] < min_per_absent:
+                idx = min(range(len(apostas)), key=lambda k: sum(1 for x in apostas[k] if x in comp_set))
+                alvo = apostas[idx][:]
+                rem = next((x for x in sorted(alvo, reverse=True) if x in ultimo and x not in anchors), None)
+                if rem is None or n in alvo:
+                    break
+                alvo.remove(rem); alvo.append(n); alvo.sort()
+                alvo = self._ajustar_paridade_e_seq(alvo, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
+                apostas[idx] = alvo
+                cnt_abs[n] += 1
+
+        for n in comp_list:
+            while cnt_abs[n] > max_per_absent:
+                idx = max(
+                    range(len(apostas)),
+                    key=lambda k: (n in apostas[k]) + sum(1 for x in apostas[k] if x in comp_set)
+                )
+                a = apostas[idx][:]
+                if n not in a:
+                    break
+                cand_add = next((u for u in ultimo if u not in a and u not in anchors), None)
+                if cand_add is None:
+                    cand_add = next((u for u in ultimo if u not in a), None)
+                if cand_add is None:
+                    break
+                a.remove(n); a.append(cand_add); a.sort()
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
+                apostas[idx] = a
+                cnt_abs[n] -= 1
+
+        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors)) for a in apostas]
+        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=set(anchors))
+        return apostas
+
+    # --------- Funções auxiliares (pares penalizados e cap de ruído) ---------
+    @staticmethod
+    def _tem_par_penalizado(aposta):
+        s = set(aposta)
+        for a, b in PARES_PENALIZADOS:
+            if a in s and b in s:
+                return (a, b)
+        return None
+
+    def _quebrar_pares_ruins(self, aposta, comp, anchors=()):
+        a = sorted(aposta)
+        comp_list = [c for c in sorted(comp) if c not in a]
+        changed = False
+        while True:
+            par = self._tem_par_penalizado(a)
+            if not par or not comp_list:
+                break
+            x, y = par
+            # escolha quem sai (evitando tirar âncoras)
+            sair = y if x in anchors else x
+            if x in anchors and y in anchors:
+                sair = max(x, y)
+            if sair not in a:
+                break
+
+            # escolha substituto que não forme sequência
+            sub = None
+            for c in comp_list:
+                if (c - 1 not in a) and (c + 1 not in a):
+                    sub = c
+                    break
+            if sub is None:
+                sub = comp_list[0]
+
+            # aplica troca
+            a.remove(sair)
+            a.append(sub)
+            a.sort()
+            comp_list.remove(sub)
+
+            # normaliza paridade/seq
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
+            changed = True
+
+        return a, changed
+
+    def _cap_frequencia_ruido(self, apostas, ultimo, comp, anchors=()):
+        from collections import Counter
+        pres = Counter()
+        for a in apostas:
+            sa = set(a)
+            for r in RUIDOS:
+                if r in sa:
+                    pres[r] += 1
+        if not any(pres[r] > RUIDO_CAP_POR_LOTE for r in RUIDOS):
+            return apostas
+        comp_pool = sorted(set(comp))
+        for r in sorted(RUIDOS):
+            while pres[r] > RUIDO_CAP_POR_LOTE and comp_pool:
+                idx = next((i for i in range(len(apostas)-1, -1, -1) if r in apostas[i]), None)
+                if idx is None:
+                    break
+                a = apostas[idx][:]
+                add = None
+                for c in comp_pool:
+                    if c not in a and (c-1 not in a) and (c+1 not in a):
+                        add = c
+                        break
+                if add is None:
+                    add = comp_pool[0] if comp_pool else None
+                if add is None:
+                    break
+                rem = r if r not in anchors else next((x for x in reversed(a) if x not in anchors), None)
+                if rem is None or rem not in a:
+                    break
+                a.remove(rem); a.append(add); a.sort()
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=set(anchors))
+                apostas[idx] = a
+                pres[r] -= 1
+                comp_pool.remove(add)
+                if pres[r] <= RUIDO_CAP_POR_LOTE:
+                    break
         return apostas
 
     # ========================
