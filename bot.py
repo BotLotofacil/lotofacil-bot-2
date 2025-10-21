@@ -629,10 +629,10 @@ class LotoFacilBot:
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
 
-    # --- /gerar: rápido, determinístico e com lock duro de forma ---
+    # --- /gerar: RÁPIDO, determinístico e com lock eficiente ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Comando /gerar – Gera apostas inteligentes.
+        Comando /gerar – Gera apostas inteligentes (OTIMIZADO).
         Uso: /gerar [qtd] [janela] [alpha]
         Padrão: 5 apostas | janela=60 | α=0,42
         """
@@ -655,7 +655,7 @@ class LotoFacilBot:
         # Defaults
         qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
 
-        # Parse argumentos posicionais (opcionais)
+        # Parse argumentos posicionais (opcionais) - MANTIDO
         try:
             if context.args and len(context.args) >= 1:
                 qtd = int(context.args[0])
@@ -669,7 +669,7 @@ class LotoFacilBot:
         # Clamps
         qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
 
-        # Histórico/último
+        # Histórico/último - MANTIDO
         try:
             historico = carregar_historico(HISTORY_PATH)
         except Exception:
@@ -680,92 +680,182 @@ class LotoFacilBot:
             ultimo = []
         comp = [n for n in range(1, 26) if n not in set(ultimo)]
 
-        # ---------- Auxiliares locais de lock/validação ----------
-        def _is_valid(a: list[int]) -> bool:
-            return 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3 and len(a) == 15
+        # ---------- Versão OTIMIZADA de validação/lock ----------
+        def _is_valid_fast(a: list[int]) -> bool:
+            return len(a) == 15 and 7 <= self._contar_pares(a) <= 8 and self._max_seq(a) <= 3
 
-        def _hard_lock(a: list[int], anchors=frozenset()) -> list[int]:
+        def _hard_lock_fast(a: list[int], anchors=frozenset()) -> list[int]:
             """
-            Força (pares∈[7,8] ∧ seq≤3) preservando âncoras sempre que possível.
-            Usa trocas com o complemento; reavalia comp a cada passo.
+            Versão OTIMIZADA: menos iterações, lógica simplificada
             """
             a = sorted(set(a))[:15]
-            for _ in range(40):
-                # 1) quebra sequências >3
-                comp_local = [n for n in range(1, 26) if n not in a]
-                # quebra a maior sequência trocando um membro não-âncora por um número isolado
-                while self._max_seq(a) > 3 and comp_local:
-                    seq_break_done = False
+        
+            # Verificação rápida - se já está válido, retorna
+            if _is_valid_fast(a):
+                return a
+            
+            # Máximo 15 iterações (reduzido de 40)
+            for attempt in range(15):
+                changed = False
+            
+                # 1) Ajuste de paridade PRIORITÁRIO (mais simples)
+                pares = self._contar_pares(a)
+                if pares < 7 or pares > 8:
+                    comp_local = [n for n in range(1, 26) if n not in a]
+                    if pares > 8:  # Muitos pares
+                        # Remove par, adiciona ímpar
+                        for rem in a:
+                            if rem % 2 == 0 and rem not in anchors and rem in a:
+                                for add in comp_local:
+                                    if add % 2 == 1 and add not in a:
+                                        a.remove(rem)
+                                        a.append(add)
+                                        a.sort()
+                                        changed = True
+                                        break
+                                if changed:
+                                    break
+                    else:  # Poucos pares (pares < 7)
+                        # Remove ímpar, adiciona par
+                        for rem in a:
+                            if rem % 2 == 1 and rem not in anchors and rem in a:
+                                for add in comp_local:
+                                    if add % 2 == 0 and add not in a:
+                                        a.remove(rem)
+                                        a.append(add)
+                                        a.sort()
+                                        changed = True
+                                        break
+                                if changed:
+                                    break
+            
+                # 2) Quebra de sequências (apenas se necessário)
+                if self._max_seq(a) > 3:
                     s = sorted(a)
-                    # localizar blocos
-                    runs = []
-                    st = s[0]
-                    run = 1
+                    # Encontra a maior sequência rapidamente
+                    current_seq = 1
+                    seq_start = 0
                     for i in range(1, len(s)):
                         if s[i] == s[i-1] + 1:
-                            run += 1
+                            current_seq += 1
                         else:
-                            if run > 1:
-                                runs.append((st, s[i-1], run))
-                            st, run = s[i], 1
-                    if run > 1:
-                        runs.append((st, s[-1], run))
-                    runs.sort(key=lambda t: t[2], reverse=True)
-                    rem = None
-                    for st, fn, _r in runs:
-                        for x in range(fn, st - 1, -1):
-                            if x in a and x not in anchors:
-                                rem = x
-                                break
-                        if rem is not None:
-                            break
-                    add = next((c for c in comp_local if (c-1 not in a) and (c+1 not in a)), None)
-                    if rem is not None and add is not None:
-                        a.remove(rem); a.append(add); a.sort()
-                        seq_break_done = True
-                    comp_local = [n for n in range(1, 26) if n not in a]
-                    if not seq_break_done:
-                        break
-
-                # 2) ajusta paridade para [7,8]
-                comp_local = [n for n in range(1, 26) if n not in a]
-                pares = self._contar_pares(a)
-                if pares > 8:
-                    rem = next((x for x in a if x % 2 == 0 and x not in anchors), None)
-                    add = next((c for c in comp_local if c % 2 == 1), None)
-                    if rem is not None and add is not None:
-                        a.remove(rem); a.append(add); a.sort()
-                elif pares < 7:
-                    rem = next((x for x in a if x % 2 == 1 and x not in anchors), None)
-                    add = next((c for c in comp_local if c % 2 == 0), None)
-                    if rem is not None and add is not None:
-                        a.remove(rem); a.append(add); a.sort()
-
-                # 3) normalização fina usando o seu utilitário
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=frozenset())
-                if _is_valid(a):
+                            if current_seq > 3:
+                                # Quebra a sequência trocando o último elemento
+                                rem = s[i-1]
+                                if rem not in anchors and rem in a:
+                                    comp_local = [n for n in range(1, 26) if n not in a]
+                                    # Encontra substituto que não crie nova sequência
+                                    for add in comp_local:
+                                        if (add-1 not in a) and (add+1 not in a):
+                                            a.remove(rem)
+                                            a.append(add)
+                                            a.sort()
+                                            changed = True
+                                            break
+                            current_seq = 1
+                            seq_start = i
+                
+                    # Verifica a última sequência
+                    if current_seq > 3:
+                        rem = s[-1]
+                        if rem not in anchors and rem in a:
+                            comp_local = [n for n in range(1, 26) if n not in a]
+                            for add in comp_local:
+                                if (add-1 not in a) and (add+1 not in a):
+                                    a.remove(rem)
+                                    a.append(add)
+                                    a.sort()
+                                    changed = True
+                                    break
+            
+                # 3) Se não houve mudanças e está válido, termina
+                if not changed and _is_valid_fast(a):
                     break
+                
+                # 4) Último recurso: normalização básica
+                if attempt >= 10 and not _is_valid_fast(a):
+                    a = self._ajustar_paridade_e_seq_fast(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
+        
             return sorted(a)[:15]
 
-        def _fallback_det(qty: int) -> list[list[int]]:
+        def _ajustar_paridade_e_seq_fast(self, aposta, alvo_par=(7, 8), max_seq=3, anchors=frozenset()):
             """
-            Fallback determinístico: monta apostas a partir de (último, comp)
-            já dentro de pares 7–8 e seq≤3.
+            Versão SIMPLIFICADA do ajuste de paridade/sequência
+            """
+            a = sorted(set(aposta))
+            min_par, max_par = alvo_par
+        
+            # Apenas 10 iterações (reduzido de 40)
+            for _ in range(10):
+                pares = self._contar_pares(a)
+                seq_ok = self._max_seq(a) <= max_seq
+            
+                # Se está OK, para
+                if min_par <= pares <= max_par and seq_ok:
+                    break
+                
+                comp = [n for n in range(1, 26) if n not in a]
+            
+                # Prioriza ajuste de paridade
+                if pares > max_par:
+                    rem = next((x for x in a if x % 2 == 0 and x not in anchors), None)
+                    add = next((c for c in comp if c % 2 == 1), None)
+                elif pares < min_par:
+                    rem = next((x for x in a if x % 2 == 1 and x not in anchors), None)
+                    add = next((c for c in comp if c % 2 == 0), None)
+                else:
+                    # Só ajuste de sequência
+                    if not seq_ok:
+                        s = sorted(a)
+                        for i in range(len(s)-1, 0, -1):
+                            if s[i] - s[i-1] == 1:  # Parte de sequência
+                                rem = s[i]
+                                if rem not in anchors:
+                                    add = next((c for c in comp if (c-1 not in a) and (c+1 not in a)), comp[0] if comp else None)
+                                    if add:
+                                        a.remove(rem)
+                                        a.append(add)
+                                        a.sort()
+                                        break
+                    continue
+                    
+                if rem is not None and add is not None:
+                    a.remove(rem)
+                    a.append(add)
+                    a.sort()
+        
+            return sorted(a)
+
+        def _fallback_det_fast(qty: int) -> list[list[int]]:
+            """
+            Fallback MUITO mais rápido
             """
             base = []
             L = list(ultimo) or list(range(1, 16))
             C = comp or [n for n in range(1, 26) if n not in L]
+        
             for i in range(max(1, qty)):
-                off_last = (i * 3) % len(L)
-                off_comp = (i * 5) % len(C)
-                manter = (L[off_last:] + L[:off_last])[:8]  # 8 do último
-                add = (C[off_comp:] + C[:off_comp])[:7]     # 7 do comp
-                a = sorted(set(manter + add))[:15]
-                a = _hard_lock(a)
-                base.append(a)
+                # Lógica mais simples e direta
+                manter = L[:8]  # Sempre pega os primeiros 8 do último
+                add = C[:7]     # Sempre pega os primeiros 7 do complemento
+            
+                a = sorted(set(manter + add))
+            
+                # Garante 15 números
+                while len(a) < 15:
+                    for n in range(1, 26):
+                        if n not in a:
+                            a.append(n)
+                            if len(a) == 15:
+                                break
+            
+                # Aplica lock rápido
+                a = _hard_lock_fast(a)
+                base.append(a[:15])
+            
             return base
 
-        # ---------- Cache leve do preditor ----------
+        # ---------- Cache do preditor (MANTIDO) ----------
         try:
             snap = self._latest_snapshot()
             snap_id = snap.snapshot_id
@@ -777,67 +867,63 @@ class LotoFacilBot:
         cached = cache_map.get(cache_key)
 
         async def _gen_pred():
-            # se cache existe, usa direto
             if cached and isinstance(cached, list):
                 return [a[:] for a in cached][:qtd]
-            # senão, gera em thread
+            # Timeout REDUZIDO para 2 segundos
             res = await asyncio.to_thread(self._gerar_apostas_inteligentes, qtd, janela, alpha)
-            # guarda só 10 para não crescer demais
             cache_map[cache_key] = res[:10]
             return res
 
-        # ---------- Geração com timeout curto ----------
+        # ---------- Geração com timeout MAIS CURTO ----------
         try:
             try:
-                apostas = await asyncio.wait_for(_gen_pred(), timeout=3.0)
+                # Timeout de 2 segundos (era 3)
+                apostas = await asyncio.wait_for(_gen_pred(), timeout=2.0)
             except asyncio.TimeoutError:
-                logger.warning("Predictor levou >3s; usando fallback determinístico.")
-                apostas = _fallback_det(qtd)
+                logger.warning("Predictor levou >2s; usando fallback RÁPIDO.")
+                apostas = _fallback_det_fast(qtd)
 
-            # Pós-processamento (se tivermos 'ultimo')
+            # Pós-processamento SIMPLIFICADO
             try:
-                if ultimo:
-                    apostas = self._pos_processador_basico(apostas, ultimo=ultimo)
+                if ultimo and apostas:
+                    # Apenas uma passada rápida de normalização
+                    apostas = [self._ajustar_paridade_e_seq_fast(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
             except Exception:
-                logger.warning("Pós-processador básico falhou; seguindo com apostas atuais.", exc_info=True)
+                logger.warning("Pós-processador rápido falhou; seguindo com apostas atuais.", exc_info=True)
 
-            # Selagem leve
-            try:
-                apostas = [self._enforce_rules(a) for a in apostas]
-            except Exception:
-                logger.warning("Falha no enforce inicial.", exc_info=True)
-
-            # ---------- Auditoria/lock final por aposta ----------
+            # ---------- Validação final RÁPIDA ----------
             apostas_ok = []
             for a in apostas:
-                a = _hard_lock(a)
-                if not _is_valid(a):
-                    # última cura determinística
-                    a = _hard_lock(self._construir_aposta_por_repeticao(
-                        last_sorted=ultimo or list(range(1, 26))[:15],
-                        comp_sorted=comp or [n for n in range(1, 26) if n not in (ultimo or [])],
-                        repeticoes=8, offset_last=1, offset_comp=2
-                    ))
-                apostas_ok.append(sorted(a)[:15])
+                a_fixed = _hard_lock_fast(a)
+                if not _is_valid_fast(a_fixed):
+                    # Correção emergencial simples
+                    a_fixed = _hard_lock_fast(list(range(1, 16)))  # Fallback ultra simples
+                apostas_ok.append(sorted(a_fixed)[:15])
 
-            # Dedup/overlap finais (rápidos)
+            # Dedup rápido (apenas uma verificação)
             try:
-                if ultimo:
-                    apostas_ok = self._dedup_apostas(apostas_ok, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
+                if ultimo and len(apostas_ok) > 1:
+                    seen = set()
+                    unique_apostas = []
+                    for a in apostas_ok:
+                        key = tuple(a)
+                        if key not in seen:
+                            seen.add(key)
+                            unique_apostas.append(a)
+                    apostas_ok = unique_apostas[:qtd]  # Mantém quantidade original
             except Exception:
-                logger.warning("Dedup/overlap final falhou.", exc_info=True)
+                logger.warning("Dedup rápido falhou.", exc_info=True)
 
-            # Formatação
+            # Formatação (MANTIDA)
             try:
                 resposta = self._formatar_resposta(apostas_ok, janela, alpha)
             except Exception:
                 linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
                 for i, a in enumerate(apostas_ok, 1):
                     pares = self._contar_pares(a)
-                    seq = self._max_seq(a)
                     linhas.append(
                         f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
-                        f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
+                        f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
                     )
                 resposta = "\n".join(linhas)
 
