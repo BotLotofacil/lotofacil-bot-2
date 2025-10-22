@@ -12,21 +12,37 @@ class HybridGenerator:
         self.neural_gen = NeuralStrategy(historico)
 
     def generate(self, n_apostas: int = 5) -> List[List[int]]:
-        """Gera apostas combinando múltiplas estratégias"""
         return [self._combinar_aposta() for _ in range(n_apostas)]
 
     # --- Interno ---
     def _combinar_aposta(self) -> List[int]:
-        """
-        Combina uma aposta de 3 estratégias diferentes.
-        Usa as saídas públicas (executar) e consolida 15 dezenas.
-        """
         stat = self.stats_gen.executar()
         gene = self.genetic_gen.executar()
         neur = self.neural_gen.executar()
 
-        combinado = list(set(stat + gene + neur))
+        usados = set()
+        combinado: List[int] = []
+
+        def take(source: List[int], k: int):
+            for n in source:
+                if 1 <= n <= 25 and n not in usados:
+                    combinado.append(n)
+                    usados.add(n)
+                    if len(combinado) % 5 == 0 and len(combinado) >= k:
+                        break
+
+        # quota inicial equilibrada ~5/5/5 (se possível)
+        take(stat, 5)
+        take(gene, 10)
+        take(neur, 15)
+
+        # se ainda faltar, completa com universo
         if len(combinado) < 15:
-            combinado += [n for n in range(1, 26) if n not in combinado]
+            for n in range(1, 26):
+                if n not in usados:
+                    combinado.append(n)
+                    usados.add(n)
+                    if len(combinado) == 15:
+                        break
 
         return sorted(combinado[:15])
