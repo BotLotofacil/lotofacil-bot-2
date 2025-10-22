@@ -629,7 +629,7 @@ class LotoFacilBot:
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
 
-    # --- /gerar: rápido, canônico e selado ---
+    # --- /gerar: rápido, estável, sem cache e com diversidade entre chamadas ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando /gerar – Gera apostas inteligentes (rápido e estável).
@@ -667,7 +667,7 @@ class LotoFacilBot:
         except Exception:
             pass  # mantém defaults
 
-        # Clamps defensivos
+        # Clamps defensivos (garanta BILH_MAX alto na sua configuração p/ /gerar 50, 100, etc.)
         qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
 
         # Histórico/último seguro
@@ -683,21 +683,17 @@ class LotoFacilBot:
         u_set = set(ultimo)
         universo = list(range(1, 26))
 
-        # --------- Utilidades canônicas (SEM duplicidades) ---------
+        # --------- utilidades canônicas e selagem ----------
         def _canon(a: list[int]) -> list[int]:
-            """
-            Normaliza: inteiros 1..25, únicos, ordenados, 15 elementos.
-            Se faltar, completa pelo complemento; se sobrar, corta mantendo diversidade.
-            """
+            """Normaliza: 1..25, únicos, ordenados, exatamente 15."""
             a = [int(x) for x in a if 1 <= int(x) <= 25]
             a = sorted(set(a))
             if len(a) > 15:
-                # corta priorizando manter mistura último/complemento
+                # corta tentando alternar último/complemento
                 keep = []
                 for n in a:
                     if len(keep) == 15:
                         break
-                    # alterna preferência: primeiro que está no último, depois do comp
                     if (len(keep) % 2 == 0 and n in u_set) or (len(keep) % 2 == 1 and n not in u_set):
                         keep.append(n)
                 if len(keep) < 15:
@@ -725,87 +721,98 @@ class LotoFacilBot:
             return a
 
         def _selar(a: list[int]) -> list[int]:
-            """
-            Passo único de selagem: canônico -> enforce_rules (paridade 7–8, seq≤3).
-            """
+            """Canônico + lock forte (pares 7–8, seq≤3) preservando inteligência."""
             a = _canon(a)
-            # _enforce_rules já ordena e preserva forma; anchors vazias aqui.
             try:
-                a = self._enforce_rules(a)
+                # >>> IMPORTANTE: passar 'ultimo' explicitamente
+                a = self._hard_lock_fast(a, ultimo, anchors=frozenset())
+            except TypeError:
+                # caso sua _hard_lock_fast antiga não tenha 'ultimo' na assinatura
+                try:
+                    a = self._hard_lock_fast(a, anchors=frozenset())
+                except Exception:
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
             except Exception:
-                # fallback mínimo
                 a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-            # garantia canônica (nunca sobra duplicado)
+            # reforço final
+            try:
+                a = self._enforce_rules(a)  # P∈[7,8], Seq≤3
+            except Exception:
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
             return _canon(a)
 
-        # --------- Fallback determinístico (rápido e estável) ---------
-        def _fallback(qty: int) -> list[list[int]]:
-            base = []
-            L = list(ultimo) or universo[:15]
-            C = [n for n in universo if n not in L]
-            for i in range(max(1, qty)):
-                offL = (i * 3) % len(L)
-                offC = (i * 5) % len(C) if C else 0
-                # 8 do último + 7 do complemento (boa mistura)
-                a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
-                base.append(_selar(a))
-            return base
-
-        # --------- Preditor com cache + timeout curto ---------
+        # --------- “sal” por chamada para variar offsets do fallback ----------
         try:
             snap = self._latest_snapshot()
             snap_id = getattr(snap, "snapshot_id", "n/a")
         except Exception:
             snap_id = "n/a"
+        try:
+            call_salt = (self._next_draw_seed(str(snap_id)) & 0x7FFFFFFF)  # contador persistido por snapshot
+        except Exception:
+            call_salt = 0
 
-        cache_key = ("gerar", snap_id, int(janela), round(float(alpha), 4))
-        cache_map = _PROCESS_CACHE.setdefault("pred_cache", {})
-        cached = cache_map.get(cache_key)
+        # --------- Fallback determinístico (rápido), mas salgado por chamada ----------
+        def _fallback(qty: int, salt: int) -> list[list[int]]:
+            base = []
+            L = list(ultimo) or universo[:15]
+            C = [n for n in universo if n not in L]
+            for i in range(max(1, qty)):
+                offL = (salt + i * 3) % len(L)
+                offC = ((salt // 7) + i * 5) % len(C) if C else 0
+                a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
+                base.append(_selar(a))
+            return base
 
+        # --------- Preditor SEM cache (sempre gera lote novo) ----------
         async def _run_preditor():
-            if cached and isinstance(cached, list):
-                return [a[:] for a in cached][:qtd]
-            res = await asyncio.to_thread(self._gerar_apostas_inteligentes, qtd, janela, alpha)
-            cache_map[cache_key] = res[:10]
-            return res
+            return await asyncio.to_thread(self._gerar_apostas_inteligentes, qtd, janela, alpha)
 
-        # --------- Pipeline principal ---------
+        # --------- Pipeline principal ----------
         try:
             try:
                 brutas = await asyncio.wait_for(_run_preditor(), timeout=2.5)
             except asyncio.TimeoutError:
                 logger.warning("Predictor >2.5s: usando fallback determinístico.")
-                brutas = _fallback(qtd)
+                brutas = _fallback(qtd, call_salt)
 
-            # 1) Selagem por aposta (remove duplicatas internas e garante forma)
+            # 1) Selagem por aposta
             apostas = [_selar(a) for a in brutas]
 
-            # 2) Dedup entre apostas (se houver 'ultimo' melhora a cura)
+            # 2) Dedup/anti-overlap entre apostas
             try:
                 if ultimo and len(apostas) > 1:
                     apostas = self._dedup_apostas(apostas, ultimo=ultimo, max_overlap=BOLAO_MAX_OVERLAP)
                 else:
-                    # dedup simples por tupla
                     seen, uniq = set(), []
                     for a in apostas:
                         t = tuple(a)
                         if t not in seen:
-                            seen.add(t)
-                            uniq.append(a)
+                            seen.add(t); uniq.append(a)
                     apostas = uniq
             except Exception:
                 logger.warning("Dedup final falhou; seguindo com apostas seladas.", exc_info=True)
 
-            # 3) Validação teimosa (nunca sai com números repetidos/fora da forma)
+            # 3) Reposição até atingir 'qtd' (gera variantes com sal incremental)
+            rep_salt = call_salt
+            seen_keys = {tuple(x) for x in apostas}
+            while len(apostas) < qtd:
+                rep_salt += 7  # passo "primo" p/ reduzir colisões de offset
+                extra = _fallback(1, rep_salt)[0]
+                k = tuple(extra)
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    apostas.append(extra)
+
+            # 4) Validação teimosa (garantia absoluta de forma)
             apostas_ok = []
             for a in apostas[:qtd]:
                 a = _selar(a)
                 if len(a) != 15 or len(set(a)) != 15:
-                    a = _canon(a)
-                    a = _selar(a)
+                    a = _selar(_canon(a))
                 apostas_ok.append(a)
 
-            # 4) Formatação
+            # 5) Formatação
             try:
                 resposta = self._formatar_resposta(apostas_ok, janela, alpha)
             except Exception:
@@ -819,6 +826,8 @@ class LotoFacilBot:
                         f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
                     )
                 if SHOW_TIMESTAMP:
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
                     now_sp = datetime.now(ZoneInfo(TIMEZONE))
                     carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
                     linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
