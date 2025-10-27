@@ -189,7 +189,7 @@ TIMEZONE = "America/Sao_Paulo"
 JANELA_PADRAO = 60
 JANELA_MIN, JANELA_MAX = 50, 1000
 
-ALPHA_PADRAO = 0.38
+ALPHA_PADRAO = 0.37
 ALPHA_MIN,  ALPHA_MAX  = 0.05, 0.95
 
 HISTORY_PATH = "data/history.csv"
@@ -234,7 +234,7 @@ RUIDOS = {2, 1, 14, 19, 20, 10, 7, 15, 21, 9}
 # No pacote de 10 apostas do Mestre, cada ruído pode aparecer no máx. 6 apostas
 RUIDO_CAP_POR_LOTE = 6
 # Alpha alternativo para A/B
-ALPHA_TEST_B = 0.39
+ALPHA_TEST_B = 0.40
 
 # ========================
 # Ciclo C (ancorado no último resultado)
@@ -628,7 +628,7 @@ class LotoFacilBot:
             "Este bot é apenas para fins estatísticos e recreativos. "
             "Não há garantia de ganhos na Lotofácil.\n\n"
             "🎉 <b>Bem-vindo</b>\n"
-            "Use /gerar para receber 5 apostas baseadas em 60 concursos e α=0,38.\n"
+            "Use /gerar para receber 5 apostas baseadas em 60 concursos e α=0,37.\n"
             "Use /meuid para obter seu identificador e solicitar autorização.\n"
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
@@ -638,7 +638,7 @@ class LotoFacilBot:
         """
         Comando /gerar – Gera apostas inteligentes (rápido e estável).
         Uso: /gerar [qtd] [janela] [alpha]
-        Padrão: 5 apostas | janela=60 | α=0,38
+        Padrão: 5 apostas | janela=60 | α=0,37
         """
         import asyncio
 
