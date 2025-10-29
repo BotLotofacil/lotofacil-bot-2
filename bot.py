@@ -2057,16 +2057,38 @@ class LotoFacilBot:
     def _selecionar_matriz19(self, historico) -> list[int]:
         if not historico:
             raise ValueError("Histórico vazio.")
+
         ultimo = self._ultimo_resultado(historico)
         u_set = set(ultimo)
 
+        # ---- bias tolerante + saneamento do estado ----
         st = _bolao_load_state()
-        bias = {int(k): float(v) for k, v in st.get("bias", {}).items()}
+        raw_bias = st.get("bias", {}) if isinstance(st, dict) else {}
+        bias: dict[int, float] = {}
+        dirty = False
+        for k, v in (raw_bias.items() if isinstance(raw_bias, dict) else []):
+            try:
+                ki = int(k)
+                if 1 <= ki <= 25:
+                    bias[ki] = float(v)
+                else:
+                    dirty = True
+            except Exception:
+                dirty = True
+        if dirty:
+            # remove chaves inválidas e persiste o estado limpo
+            st["bias"] = {int(k): float(v) for k, v in bias.items()}
+            try:
+                _bolao_save_state(st)
+            except Exception:
+                logger.warning("Não foi possível salvar saneamento do bias.", exc_info=True)
 
+        # ---- janela e métricas ----
         jan_rf = self._janela_recent_first(historico, BOLAO_JANELA)
         freq_eff = _freq_window(jan_rf, bias=bias)
         atrasos = _atrasos_recent_first(jan_rf)
 
+        # ---- composição da matriz 19 (r10 + ausentes quentes + neutros) ----
         r10 = sorted(ultimo, key=lambda n: (-freq_eff[n], n))[:10]
 
         ausentes = [n for n in range(1, 26) if n not in u_set]
@@ -2076,7 +2098,9 @@ class LotoFacilBot:
 
         usados = set(r10) | set(hot_take)
         faltam = 19 - len(usados)
+
         neutrals_pool = [n for n in ausentes if n not in usados]
+
         def score(n):
             lo, hi = BOLAO_NEUTRA_RANGE
             if lo <= n <= hi:
@@ -2084,12 +2108,13 @@ class LotoFacilBot:
             else:
                 dist = min(abs(n - lo), abs(n - hi))
             return (dist, -freq_eff[n], atrasos[n], n)
-                
+
         neutrals_pool.sort(key=score)
         neutros = neutrals_pool[:max(0, faltam)]
 
         matriz = sorted(set(r10) | set(hot_take) | set(neutros))
 
+        # âncoras
         for anc in BOLAO_ANCHORS:
             if anc not in matriz:
                 candidatos = [n for n in matriz if n not in BOLAO_ANCHORS and n not in u_set]
@@ -2099,6 +2124,7 @@ class LotoFacilBot:
                 if rem is not None and rem != anc:
                     matriz.remove(rem)
                     matriz.append(anc)
+
         matriz = sorted(set(matriz))
         if len(matriz) != 19:
             pool = [n for n in range(1, 26) if n not in matriz]
@@ -2108,6 +2134,7 @@ class LotoFacilBot:
                     break
             matriz = matriz[:19]
             matriz.sort()
+
         return matriz
 
     def _subsets_19_para_15(self, matriz19: list[int], seed: int | None = None) -> list[list[int]]:
