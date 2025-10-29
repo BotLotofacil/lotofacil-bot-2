@@ -3131,6 +3131,154 @@ class LotoFacilBot:
             )
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+    
+    # --- /mestre_bolao: Modo Bolão v5 (19→15) selado e estável, com timeout seguro ---
+    async def mestre_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Gera lote 19→15 a partir de uma matriz-19 estável do histórico,
+        preservando âncoras, com selagem forte:
+          - Paridade 7–8
+          - SeqMax ≤ 3
+          - Dedup + anti-overlap ≤ BOLAO_MAX_OVERLAP
+        Inclui proteção de timeout na geração 19→15 com fallback determinístico.
+        """
+        import asyncio, traceback
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        user_id = update.effective_user.id
+        if not self._usuario_autorizado(user_id):
+            return await update.message.reply_text("⛔ Você não está autorizado.")
+
+        # >>> anti-abuso
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        # <<< anti-abuso
+
+        chat_id = update.message.chat_id if update.message else update.effective_chat.id
+        if self._hit_cooldown(chat_id, "mestre_bolao"):
+            return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /mestre_bolao novamente.")
+
+        try:
+            # --- carregar histórico e último resultado ---
+            historico = carregar_historico(HISTORY_PATH)
+            if not historico:
+                return await update.message.reply_text("Erro: histórico vazio.")
+            ultimo = self._ultimo_resultado(historico)
+
+            # --- matriz-19 estável usando sua rotina oficial ---
+            try:
+                matriz19 = self._selecionar_matriz19(historico)
+            except Exception:
+                # fallback: último + âncoras + completa até 19
+                universo = list(range(1, 26))
+                base = sorted({n for n in (ultimo or []) if 1 <= n <= 25})
+                for a in BOLAO_ANCHORS:
+                    if a not in base:
+                        base.append(a)
+                for n in universo:
+                    if len(base) >= 19: break
+                    if n not in base: base.append(n)
+                matriz19 = sorted(base)[:19]
+
+            # --- seed determinística por snapshot/usuário ---
+            try:
+                snap   = self._latest_snapshot()
+                s_inc  = self._next_draw_seed(snap.snapshot_id)
+            except Exception:
+                snap, s_inc = None, self._next_draw_seed("fallback")
+            user_seed = self._calc_mestre_seed(
+                user_id=user_id,
+                chat_id=chat_id,
+                ultimo_sorted=sorted(ultimo),
+            )
+            seed = (int(s_inc) ^ (int(user_seed) & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+            # --- gerar 19→15 com timeout + fallback seguro ---
+            async def _run_expand():
+                return await asyncio.to_thread(self._subsets_19_para_15, matriz19, seed)
+
+            try:
+                apostas = await asyncio.wait_for(_run_expand(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning("/mestre_bolao: expansão 19→15 >8s; usando fallback determinístico.")
+                # fallback linear a partir da matriz19
+                base = sorted(matriz19)
+                apostas = []
+                for off in range(min(BOLAO_QTD_APOSTAS, 10)):
+                    s = []
+                    idx = off
+                    while len(s) < 15:
+                        s.append(base[idx % len(base)])
+                        idx += 1
+                    apostas.append(sorted(set(s)))
+            except Exception:
+                logger.error("Erro na expansão 19→15:\n" + traceback.format_exc())
+                return await update.message.reply_text("Erro ao expandir 19→15. Tente novamente.")
+
+            # --- selagem por aposta + pós-filtro unificado ---
+            try:
+                anchors = frozenset(BOLAO_ANCHORS)
+            except Exception:
+                anchors = frozenset()
+            apostas = [self._hard_lock_fast(a, ultimo=ultimo, anchors=anchors) for a in apostas]
+            try:
+                apostas = self._pos_filtro_unificado(apostas, ultimo=ultimo)
+            except Exception:
+                logger.warning("Pós-filtro unificado falhou no /mestre_bolao; mantendo selagem rápida.", exc_info=True)
+
+            # --- validação final teimosa ---
+            apostas_ok = []
+            for a in apostas[:BOLAO_QTD_APOSTAS]:
+                a = self._hard_lock_fast(a, ultimo=ultimo, anchors=anchors)
+                apostas_ok.append(a)
+            apostas = apostas_ok
+
+            # --- REGISTRO p/ aprendizado leve ---
+            try:
+                self._registrar_geracao(apostas, base_resultado=ultimo or [])
+            except Exception:
+                logger.warning("Falha ao registrar geração para aprendizado leve (/mestre_bolao).", exc_info=True)
+
+            # --- resposta formatada (telemetria resumida) ---
+            linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5</b> 🎰\n"]
+            ok_count = 0
+            u_set = set(ultimo)
+            for i, a in enumerate(apostas, 1):
+                pares = self._contar_pares(a)
+                seq   = self._max_seq(a)
+                rep   = sum(1 for n in a if n in u_set)
+                ok    = (7 <= pares <= 8) and (seq <= 3)
+                if ok: ok_count += 1
+                linhas.append(
+                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                    f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq} | {rep}R | {'✅ OK' if ok else '🛠️'}\n"
+                )
+
+            linhas.append(f"\n<b>Conformidade</b>: {ok_count}/{len(apostas)} dentro de (paridade 7–8, seq≤3)")
+            linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
+
+            if SHOW_TIMESTAMP:
+                from hashlib import md5
+                try:
+                    hash_ult = md5("".join(f"{n:02d}" for n in sorted(ultimo)).encode()).hexdigest()[:8]
+                except Exception:
+                    hash_ult = "--"
+                snap_id = getattr(snap, "snapshot_id", "n/a")
+                carimbo = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+                linhas.append(f"<i>base=último | hash={hash_ult} | snapshot={snap_id} | {carimbo}</i>")
+
+            return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
+        except Exception as e:
+            logger.error("Erro no /mestre_bolao:\n" + traceback.format_exc())
+            return await update.message.reply_text(f"Erro no /mestre_bolao: {e}")
 
     # --- Diagnóstico ---
     async def ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
