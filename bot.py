@@ -198,6 +198,9 @@ WHITELIST_PATH = "whitelist.txt"
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
 
+# Limite seguro para mensagens no Telegram
+TELEGRAM_SAFE_MAX = 3900  # 4096 é o real; deixamos folga por causa do HTML
+
 # Identificação do build (para /versao)
 BUILD_TAG = getenv("BUILD_TAG", "unknown")
 
@@ -550,8 +553,6 @@ class LotoFacilBot:
         h8 = _hash_dezenas(ultimo)
         snapshot_id = f"{tamanho}|{h8}"
         return _Snapshot(snapshot_id=snapshot_id, tamanho=tamanho, dezenas=ultimo)
-    
-    TELEGRAM_SAFE_MAX = 3900  # margem sob 4096 por causa de tags HTML
 
     async def _send_long(self, update: Update, text: str, parse_mode: str = "HTML"):
         # quebra por "blocos" separados por linhas em branco
