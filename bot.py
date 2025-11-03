@@ -180,7 +180,7 @@ except Exception:
 # Quantidade: permitir até 50 no /gerar
 QTD_BILHETES_PADRAO = 5
 QTD_BILHETES_MIN = 1
-QTD_BILHETES_MAX = 50
+QTD_BILHETES_MAX = 200
 
 SHOW_TIMESTAMP = True
 TIMEZONE = "America/Sao_Paulo"
