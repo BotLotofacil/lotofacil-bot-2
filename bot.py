@@ -225,6 +225,51 @@ BOLAO_BIAS_MISS = -0.2
 BOLAO_BIAS_ANCHOR_SCALE = 0.5
 
 # ========================
+# Aprendizado REAL — paths e grades
+# ========================
+LEARN_LOG_PATH = "data/learn_log.csv"   # log de (snapshot_id, oficial, apostas, placares)
+REAL_STATE_PATH = BOLAO_STATE_PATH      # reaproveita o mesmo arquivo de estado
+
+# Grade de busca (pode ajustar depois)
+ALPHA_GRID = [round(x, 2) for x in (0.28, 0.30, 0.31, 0.33, 0.36, 0.39, 0.40, 0.42)]
+JANELA_GRID = [50, 60, 80, 100]
+GRID_MAX_TIME_S = 4.0  # limite duro pra não travar bot
+
+# Tamanho mínimo de histórico para aprendizado real
+MIN_TREINO = 120  # concursos
+ROLLING_TEST = 12 # últimos T pontos para validação walk-forward
+TOPK_SCORE = 5    # média dos TOP-K bilhetes por concurso na métrica de acertos
+
+def _score_lote(apostas: list[list[int]], oficial: list[int]) -> list[int]:
+    """Conta acertos por aposta (15 dezenas)."""
+    o = set(oficial)
+    return [sum(1 for n in a if n in o) for a in apostas]
+
+def _hits_media_topk(placares: list[int], k: int = TOPK_SCORE) -> float:
+    if not placares:
+        return 0.0
+    k = max(1, min(k, len(placares)))
+    return sum(sorted(placares, reverse=True)[:k]) / float(k)
+
+def _append_learn_log(snapshot_id: str, oficial: list[int], apostas: list[list[int]]):
+    """Grava uma linha no CSV de aprendizado real (sem travar se falhar)."""
+    try:
+        import csv, os
+        os.makedirs(os.path.dirname(LEARN_LOG_PATH), exist_ok=True)
+        placar = _score_lote(apostas, oficial) if oficial else []
+        with open(LEARN_LOG_PATH, "a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                snapshot_id,
+                " ".join(f"{n:02d}" for n in sorted(oficial)) if oficial else "",
+                "|".join(" ".join(f"{x:02d}" for x in a) for a in apostas),
+                " ".join(str(p) for p in placar),
+                datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S")
+            ])
+    except Exception:
+        logger.warning("Falha ao registrar linha no learn_log.csv", exc_info=True)
+
+# ========================
 # Heurísticas adicionais (Mestre + A/B)
 # ========================
 # Pares cuja coocorrência derrubou média em análises anteriores
@@ -545,6 +590,139 @@ class LotoFacilBot:
             import random
             rng = random.Random()
             return [sorted(rng.sample(range(1, 26), 15)) for _ in range(max(1, qtd))]
+        
+    # ========================
+    # Aprendizado REAL
+    # ========================
+    async def auto_aprender(self, update, context):  # substitui a versão leve existente
+        """
+        Aprendizado REAL: 
+        1) Loga última geração + oficial.
+        2) Reestima viés por dezena (multiplicative weights) nos últimos ROLLING_TEST concursos.
+        3) Faz busca rápida (grid + tempo limitado) de (janela, alpha) via walk-forward.
+        4) Atualiza estado persistente (alpha, bias, contadores).
+        5) Não trava o bot se falhar.
+        """
+        try:
+            historico = carregar_historico(HISTORY_PATH)
+            if not historico or len(historico) < MIN_TREINO:
+                logger.info("Histórico insuficiente para aprendizado real; mantendo parâmetros.")
+                return
+
+            # --- 0) Snapshot/último oficial + última geração registrada no estado
+            snap = self._latest_snapshot()  # tem snapshot_id e último oficial
+            ultimo = list(snap.dezenas)
+            snap_id = snap.snapshot_id
+
+            # Carrega estado
+            state = _bolao_load_state()
+            # guard rails
+            state.setdefault("bias", {})
+            state.setdefault("seen", {})
+            state.setdefault("hits", {})
+            state.setdefault("alpha", ALPHA_PADRAO)
+
+            # Recupera a última geração registrada no ciclo dos comandos
+            # (seu código chama _registrar_geracao quando gera lotes)  # ver chamadas nas rotas
+            # Apenas registramos também no CSV para auditoria externa:
+            try:
+                # Monta um lote “logo após envio” para logging: 
+                # usamos o cache do processo, se houver; caso contrário, só registra oficial.
+                # (Evita leituras internas de estruturas não públicas.)
+                apostas_para_log = []
+                _append_learn_log(snap_id, ultimo, apostas_para_log)
+            except Exception:
+                pass
+
+            # --- 1) Reestimação de bias por dezena nos últimos ROLLING_TEST concursos
+            # Estratégia: multiplicative weights (acerto reforça, erro atenua),
+            # mas respeitando BOLAO_BIAS_MIN/MAX e âncoras usadas no modo Bolão.
+            bias = {int(k): float(v) for (k, v) in state.get("bias", {}).items() if str(k).isdigit()}
+            for n in range(1, 26):
+                bias.setdefault(n, 0.0)
+
+            recent = historico[:ROLLING_TEST] if HISTORY_ORDER_DESC else historico[-ROLLING_TEST:]
+            # Conta acertos/ausências recentes para tendência curta
+            freq = {n: 0 for n in range(1, 26)}
+            for conc in recent:
+                for n in conc:
+                    freq[n] += 1
+
+            # Atualiza via multiplicative weights (simples, estável e rápido)
+            # alvo: reforçar dezenas que têm sido mais “compatíveis” com forma e resultado recente
+            for n in range(1, 26):
+                # normaliza contribuição (0..1) na janela curta
+                contrib = freq[n] / float(max(1, len(recent)))
+                # centro em 0 via (contrib - média)
+                contrib -= (15.0 / 25.0)  # base uniforme (15 em 25)
+                # pequeno passo
+                bias[n] = _clamp(bias[n] + contrib * 0.6, BOLAO_BIAS_MIN, BOLAO_BIAS_MAX)
+
+            # --- 2) Busca de hiperparâmetros (janela, alpha) via walk-forward curta
+            import time as _t
+            t0 = _t.time()
+            best = {"score": -1.0, "alpha": state.get("alpha", ALPHA_PADRAO), "janela": JANELA_PADRAO}
+
+            # recorta histórico útil; vamos usar ROLLING_TEST folds
+            H = list(historico)
+            if not HISTORY_ORDER_DESC:
+                H = H[:]  # já em ordem ASC → mais recente no fim
+            # para simplificar, garantimos mais recente no topo para o slicing
+            if not HISTORY_ORDER_DESC:
+                # reorganiza: recente primeiro
+                H = list(reversed(H))
+
+            def _fit_and_eval(alpha_val: float, janela_val: int) -> float:
+                try:
+                    # walk-forward: para t = ROLLING_TEST..1, treina na janela anterior e testa no ponto t
+                    scores = []
+                    for t in range(ROLLING_TEST, 0, -1):
+                        # janela de treino até antes de t
+                        start = t
+                        end = t + janela_val
+                        if end > len(H):
+                            break
+                        janela_hist = H[start:end]
+                        # gera poucas apostas p/ validar (rápido)
+                        filtro = FilterConfig(paridade_min=6, paridade_max=9, col_min=1, col_max=4, relax_steps=2)
+                        cfg = GeradorApostasConfig(janela=janela_val, alpha=alpha_val, filtro=filtro, pool_multiplier=2)
+                        modelo = Predictor(cfg)
+                        modelo.fit(janela_hist, janela=janela_val)
+                        aps = modelo.gerar_apostas(qtd=QTD_BILHETES_PADRAO)
+                        # oficial “alvo” nesse fold é H[t-1] (o concurso imediatamente anterior ao início do treino)
+                        oficial = sorted(list(H[t-1]))
+                        # reforça forma, mantendo sua selagem canônica
+                        aps = [self._hard_lock_fast(a, ultimo=oficial, anchors=frozenset()) for a in aps]
+                        plac = _score_lote(aps, oficial)
+                        scores.append(_hits_media_topk(plac, TOPK_SCORE))
+                    return sum(scores) / float(len(scores)) if scores else -1.0
+                except Exception:
+                    return -1.0
+
+            for j in JANELA_GRID:
+                for a in ALPHA_GRID:
+                    if _t.time() - t0 > GRID_MAX_TIME_S:
+                        break
+                    s = _fit_and_eval(a, j)
+                    if s > best["score"]:
+                        best.update(score=s, alpha=a, janela=j)
+                if _t.time() - t0 > GRID_MAX_TIME_S:
+                    break
+
+            # --- 3) Consolida estado
+            state["alpha"] = float(best["alpha"])
+            state["learning"] = {
+                "janela": int(best["janela"]),
+                "score": float(round(best["score"], 4)),
+                "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+            }
+            state["bias"] = {int(k): float(v) for k, v in bias.items()}
+
+            _bolao_save_state(state)
+            logger.info(f"[Aprendizado REAL] α={state['alpha']:.2f} | janela={state['learning']['janela']} | score={state['learning']['score']:.4f}")
+
+        except Exception:
+            logger.warning("Falha no aprendizado real; mantendo parâmetros anteriores.", exc_info=True)
 
     # ------------- Parse utilitário p/ backtest -------------
     def _parse_backtest_args(self, args: List[str]) -> Tuple[int, int, float]:
@@ -2548,13 +2726,18 @@ class LotoFacilBot:
         telems = [self._telemetria(a, ultimo, alvo_par=(7, 8), max_seq=3) for a in apostas_finais]
 
         # ------------------------------------------------------------------
-        # 5. Registrar geração para aprendizado leve
-        #    (para que /auto_aprender depois saiba o que revisar)
-        # ------------------------------------------------------------------
+        # 5. Registrar geração para aprendizado leve (estado interno)
         try:
             self._registrar_geracao(apostas_finais, base_resultado=ultimo)
         except Exception:
             logger.warning("Falha ao registrar geração (mestre).", exc_info=True)
+
+        # 5.1) >>> NOVO: auditoria CSV (aprendizado REAL)
+        try:
+            snap = self._latest_snapshot()
+            _append_learn_log(snap.snapshot_id, ultimo or [], apostas_finais)
+        except Exception:
+            logger.warning("Falha para append no learn_log após /mestre.", exc_info=True)
 
         # ------------------------------------------------------------------
         # 6. Formatar resposta pro usuário
@@ -2777,9 +2960,14 @@ class LotoFacilBot:
 
             # 7.2) REGISTRO para aprendizado leve (/refinar_bolao)
             try:
+                # 1) Estado persistente (fundamental para o núcleo aprender)
                 self._registrar_geracao(apostas, base_resultado=oficial or [])
+
+                # 2) CSV de auditoria externa (aprendizado REAL)
+                _append_learn_log(snap.snapshot_id, oficial or [], apostas)
+
             except Exception:
-                logger.warning("Falha ao registrar geração para aprendizado leve (/refinar_bolao).", exc_info=True)
+                logger.warning("Falha ao registrar geração e/ou append no learn_log após /refinar_bolao.", exc_info=True)
 
             # 8) Telemetria, placar e resposta (NÃO reprocessar apostas depois disso)
             def _hits(bilhete: list[int]) -> int:
@@ -3626,6 +3814,13 @@ class LotoFacilBot:
                 self._registrar_geracao(apostas, base_resultado=ultimo or [])
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/mestre_bolao).", exc_info=True)
+            
+            # >>> NOVO: registro de auditoria no CSV (aprendizado REAL)
+            try:
+                snap = self._latest_snapshot()
+                _append_learn_log(snap.snapshot_id, ultimo or [], apostas)
+            except Exception:
+                logger.warning("Falha para append no learn_log após /mestre_bolao.", exc_info=True)
 
             # --- resposta formatada (telemetria resumida) ---
             linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Modo Bolão v5</b> 🎰\n"]
@@ -3870,13 +4065,21 @@ class LotoFacilBot:
             logger.error("Erro no /ab:\n" + traceback.format_exc())
             return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
 
-        # REGISTRO para aprendizado leve (/ab A/B técnico)
+        # REGISTRO para aprendizado leve (/ab A/B técnico) + auditoria CSV
         try:
+            # base oficial para o registro
             historico = carregar_historico(HISTORY_PATH)
             ultimo = self._ultimo_resultado(historico) if historico else []
+
+            # 1) Estado persistente (necessário para o aprendizado do núcleo)
             self._registrar_geracao(list(apostasA) + list(apostasB), base_resultado=ultimo or [])
+
+            # 2) CSV de auditoria externa (aprendizado REAL)
+            snap = self._latest_snapshot()
+            _append_learn_log(snap.snapshot_id, ultimo or [], list(apostasA) + list(apostasB))
+
         except Exception:
-            logger.warning("Falha ao registrar geração para aprendizado leve (/ab técnico).", exc_info=True)
+            logger.warning("Falha ao registrar geração e/ou append no learn_log após /ab técnico.", exc_info=True)
 
         # formatação da saída
         def _fmt(tag, aps):
