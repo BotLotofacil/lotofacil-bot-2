@@ -550,6 +550,30 @@ class LotoFacilBot:
         h8 = _hash_dezenas(ultimo)
         snapshot_id = f"{tamanho}|{h8}"
         return _Snapshot(snapshot_id=snapshot_id, tamanho=tamanho, dezenas=ultimo)
+    
+    TELEGRAM_SAFE_MAX = 3900  # margem sob 4096 por causa de tags HTML
+
+    async def _send_long(self, update: Update, text: str, parse_mode: str = "HTML"):
+        # quebra por "blocos" separados por linhas em branco
+        blocks = text.split("\n\n")
+        parts = []
+        cur = ""
+        for b in blocks:
+            if not cur:
+                cur = b
+            elif len(cur) + 2 + len(b) <= TELEGRAM_SAFE_MAX:
+                cur += "\n\n" + b
+            else:
+                parts.append(cur)
+                cur = b
+        if cur:
+            parts.append(cur)
+
+        # envia cada parte com rodapé (Parte X/Y)
+        total = len(parts)
+        for i, p in enumerate(parts, 1):
+            suffix = f"\n\n<i>Parte {i}/{total}</i>" if total > 1 else ""
+            await update.message.reply_text(p + suffix, parse_mode=parse_mode)
 
     # ------------- Gerador preditivo -------------
     def _gerar_apostas_inteligentes(
@@ -1019,7 +1043,7 @@ class LotoFacilBot:
                 resposta = "\n".join(linhas)
 
             # 5) Saída
-            await update.message.reply_text(resposta, parse_mode="HTML")
+            await self._send_long(update, resposta, parse_mode="HTML")
 
             # (opcional) Chamar auto_aprender aqui NÃO é necessário para aprender (o ideal é após novo resultado),
             # mas manter não quebra nada; deixei como está:
