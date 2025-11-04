@@ -233,6 +233,11 @@ BOLAO_BIAS_ANCHOR_SCALE = 0.5
 LEARN_LOG_PATH = "data/learn_log.csv"   # log de (snapshot_id, oficial, apostas, placares)
 REAL_STATE_PATH = BOLAO_STATE_PATH      # reaproveita o mesmo arquivo de estado
 
+# Política de aprendizado (gating por oficial)
+LEARN_POLICY = "official_gate"   # ["official_gate", "free_run"]
+IMPROVE_EPS  = 0.15              # melhoria mínima de score TOP-K para aceitar novo α/janela
+BIAS_LR      = 0.10              # passo do ajuste suave de bias quando aplicar
+
 # Grade de busca (pode ajustar depois)
 ALPHA_GRID = [round(x, 2) for x in (0.28, 0.30, 0.31, 0.33, 0.36, 0.39, 0.40, 0.42)]
 JANELA_GRID = [50, 60, 80, 100]
@@ -408,6 +413,23 @@ def _bolao_save_state(state: dict, path: str = BOLAO_STATE_PATH):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+def _normalize_state_defaults(state: dict) -> dict:
+    state = dict(state or {})
+    # política de aprendizado: “gated” por oficial, a menos que você troque por “free_run”
+    state.setdefault("learn_policy", LEARN_POLICY)
+    # fila de lotes pendentes de avaliação (cada /gerar, /mestre, /ab, etc, empilha aqui — sem aprender ainda)
+    state.setdefault("pending_batches", [])
+    # baseline (score/α/janela) usado para decidir se um novo parâmetro realmente melhorou
+    state.setdefault(
+        "last_baseline",
+        {
+            "score": 0.0,
+            "alpha": state.get("alpha", ALPHA_PADRAO),
+            "janela": state.get("learning", {}).get("janela", JANELA_PADRAO),
+        },
+    )
+    return state
 
 # ========================
 # Bot Principal
@@ -621,105 +643,101 @@ class LotoFacilBot:
     # ========================
     async def auto_aprender(self, update, context):  # substitui a versão leve existente
         """
-        Aprendizado REAL: 
-        1) Loga última geração + oficial.
-        2) Reestima viés por dezena (multiplicative weights) nos últimos ROLLING_TEST concursos.
-        3) Faz busca rápida (grid + tempo limitado) de (janela, alpha) via walk-forward.
+        Aprendizado REAL (com gating por oficial):
+        0) Se LEARN_POLICY == "official_gate", ignora sem novo oficial.
+        1) Loga última geração + oficial (CSV).
+        2) Reestima viés por dezena (janela curta ROLLING_TEST).
+        3) Busca rápida (grade + tempo limitado) de (janela, alpha) via walk-forward.
         4) Atualiza estado persistente (alpha, bias, contadores).
         5) Não trava o bot se falhar.
         """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import time as _t
+
         try:
+            # --- [GATING] Não mexe em nada sem "evento de verdade" (oficial) ---
+            state = _normalize_state_defaults(_bolao_load_state() or {})
+            if state.get("learn_policy", LEARN_POLICY) == "official_gate":
+                logger.info("[GATED] auto_aprender ignorado (sem novo oficial).")
+                return
+
+            # --- histórico mínimo para aprendizado real ---
             historico = carregar_historico(HISTORY_PATH)
             if not historico or len(historico) < MIN_TREINO:
                 logger.info("Histórico insuficiente para aprendizado real; mantendo parâmetros.")
                 return
 
-            # --- 0) Snapshot/último oficial + última geração registrada no estado
+            # --- 0) Snapshot/último oficial + auditoria CSV mínima ---
             snap = self._latest_snapshot()  # tem snapshot_id e último oficial
-            ultimo = list(snap.dezenas)
-            snap_id = snap.snapshot_id
+            ultimo = list(snap.dezenas) if getattr(snap, "dezenas", None) else []
+            snap_id = getattr(snap, "snapshot_id", "--")
 
-            # Carrega estado
-            state = _bolao_load_state()
-            # guard rails
-            state.setdefault("bias", {})
-            state.setdefault("seen", {})
-            state.setdefault("hits", {})
-            state.setdefault("alpha", ALPHA_PADRAO)
-
-            # Recupera a última geração registrada no ciclo dos comandos
-            # (seu código chama _registrar_geracao quando gera lotes)  # ver chamadas nas rotas
-            # Apenas registramos também no CSV para auditoria externa:
+            # Apenas garante uma linha de auditoria (sem travar se falhar)
             try:
-                # Monta um lote “logo após envio” para logging: 
-                # usamos o cache do processo, se houver; caso contrário, só registra oficial.
-                # (Evita leituras internas de estruturas não públicas.)
-                apostas_para_log = []
-                _append_learn_log(snap_id, ultimo, apostas_para_log)
+                _append_learn_log(snap_id, ultimo, [])  # sem apostas aqui (somente carimbo)
             except Exception:
-                pass
+                logger.warning("Falha ao registrar auditoria mínima no learn_log.csv", exc_info=True)
 
-            # --- 1) Reestimação de bias por dezena nos últimos ROLLING_TEST concursos
-            # Estratégia: multiplicative weights (acerto reforça, erro atenua),
-            # mas respeitando BOLAO_BIAS_MIN/MAX e âncoras usadas no modo Bolão.
-            bias = {int(k): float(v) for (k, v) in state.get("bias", {}).items() if str(k).isdigit()}
+            # --- estado já normalizado: bias/hits/seen/alpha/janela/baseline existem por default ---
+            bias = {int(k): float(v) for (k, v) in (state.get("bias") or {}).items() if str(k).isdigit()}
             for n in range(1, 26):
                 bias.setdefault(n, 0.0)
 
+            # --- 1) Reestimação de bias (tendência curta nos últimos ROLLING_TEST concursos) ---
             recent = historico[:ROLLING_TEST] if HISTORY_ORDER_DESC else historico[-ROLLING_TEST:]
-            # Conta acertos/ausências recentes para tendência curta
             freq = {n: 0 for n in range(1, 26)}
             for conc in recent:
                 for n in conc:
-                    freq[n] += 1
+                    if 1 <= n <= 25:
+                        freq[n] += 1
 
-            # Atualiza via multiplicative weights (simples, estável e rápido)
-            # alvo: reforçar dezenas que têm sido mais “compatíveis” com forma e resultado recente
+            # multiplicative-weights (versão aditiva com clamp, passo moderado)
             for n in range(1, 26):
-                # normaliza contribuição (0..1) na janela curta
-                contrib = freq[n] / float(max(1, len(recent)))
-                # centro em 0 via (contrib - média)
-                contrib -= (15.0 / 25.0)  # base uniforme (15 em 25)
-                # pequeno passo
+                contrib = freq[n] / float(max(1, len(recent)))  # 0..1
+                contrib -= (15.0 / 25.0)                        # centro em 0 (esperança ~15/25)
                 bias[n] = _clamp(bias[n] + contrib * 0.6, BOLAO_BIAS_MIN, BOLAO_BIAS_MAX)
 
-            # --- 2) Busca de hiperparâmetros (janela, alpha) via walk-forward curta
-            import time as _t
+            # --- 2) Busca walk-forward curta de (alpha, janela) com limite de tempo ---
             t0 = _t.time()
-            best = {"score": -1.0, "alpha": state.get("alpha", ALPHA_PADRAO), "janela": JANELA_PADRAO}
+            best = {
+                "score": -1.0,
+                "alpha": float(state.get("alpha", ALPHA_PADRAO)),
+                "janela": int(state.get("learning", {}).get("janela", JANELA_PADRAO)),
+            }
 
-            # recorta histórico útil; vamos usar ROLLING_TEST folds
+            # organizar histórico para slicing (mais recente no topo)
             H = list(historico)
             if not HISTORY_ORDER_DESC:
-                H = H[:]  # já em ordem ASC → mais recente no fim
-            # para simplificar, garantimos mais recente no topo para o slicing
-            if not HISTORY_ORDER_DESC:
-                # reorganiza: recente primeiro
-                H = list(reversed(H))
+                H = list(reversed(H))  # agora H[0] é o mais recente
 
             def _fit_and_eval(alpha_val: float, janela_val: int) -> float:
                 try:
-                    # walk-forward: para t = ROLLING_TEST..1, treina na janela anterior e testa no ponto t
                     scores = []
+                    # walk-forward: t = ROLLING_TEST..1
                     for t in range(ROLLING_TEST, 0, -1):
-                        # janela de treino até antes de t
                         start = t
                         end = t + janela_val
                         if end > len(H):
                             break
                         janela_hist = H[start:end]
-                        # gera poucas apostas p/ validar (rápido)
+
+                        # modelo leve/rápido para validação
                         filtro = FilterConfig(paridade_min=6, paridade_max=9, col_min=1, col_max=4, relax_steps=2)
                         cfg = GeradorApostasConfig(janela=janela_val, alpha=alpha_val, filtro=filtro, pool_multiplier=2)
                         modelo = Predictor(cfg)
                         modelo.fit(janela_hist, janela=janela_val)
+
                         aps = modelo.gerar_apostas(qtd=QTD_BILHETES_PADRAO)
-                        # oficial “alvo” nesse fold é H[t-1] (o concurso imediatamente anterior ao início do treino)
-                        oficial = sorted(list(H[t-1]))
-                        # reforça forma, mantendo sua selagem canônica
+
+                        # oficial alvo do fold = H[t-1]
+                        oficial = sorted(list(H[t - 1]))
+                        # reforça forma canônica
                         aps = [self._hard_lock_fast(a, ultimo=oficial, anchors=frozenset()) for a in aps]
+
                         plac = _score_lote(aps, oficial)
                         scores.append(_hits_media_topk(plac, TOPK_SCORE))
+
                     return sum(scores) / float(len(scores)) if scores else -1.0
                 except Exception:
                     return -1.0
@@ -734,7 +752,7 @@ class LotoFacilBot:
                 if _t.time() - t0 > GRID_MAX_TIME_S:
                     break
 
-            # --- 3) Consolida estado
+            # --- 3) Consolida estado persistente (alpha/janela/score/bias) ---
             state["alpha"] = float(best["alpha"])
             state["learning"] = {
                 "janela": int(best["janela"]),
@@ -849,7 +867,9 @@ class LotoFacilBot:
         Uso: /gerar [qtd] [janela] [alpha]
         Padrão: 5 apostas | janela=60 | α=0,37
         """
-        import asyncio
+        import asyncio, traceback
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
 
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
@@ -1018,9 +1038,33 @@ class LotoFacilBot:
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/gerar).", exc_info=True)
 
+            # >>> NOVO: registrar o lote no estado (pending_batches)
+            try:
+                st = _normalize_state_defaults(_bolao_load_state() or {})
+                batches = st.get("pending_batches", [])
+
+                batches.append({
+                    "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                    "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                    "alpha": float(st.get("alpha", ALPHA_PADRAO)),
+                    "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                    "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
+                    "qtd": len(apostas_ok),
+                    # opcional: salvar as apostas (atenção ao tamanho do estado)
+                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_ok],
+                })
+
+                # mantém histórico curto de lotes pendentes
+                st["pending_batches"] = batches[-100:]
+                _bolao_save_state(st)
+
+            except Exception:
+                logger.warning("Falha ao registrar pending_batch.", exc_info=True)
+            # <<< FIM NOVO
+
             # 4) Formatação + envio (usa α persistido no estado, se existir)
             try:
-                st = _bolao_load_state()
+                st = _normalize_state_defaults(_bolao_load_state() or {})
             except Exception:
                 st = None
             alpha_eff = float(st.get("alpha", alpha)) if isinstance(st, dict) else alpha
@@ -1046,8 +1090,7 @@ class LotoFacilBot:
             # 5) Saída
             await self._send_long(update, resposta, parse_mode="HTML")
 
-            # (opcional) Chamar auto_aprender aqui NÃO é necessário para aprender (o ideal é após novo resultado),
-            # mas manter não quebra nada; deixei como está:
+            # Opcional: auto_aprender (com gating ativo ele retorna sem mexer)
             try:
                 await self.auto_aprender(update, context)
             except Exception:
@@ -1257,7 +1300,7 @@ class LotoFacilBot:
         A contagem é persistida em data/bolao_state.json -> draw_counter[snapshot_id].
         Trocar de snapshot (histórico novo) gera um novo contador automaticamente.
         """
-        st = _bolao_load_state()
+        st = _normalize_state_defaults(_bolao_load_state() or {})
         cnt = st.get("draw_counter", {})
         n = int(cnt.get(snapshot_id, 0)) + 1
         cnt[snapshot_id] = n
@@ -1302,7 +1345,7 @@ class LotoFacilBot:
           - realiza até 2 trocas por aposta
           - SEM quebrar paridade 7–8 e Seq≤3
         """
-        st = _bolao_load_state()
+        st = _normalize_state_defaults(_bolao_load_state() or {})
         bias: dict[str, float] = st.get("bias", {})
         if not bias:
             return apostas
@@ -2278,7 +2321,7 @@ class LotoFacilBot:
         u_set = set(ultimo)
 
         # --- SANITIZA bias: aceita só dezenas 1..25 como chave ---
-        st = _bolao_load_state()
+        st = _normalize_state_defaults(_bolao_load_state() or {})
         bias_raw = st.get("bias", {})
         bias: dict[int, float] = {}
         if isinstance(bias_raw, dict):
@@ -2811,13 +2854,6 @@ class LotoFacilBot:
 
         Aceita 15 dezenas no comando:
             /refinar_bolao 01 02 ... 25
-
-        Fluxo:
-          1. Atualiza bias diretamente usando o resultado oficial informado (ou último oficial do histórico).
-          2. Regera as apostas seladas já no padrão do bolão.
-          3. Registra essa geração para o auto_aprender.
-          4. Mostra auditoria de desempenho (placar de acertos etc.).
-          5. Chama auto_aprender para consolidar α, paridade, seq, etc.
         """
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -2866,7 +2902,7 @@ class LotoFacilBot:
             matriz19_antes = self._selecionar_matriz19(historico)
 
             # 3) Carrega estado de bias e aplica atualização com base no 'oficial'
-            st = _bolao_load_state()
+            st = _normalize_state_defaults(_bolao_load_state() or {})
             st = dict(st) if isinstance(st, dict) else {}
             raw_bias = st.get("bias", {}) or {}
 
@@ -2958,7 +2994,6 @@ class LotoFacilBot:
                 a = sorted(set(a))
                 if len(a) < 15:
                     comp = [n for n in range(1, 26) if n not in a]
-                    # tenta evitar criar sequências longas
                     for n in comp:
                         if (n - 1 not in a) and (n + 1 not in a):
                             a.append(n)
@@ -2966,7 +3001,7 @@ class LotoFacilBot:
                                 break
                     if len(a) < 15:
                         for n in comp:
-                            if n not in a:
+                           if n not in a:
                                 a.append(n)
                                 if len(a) == 15:
                                     break
@@ -2978,23 +3013,43 @@ class LotoFacilBot:
             apostas_ok = []
             for a in apostas_filtradas[:5]:
                 a = _canon_local(a)
-                # reforça forma FINAL preservando âncoras
                 a = self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
                 apostas_ok.append(a)
             apostas = apostas_ok
 
-            # 7.2) REGISTRO para aprendizado leve (/refinar_bolao)
+            # 7.2) REGISTRO (núcleo + CSV) + NOVO: pending_batches
             try:
-                # 1) Estado persistente (fundamental para o núcleo aprender)
+                # 1) Estado persistente – núcleo
                 self._registrar_geracao(apostas, base_resultado=oficial or [])
-
-                # 2) CSV de auditoria externa (aprendizado REAL)
-                _append_learn_log(snap.snapshot_id, oficial or [], apostas)
-
             except Exception:
-                logger.warning("Falha ao registrar geração e/ou append no learn_log após /refinar_bolao.", exc_info=True)
+                logger.warning("Falha ao registrar geração para aprendizado leve (/refinar_bolao).", exc_info=True)
 
-            # 8) Telemetria, placar e resposta (NÃO reprocessar apostas depois disso)
+            # 2) CSV de auditoria externa (aprendizado REAL)
+            try:
+                _append_learn_log(snap.snapshot_id, oficial or [], apostas)
+            except Exception:
+                logger.warning("Falha para append no learn_log após /refinar_bolao.", exc_info=True)
+
+            # >>> NOVO: registrar o lote no estado (pending_batches)
+            try:
+                st2 = _normalize_state_defaults(_bolao_load_state() or {})
+                batches = st2.get("pending_batches", [])
+                batches.append({
+                    "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                    "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                    "alpha": float(st2.get("alpha", ALPHA_PADRAO)),
+                    "janela": int((st2.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                    "oficial_base": " ".join(f"{n:02d}" for n in (oficial or [])),
+                    "qtd": len(apostas),
+                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
+                })
+                st2["pending_batches"] = batches[-100:]  # mantém histórico curto
+                _bolao_save_state(st2)
+            except Exception:
+                logger.warning("Falha ao registrar pending_batch no /refinar_bolao.", exc_info=True)
+            # <<< NOVO
+
+            # 8) Telemetria, placar e resposta
             def _hits(bilhete: list[int]) -> int:
                 return len(of_set & set(bilhete))
 
@@ -3010,7 +3065,6 @@ class LotoFacilBot:
                 if getattr(t, "ok_total", False):
                     ok_count += 1
 
-            # dup-check informativo
             uniq = {tuple(a) for a in apostas}
             dup_count = len(apostas) - len(uniq)
 
@@ -3082,7 +3136,7 @@ class LotoFacilBot:
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        st = _bolao_load_state()
+        st = _normalize_state_defaults(_bolao_load_state() or {})
         st = dict(st) if isinstance(st, dict) else {}
         st.setdefault("learning", {})
 
@@ -3129,7 +3183,7 @@ class LotoFacilBot:
         try:
             # tenta carregar o estado persistido do bolão
             try:
-                st = _bolao_load_state() or {}
+                st = _normalize_state_defaults(_bolao_load_state() or {}) 
             except Exception:
                 st = {}
 
@@ -3295,7 +3349,7 @@ class LotoFacilBot:
         from statistics import mean
         try:
             # ===== 0) Carregar estado atual e histórico =====
-            st = _bolao_load_state()
+            st = _normalize_state_defaults(_bolao_load_state() or {})
             st = dict(st) if isinstance(st, dict) else {}
             st.setdefault("bias", {})
             st.setdefault("learning", {})
@@ -3607,7 +3661,11 @@ class LotoFacilBot:
         return sum(1 for n in aposta if n in u)
 
     # --- Novo comando: /mestre ---
-    async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def mestre(self, update: Update, context: ContextTypes.Default_Type):
+        import asyncio, traceback
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
         user_id = update.effective_user.id
         if not self._usuario_autorizado(user_id):
             await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
@@ -3683,10 +3741,31 @@ class LotoFacilBot:
         except Exception:
             logger.warning("Falha ao registrar geração para aprendizado leve (/mestre).", exc_info=True)
 
-        # --- Telemetria e formatação da resposta ---
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
+        # >>> NOVO: registrar o lote no estado (pending_batches)
+        try:
+            st = _normalize_state_defaults(_bolao_load_state() or {})
+            batches = st.get("pending_batches", [])
 
+            batches.append({
+                "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                "alpha": float(st.get("alpha", ALPHA_PADRAO)),
+                "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
+                "qtd": len(apostas),
+                # opcional: salvar as apostas (atenção ao tamanho do estado)
+                "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
+            })
+
+            # mantém histórico curto de lotes pendentes
+            st["pending_batches"] = batches[-100:]
+            _bolao_save_state(st)
+
+        except Exception:
+            logger.warning("Falha ao registrar pending_batch (/mestre).", exc_info=True)
+        # <<< FIM NOVO
+
+        # --- Telemetria e formatação da resposta ---
         snap_id = snap.snapshot_id if snap else "n/a"
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Preset Mestre</b> 🎰\n"]
 
@@ -3718,7 +3797,7 @@ class LotoFacilBot:
         # envia pro usuário
         await update.message.reply_text(linhas_str, parse_mode="HTML")
 
-        # --- Aprendizado automático pós-envio (não trava o bot se falhar) ---
+        # --- Aprendizado automático pós-envio (com gating ativo ele retorna sem mexer) ---
         try:
             await self.auto_aprender(update, context)
         except Exception:
@@ -3839,8 +3918,28 @@ class LotoFacilBot:
                 self._registrar_geracao(apostas, base_resultado=ultimo or [])
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/mestre_bolao).", exc_info=True)
-            
-            # >>> NOVO: registro de auditoria no CSV (aprendizado REAL)
+
+            # >>> NOVO: registrar o lote no estado (pending_batches)
+            try:
+                st = _normalize_state_defaults(_bolao_load_state() or {})
+                batches = st.get("pending_batches", [])
+                batches.append({
+                    "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                    "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                    "alpha": float(st.get("alpha", ALPHA_PADRAO)),
+                    "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                    "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
+                    "qtd": len(apostas),
+                    # opcional: salvar as apostas (cuidado com o tamanho do estado)
+                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
+                })
+                st["pending_batches"] = batches[-100:]
+                _bolao_save_state(st)
+            except Exception:
+                logger.warning("Falha ao registrar pending_batch no /mestre_bolao.", exc_info=True)
+            # <<< FIM NOVO
+
+            # >>> CSV de auditoria (aprendizado REAL já existente aqui)
             try:
                 snap = self._latest_snapshot()
                 _append_learn_log(snap.snapshot_id, ultimo or [], apostas)
@@ -3977,7 +4076,7 @@ class LotoFacilBot:
         mode_ciclo = (len(context.args) >= 1 and str(context.args[0]).lower() in {"ciclo", "c"})
         if mode_ciclo:
             try:
-                import hashlib
+                import hashlib, traceback
                 from datetime import datetime
                 from zoneinfo import ZoneInfo
 
@@ -4020,7 +4119,32 @@ class LotoFacilBot:
                 except Exception:
                     logger.warning("Falha ao registrar geração para aprendizado leve (/ab ciclo C).", exc_info=True)
 
-                # 3) Formatação da resposta (NÃO reprocessa as apostas!)
+                # --- NOVO: registrar o lote no estado (pending_batches) ---
+                try:
+                    st = _normalize_state_defaults(_bolao_load_state() or {})
+                    batches = st.get("pending_batches", [])
+                    batches.append({
+                        "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                        "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                        "alpha": float(st.get("alpha", ALPHA_PADRAO)),
+                        "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                        "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
+                        "qtd": len(apostas),
+                        "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
+                    })
+                    st["pending_batches"] = batches[-100:]  # mantém histórico curto
+                    _bolao_save_state(st)
+                except Exception:
+                    logger.warning("Falha ao registrar pending_batch no /ab ciclo C.", exc_info=True)
+                # --- FIM NOVO ---
+
+                # 3) CSV de auditoria externa (aprendizado REAL)
+                try:
+                    _append_learn_log(snap.snapshot_id, ultimo or [], apostas)
+                except Exception:
+                    logger.warning("Falha para append no learn_log após /ab ciclo C.", exc_info=True)
+
+                # 4) Formatação da resposta (NÃO reprocessa as apostas!)
                 linhas = []
                 linhas.append("🎯 Ciclo C — baseado no último resultado")
                 if len(anchors) >= 2:
@@ -4048,7 +4172,7 @@ class LotoFacilBot:
                     snap_id = getattr(snap, "snapshot_id", "--")
                 except Exception:
                     snap_id = "--"
-                carimbo = datetime.now(tz=ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d %H:%M:%S %z")
+                carimbo = datetime.now(tz=ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %z")
 
                 linhas_str = "\n".join(linhas)
 
@@ -4090,18 +4214,39 @@ class LotoFacilBot:
             logger.error("Erro no /ab:\n" + traceback.format_exc())
             return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
 
-        # REGISTRO para aprendizado leve (/ab A/B técnico) + auditoria CSV
+        # REGISTRO para aprendizado leve (/ab A/B técnico) + auditoria CSV + pending_batches
         try:
             # base oficial para o registro
             historico = carregar_historico(HISTORY_PATH)
             ultimo = self._ultimo_resultado(historico) if historico else []
 
-            # 1) Estado persistente (necessário para o aprendizado do núcleo)
-            self._registrar_geracao(list(apostasA) + list(apostasB), base_resultado=ultimo or [])
+            apostas_all = list(apostasA) + list(apostasB)
+
+            # 1) Estado persistente (núcleo)
+            self._registrar_geracao(apostas_all, base_resultado=ultimo or [])
+
+            # --- NOVO: registrar o lote no estado (pending_batches) ---
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            st = _normalize_state_defaults(_bolao_load_state() or {})
+            batches = st.get("pending_batches", [])
+            batches.append({
+                "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                "alpha": float(st.get("alpha", ALPHA_PADRAO)),
+                "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
+                "qtd": len(apostas_all),
+                "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_all],
+            })
+            st["pending_batches"] = batches[-100:]  # mantém histórico curto
+            _bolao_save_state(st)
+            # --- FIM NOVO ---
 
             # 2) CSV de auditoria externa (aprendizado REAL)
             snap = self._latest_snapshot()
-            _append_learn_log(snap.snapshot_id, ultimo or [], list(apostasA) + list(apostasB))
+            _append_learn_log(snap.snapshot_id, ultimo or [], apostas_all)
 
         except Exception:
             logger.warning("Falha ao registrar geração e/ou append no learn_log após /ab técnico.", exc_info=True)
@@ -4132,134 +4277,6 @@ class LotoFacilBot:
             await self.auto_aprender(update, context)
         except Exception:
             logger.warning("auto_aprender falhou pós-/ab técnico; prosseguindo normalmente.", exc_info=True)
-
-    def _ciclo_c_fixup(self, apostas: list[list[int]], historico) -> list[list[int]]:
-        if not historico:
-            return apostas
-        ultimo = self._ultimo_resultado(historico)
-        u_set = set(ultimo)
-        anchors = set(CICLO_C_ANCHORS)
-
-        def _forcar_repeticoes(a: list[int], r_alvo: int) -> list[int]:
-            a = a[:]
-            r_atual = sum(1 for n in a if n in u_set)
-            if r_atual == r_alvo:
-                return a
-            comp = [n for n in range(1, 26) if n not in a]
-            if r_atual < r_alvo:
-                faltam = [n for n in ultimo if n not in a]
-                for add in faltam:
-                    rem = next((x for x in a if x not in u_set and x not in anchors), None)
-                    if rem is None:
-                        rem = next((x for x in a if x not in u_set), None)
-                    if rem is None:
-                        break
-                    a.remove(rem); a.append(add); a.sort()
-                    r_atual += 1
-                    if r_atual == r_alvo:
-                        break
-            else:
-                for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
-                    add = next((c for c in comp if c not in a), None)
-                    if add is None:
-                        break
-                    a.remove(rem); a.append(add); a.sort()
-                    r_atual -= 1
-                    if r_atual == r_alvo:
-                        break
-            return a
-
-        for i, a in enumerate(apostas):
-            for anc in anchors:
-                if anc not in a:
-                    rem = next((x for x in reversed(a) if x not in anchors), None)
-                    if rem is not None and rem != anc:
-                        a.remove(rem); a.append(anc); a.sort()
-            r_alvo = CICLO_C_PLANOS[i]
-            for _ in range(14):
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                a = _forcar_repeticoes(a, r_alvo)
-                pares = self._contar_pares(a)
-                if 7 <= pares <= 8 and self._max_seq(a) <= 3 and sum(1 for n in a if n in u_set) == r_alvo:
-                    break
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            a = _forcar_repeticoes(a, r_alvo)
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            apostas[i] = sorted(a)
-
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=[n for n in range(1,26) if n not in ultimo], max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
-        for i, a in enumerate(apostas):
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-            a = _forcar_repeticoes(a, CICLO_C_PLANOS[i])
-            apostas[i] = sorted(a)
-
-        return apostas
-    
-    # ====== LOCK RÁPIDO E DETERMINÍSTICO (pares 7–8, seq≤3) ======
-    def _hard_lock_fast(self, a: list[int], ultimo: list[int], anchors=frozenset()) -> list[int]:
-        """
-        Lock rápido e determinístico:
-        - Garante P∈[7,8] e Seq≤3
-        - Evita mexer em âncoras quando possível
-        - Recalcula complemento a cada modificação
-        """
-        a = sorted(set(int(x) for x in a if 1 <= int(x) <= 25))[:15]
-
-        def is_ok(x: list[int]) -> bool:
-            return (7 <= self._contar_pares(x) <= 8) and (self._max_seq(x) <= 3) and (len(x) == 15)
-
-        def comp_now(x: list[int]) -> list[int]:
-            return [n for n in range(1, 26) if n not in x]
-
-        if is_ok(a):
-            return a
-
-        for _ in range(20):  # limite curto
-            changed = False
-
-            # --- Paridade ---
-            pares = self._contar_pares(a)
-            if pares > 8:
-                rem = (next((x for x in a if x % 2 == 0 and x in ultimo and x not in anchors), None)
-                       or next((x for x in a if x % 2 == 0 and x not in anchors), None))
-                add = next((c for c in comp_now(a) if c % 2 == 1 and (c-1 not in a) and (c+1 not in a)), None) \
-                      or next((c for c in comp_now(a) if c % 2 == 1), None)
-                if rem is not None and add is not None and rem in a and add not in a:
-                    a.remove(rem); a.append(add); a.sort()
-                    changed = True
-
-            elif pares < 7:
-                rem = (next((x for x in a if x % 2 == 1 and x in ultimo and x not in anchors), None)
-                       or next((x for x in a if x % 2 == 1 and x not in anchors), None))
-                add = next((c for c in comp_now(a) if c % 2 == 0 and (c-1 not in a) and (c+1 not in a)), None) \
-                      or next((c for c in comp_now(a) if c % 2 == 0), None)
-                if rem is not None and add is not None and rem in a and add not in a:
-                    a.remove(rem); a.append(add); a.sort()
-                    changed = True
-
-            # --- Sequências ---
-            if self._max_seq(a) > 3:
-                s = sorted(a)
-                idx = next((i for i in range(len(s)-3)
-                        if s[i+3] == s[i] + 3 and s[i+1] == s[i] + 1 and s[i+2] == s[i] + 2), None)
-                if idx is not None:
-                    janela = s[idx:idx+4]
-                    rem = (next((x for x in janela if x in ultimo and x not in anchors), None)
-                           or next((x for x in janela if x not in anchors), None))
-                    add = next((c for c in comp_now(a) if (c-1 not in a) and (c+1 not in a)), None) \
-                          or next((c for c in comp_now(a)), None)
-                    if rem is not None and add is not None and rem in a and add not in a:
-                        a.remove(rem); a.append(add); a.sort()
-                        changed = True
-
-            if is_ok(a):
-                break
-            if not changed:
-                # fallback do núcleo já existente
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                break
-
-        return sorted(a)[:15]
 
     # ------------- Handler do backtest -------------
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
