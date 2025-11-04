@@ -3661,7 +3661,7 @@ class LotoFacilBot:
         return sum(1 for n in aposta if n in u)
 
     # --- Novo comando: /mestre ---
-    async def mestre(self, update: Update, context: ContextTypes.Default_Type):
+    async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         import asyncio, traceback
         from datetime import datetime
         from zoneinfo import ZoneInfo
