@@ -2752,11 +2752,12 @@ class LotoFacilBot:
           - particiona m em 5 grupos de ~4 (ordem determinística)
           - cada jogo exclui 5 números (4 de um grupo + 1 rotativo do próximo)
           - corrige paridade/seq por trocas apenas com as reservas (subset-safe)
+          - reintenta variações determinísticas do 5º excluído até fechar requisitos
+          - repõe jogos perdidos no dedup para sempre retornar 'qtd'
         """
         # --- saneamento da matriz ---
         m = sorted({int(x) for x in matriz20 if 1 <= int(x) <= 25})
         if len(m) != 20:
-            # fallback robusto: completa para 20 mantendo 1..25
             U = [n for n in range(1, 26)]
             for x in U:
                 if x not in m:
@@ -2772,7 +2773,6 @@ class LotoFacilBot:
         grupos = [order[i::5] for i in range(5)]  # 5 grupos
 
         def max_seq(arr: list[int]) -> int:
-            """Seq. máxima considerando valores consecutivos (ordem numérica)."""
             s = 1
             best = 1
             arrs = sorted(arr)
@@ -2798,7 +2798,7 @@ class LotoFacilBot:
             resv = [n for n in reserva if n not in base_set]
             base = sorted(base)
 
-            # 0) Se por algum motivo entrou algo fora de m, força troca por reserva
+            # 0) blindagem (teórica) contra fora de m
             for x in list(base):
                 if x not in m and resv:
                     y = resv.pop(0)
@@ -2809,23 +2809,19 @@ class LotoFacilBot:
             # 1) Paridade alvo 7–8
             target_low, target_high = 7, 8
             p = pares(base)
-            # Funções auxiliares para troca orientada
+
             def swap_for_parity(want_even: bool) -> bool:
                 nonlocal base, base_set, resv, p
-                # escolhe um candidato dentro da base para sair (par indesejado)
                 if want_even:
-                    # queremos mais pares -> trocamos um ímpar da base por um par da reserva
                     base_out = next((x for x in base if x % 2 == 1), None)
                     res_in = next((y for y in resv if y % 2 == 0), None)
                     if base_out is None or res_in is None:
                         return False
                 else:
-                    # queremos mais ímpares -> trocamos um par da base por um ímpar da reserva
                     base_out = next((x for x in base if x % 2 == 0), None)
                     res_in = next((y for y in resv if y % 2 == 1), None)
                     if base_out is None or res_in is None:
                         return False
-                # executa troca
                 resv.remove(res_in)
                 base_set.remove(base_out)
                 base_set.add(res_in)
@@ -2833,51 +2829,40 @@ class LotoFacilBot:
                 p = pares(base)
                 return True
 
-            # Corrige paridade até atingir [7..8]
             guard = 0
-            while (p < target_low or p > target_high) and guard < 10:
+            while (p < target_low or p > target_high) and guard < 12:
                 guard += 1
-                if p < target_low:
-                    # poucos pares -> precisamos ganhar pares
+                if p < target_low:   # precisamos GANHAR pares
                     if not swap_for_parity(want_even=True):
                         break
-                elif p > target_high:
-                    # pares demais -> precisamos ganhar ímpares
+                elif p > target_high:  # precisamos GANHAR ímpares
                     if not swap_for_parity(want_even=False):
                         break
 
             # 2) Sequência máxima ≤ 3
             def break_runs() -> bool:
-                """Tenta reduzir a maior sequência trocando 1 número por reserva."""
                 nonlocal base, base_set, resv
                 arr = sorted(base)
-                # detecta runs
                 runs = []
                 start = 0
                 for i in range(1, len(arr)+1):
                     if i == len(arr) or arr[i] != arr[i-1] + 1:
                         runs.append(arr[start:i])
                         start = i
-                # encontra a pior run
                 worst = max(runs, key=len)
                 if len(worst) <= 3:
                     return False
-                # escolhe um elemento "central" da run para retirar
                 out_idx = len(worst) // 2
                 to_remove = worst[out_idx]
-                # escolhe um reserva que não cole em vizinhos
-                neigh = set([to_remove-1, to_remove+1])
+                # tenta reserva que não cole em vizinhos
                 for y in list(resv):
-                    # não formar corrente com elementos adjacentes da base
                     if (y-1 in base_set) or (y+1 in base_set):
                         continue
-                    # executa troca
                     resv.remove(y)
                     base_set.remove(to_remove)
                     base_set.add(y)
                     base = sorted(base_set)
                     return True
-                # se não achou ideal, tenta qualquer da reserva
                 if resv:
                     y = resv.pop(0)
                     base_set.remove(to_remove)
@@ -2892,38 +2877,107 @@ class LotoFacilBot:
                 if not break_runs():
                     break
 
+            # 3) Repassa paridade após quebrar sequências (quebra pode alterar p)
+            p = pares(base)
+            guard = 0
+            while (p < target_low or p > target_high) and guard < 6:
+                guard += 1
+                if p < target_low:
+                    if not swap_for_parity(want_even=True):
+                        break
+                elif p > target_high:
+                    if not swap_for_parity(want_even=False):
+                        break
+                p = pares(base)
+
             return sorted(base)
 
-        jogos = []
-        rot = 0
-        for k in range(max(1, int(qtd))):
+        def build_one(k: int, extra_offset: int) -> list[int] | None:
+            """
+            Constrói o jogo k variando deterministicamente o 5º excluído
+            via 'extra_offset' para dar flexibilidade de paridade e seq.
+            Retorna None se não conseguiu fechar requisitos.
+            """
             g_idx = k % 5
             excl = set(grupos[g_idx])  # 4 números do grupo g_idx
             prox = (g_idx + 1) % 5
-            extra = grupos[prox][rot % len(grupos[prox])]  # 5º excluído, rotativo
-            rot += 1
+            alt = grupos[prox]
+            extra = alt[(k + extra_offset) % len(alt)]
             excl.add(extra)
 
-            base = [n for n in m if n not in excl]   # 20 - 5 = 15 (subset de m)
-            reserva = sorted(list(excl))             # 5 números sobressalentes (subset de m)
-
-            # >>> correção subset-safe de paridade/SeqMax <<<
+            base = [n for n in m if n not in excl]   # 20-5=15
+            reserva = sorted(list(excl))
             base = seal_subset(base, reserva)
+            # verifica requisitos
+            if max_seq(base) > 3:
+                return None
+            p = pares(base)
+            if not (7 <= p <= 8):
+                return None
+            return sorted(base)
 
-            jogos.append(sorted(base))
-
-        # REMOVER quaisquer duplicados (sem alterar universo)
+        # --- geração com reintentos determinísticos por jogo ---
+        jogos = []
         seen = set()
-        uniq = []
-        for a in jogos:
-            t = tuple(a)
+        max_try_per_game = 12
+        for k in range(max(1, int(qtd))):
+            chosen = None
+            for off in range(max_try_per_game):
+                cand = build_one(k, off)
+                if cand is None:
+                    continue
+                t = tuple(cand)
+                if t in seen:
+                    continue
+                chosen = cand
+                break
+            # fallback: se ainda não escolheu, relaxa unicidade (aceita 1 duplicado e ajusta depois)
+            if chosen is None:
+                for off in range(max_try_per_game, max_try_per_game + 8):
+                    cand = build_one(k, off)
+                    if cand is not None:
+                        chosen = cand
+                        break
+            if chosen is None:
+                # impossível fechar com as reservas atuais (muito raro) — gera variação mínima
+                base = sorted(m)[k % 6:k % 6 + 15]
+                chosen = seal_subset(base, [n for n in m if n not in base])
+            t = tuple(chosen)
             if t not in seen:
                 seen.add(t)
-                uniq.append(a)
-        jogos = uniq
+                jogos.append(chosen)
 
-        # (Opcional) leve tentativa de reduzir overlap usando APENAS trocas com reserva de cada linha
-        # Mantemos subset de m SEM injetar números externos – se quiser ativar, me peça que adiciono aqui.
+        # --- se o dedup natural deixou com menos que 'qtd', gera variações até completar ---
+        guard_global = 0
+        while len(jogos) < qtd and guard_global < 200:
+            guard_global += 1
+            k = len(jogos)
+            cand = None
+            for off in range(max_try_per_game + guard_global, max_try_per_game + guard_global + 12):
+                c = build_one(k, off)
+                if c is None:
+                    continue
+                t = tuple(c)
+                if t in seen:
+                    continue
+                cand = c
+                break
+            if cand:
+                seen.add(tuple(cand))
+                jogos.append(cand)
+            else:
+                # força microvariação determinística dentro de m
+                base = sorted(m)
+                # corta 5 espaçados para compor 15
+                step = 5 + (guard_global % 3)
+                excl = set(base[::step][:5])
+                cand0 = [n for n in base if n not in excl][:15]
+                cand0 = seal_subset(cand0, sorted(list(excl)))
+                if max_seq(cand0) <= 3 and 7 <= pares(cand0) <= 8:
+                    t = tuple(cand0)
+                    if t not in seen:
+                        seen.add(t)
+                        jogos.append(sorted(cand0))
 
         return [sorted(a) for a in jogos[:qtd]]
 
