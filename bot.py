@@ -228,25 +228,30 @@ BOLAO_BIAS_MISS = -0.2
 BOLAO_BIAS_ANCHOR_SCALE = 0.5
 
 # ========================
-# Bolão Matriz 20 → 15 (A/B/C)
+# Bolão Matriz 20 → 15 (A/B/C) + Estado Persistente
 # ========================
-BOLAO20_JANELA = 60          # usa a mesma janela do Mestre/platô
-BOLAO20_ALPHA  = 0.30        # estável para platô (não puxa R12)
+from pathlib import Path
+
+# Diretório base de dados (mesmo local onde fica o history.csv)
+DATA_DIR = str(Path(HISTORY_PATH).parent)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+BOLAO20_JANELA = 60
+BOLAO20_ALPHA  = 0.30
 BOLAO20_PAR    = (7, 8)
 BOLAO20_MAXSEQ = 3
-BOLAO20_MAX_OVERLAP = 11     # compatível com sua malha atual
-BOLAO20_PLANOS = {"A": 10, "B": 20, "C": 48}  # nº de jogos
+BOLAO20_MAX_OVERLAP = 11
+
+BOLAO20_PLANOS = {"A": 10, "B": 20, "C": 48}
 BOLAO20_DESCR  = {
     "A": "10 jogos — 14 frequente (não garantido)",
     "B": "20 jogos — 14 muito frequente (estilo lotérica)",
     "C": "36–48 jogos — garantia técnica de 14 se errar ≤1"
 }
 
-# ========================
-# Estado do Bolão 20 (persistência p/ conferência)
-# ========================
+# Arquivo de estado persistente (para conferência / auditoria do bolão)
 BOLAO20_STATE_PATH = os.path.join(DATA_DIR, "bolao20_state.json")
-BOLAO20_AUTO_MATCH_LAST = True  # tenta casar sessão pendente com o último oficial
+BOLAO20_AUTO_MATCH_LAST = True  # tenta casar sessão com último oficial automaticamente
 
 # ========================
 # Aprendizado REAL — paths e grades
