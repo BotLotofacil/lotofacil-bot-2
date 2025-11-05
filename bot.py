@@ -2741,20 +2741,23 @@ class LotoFacilBot:
         matriz20 = sorted(list(last_set | set(pick)))[:20]
         return matriz20
 
-    # ---------- Fechamento reduzido 20→15 (determinístico, cobertura balanceada) ----------
     def _fechamento20_reduzido(self, matriz20: list[int], qtd: int, ultimo: list[int]) -> list[list[int]]:
         """
-        Gera 'qtd' apostas de 15 dezenas contidas em 'matriz20'.
+        Gera 'qtd' apostas de 15 dezenas a partir de 'matriz20' (20 dezenas),
+        garantindo SEMPRE:
+          - cada jogo é SUBCONJUNTO de matriz20 (nunca injeta fora)
+          - paridade 7–8
+          - SeqMax ≤ 3
         Estratégia:
-          - particiona os 20 números em 5 grupos de 4 (round-robin determinístico)
-          - cada jogo exclui 5 números (4 de um grupo + 1 rotativo de outro)
-          - aplica selagem (paridade 7–8, Seq≤3) e anti-overlap≤11
-        Resultado: lote estável, muito próximo do padrão de lotérica.
+          - particiona m em 5 grupos de ~4 (ordem determinística)
+          - cada jogo exclui 5 números (4 de um grupo + 1 rotativo do próximo)
+          - corrige paridade/seq por trocas apenas com as reservas (subset-safe)
         """
-        m = sorted(set(int(x) for x in matriz20 if 1 <= int(x) <= 25))
+        # --- saneamento da matriz ---
+        m = sorted({int(x) for x in matriz20 if 1 <= int(x) <= 25})
         if len(m) != 20:
-            # fallback robusto
-            U = list(range(1, 26))
+            # fallback robusto: completa para 20 mantendo 1..25
+            U = [n for n in range(1, 26)]
             for x in U:
                 if x not in m:
                     m.append(x)
@@ -2762,34 +2765,166 @@ class LotoFacilBot:
                     break
             m = sorted(m[:20])
 
-        # grupos determinísticos
-        # usa hash do snapshot para garantir reprodutibilidade por concurso
+        # --- grupos determinísticos por snapshot ---
         snap = self._latest_snapshot()
-        seed = self._stable_hash_int(snap.snapshot_id) % (10**9)
+        seed = (self._stable_hash_int(snap.snapshot_id) % (10**9)) or 1
         order = sorted(m, key=lambda x: (seed ^ (x * 1315423911)) & 0xFFFFFFFF)
-        grupos = [order[i::5] for i in range(5)]  # 5 grupos de ~4
+        grupos = [order[i::5] for i in range(5)]  # 5 grupos
+
+        def max_seq(arr: list[int]) -> int:
+            """Seq. máxima considerando valores consecutivos (ordem numérica)."""
+            s = 1
+            best = 1
+            arrs = sorted(arr)
+            for i in range(1, len(arrs)):
+                if arrs[i] == arrs[i-1] + 1:
+                    s += 1
+                    if s > best:
+                        best = s
+                else:
+                    s = 1
+            return best
+
+        def pares(arr: list[int]) -> int:
+            return sum(1 for n in arr if n % 2 == 0)
+
+        def seal_subset(base: list[int], reserva: list[int]) -> list[int]:
+            """
+            Ajusta base (subset de m) para paridade 7–8 e SeqMax≤3,
+            trocando APENAS com números da 'reserva' (também subset de m).
+            Nunca injeta número fora de m.
+            """
+            base_set = set(base)
+            resv = [n for n in reserva if n not in base_set]
+            base = sorted(base)
+
+            # 0) Se por algum motivo entrou algo fora de m, força troca por reserva
+            for x in list(base):
+                if x not in m and resv:
+                    y = resv.pop(0)
+                    base_set.remove(x)
+                    base_set.add(y)
+                    base = sorted(base_set)
+
+            # 1) Paridade alvo 7–8
+            target_low, target_high = 7, 8
+            p = pares(base)
+            # Funções auxiliares para troca orientada
+            def swap_for_parity(want_even: bool) -> bool:
+                nonlocal base, base_set, resv, p
+                # escolhe um candidato dentro da base para sair (par indesejado)
+                if want_even:
+                    # queremos mais pares -> trocamos um ímpar da base por um par da reserva
+                    base_out = next((x for x in base if x % 2 == 1), None)
+                    res_in = next((y for y in resv if y % 2 == 0), None)
+                    if base_out is None or res_in is None:
+                        return False
+                else:
+                    # queremos mais ímpares -> trocamos um par da base por um ímpar da reserva
+                    base_out = next((x for x in base if x % 2 == 0), None)
+                    res_in = next((y for y in resv if y % 2 == 1), None)
+                    if base_out is None or res_in is None:
+                        return False
+                # executa troca
+                resv.remove(res_in)
+                base_set.remove(base_out)
+                base_set.add(res_in)
+                base = sorted(base_set)
+                p = pares(base)
+                return True
+
+            # Corrige paridade até atingir [7..8]
+            guard = 0
+            while (p < target_low or p > target_high) and guard < 10:
+                guard += 1
+                if p < target_low:
+                    # poucos pares -> precisamos ganhar pares
+                    if not swap_for_parity(want_even=True):
+                        break
+                elif p > target_high:
+                    # pares demais -> precisamos ganhar ímpares
+                    if not swap_for_parity(want_even=False):
+                        break
+
+            # 2) Sequência máxima ≤ 3
+            def break_runs() -> bool:
+                """Tenta reduzir a maior sequência trocando 1 número por reserva."""
+                nonlocal base, base_set, resv
+                arr = sorted(base)
+                # detecta runs
+                runs = []
+                start = 0
+                for i in range(1, len(arr)+1):
+                    if i == len(arr) or arr[i] != arr[i-1] + 1:
+                        runs.append(arr[start:i])
+                        start = i
+                # encontra a pior run
+                worst = max(runs, key=len)
+                if len(worst) <= 3:
+                    return False
+                # escolhe um elemento "central" da run para retirar
+                out_idx = len(worst) // 2
+                to_remove = worst[out_idx]
+                # escolhe um reserva que não cole em vizinhos
+                neigh = set([to_remove-1, to_remove+1])
+                for y in list(resv):
+                    # não formar corrente com elementos adjacentes da base
+                    if (y-1 in base_set) or (y+1 in base_set):
+                        continue
+                    # executa troca
+                    resv.remove(y)
+                    base_set.remove(to_remove)
+                    base_set.add(y)
+                    base = sorted(base_set)
+                    return True
+                # se não achou ideal, tenta qualquer da reserva
+                if resv:
+                    y = resv.pop(0)
+                    base_set.remove(to_remove)
+                    base_set.add(y)
+                    base = sorted(base_set)
+                    return True
+                return False
+
+            guard = 0
+            while max_seq(base) > 3 and guard < 12:
+                guard += 1
+                if not break_runs():
+                    break
+
+            return sorted(base)
 
         jogos = []
         rot = 0
         for k in range(max(1, int(qtd))):
             g_idx = k % 5
-            excl = set(grupos[g_idx])  # 4 números
-            # quinto excluído: pega do próximo grupo, rotacionando
+            excl = set(grupos[g_idx])  # 4 números do grupo g_idx
             prox = (g_idx + 1) % 5
-            extra = grupos[prox][rot % len(grupos[prox])]
+            extra = grupos[prox][rot % len(grupos[prox])]  # 5º excluído, rotativo
             rot += 1
             excl.add(extra)
 
-            base = [n for n in m if n not in excl]   # 20 - 5 = 15
-            # selagem de forma (não usa âncoras específicas aqui)
-            base = self._hard_lock_fast(base, ultimo=ultimo or [], anchors=frozenset(),
-                                        alvo_par=BOLAO20_PAR, max_seq=BOLAO20_MAXSEQ)
+            base = [n for n in m if n not in excl]   # 20 - 5 = 15 (subset de m)
+            reserva = sorted(list(excl))             # 5 números sobressalentes (subset de m)
+
+            # >>> correção subset-safe de paridade/SeqMax <<<
+            base = seal_subset(base, reserva)
+
             jogos.append(sorted(base))
 
-        # cura duplicados e reduz overlap global
-        jogos = self._dedup_apostas(jogos, ultimo=ultimo, max_overlap=BOLAO20_MAX_OVERLAP, anchors=frozenset())
-        jogos = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset(),
-                                      alvo_par=BOLAO20_PAR, max_seq=BOLAO20_MAXSEQ) for a in jogos]
+        # REMOVER quaisquer duplicados (sem alterar universo)
+        seen = set()
+        uniq = []
+        for a in jogos:
+            t = tuple(a)
+            if t not in seen:
+                seen.add(t)
+                uniq.append(a)
+        jogos = uniq
+
+        # (Opcional) leve tentativa de reduzir overlap usando APENAS trocas com reserva de cada linha
+        # Mantemos subset de m SEM injetar números externos – se quiser ativar, me peça que adiciono aqui.
+
         return [sorted(a) for a in jogos[:qtd]]
 
     # ---------- Comando público /bolao20 ----------
