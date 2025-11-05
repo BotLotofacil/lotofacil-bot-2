@@ -228,6 +228,27 @@ BOLAO_BIAS_MISS = -0.2
 BOLAO_BIAS_ANCHOR_SCALE = 0.5
 
 # ========================
+# Bolão Matriz 20 → 15 (A/B/C)
+# ========================
+BOLAO20_JANELA = 60          # usa a mesma janela do Mestre/platô
+BOLAO20_ALPHA  = 0.30        # estável para platô (não puxa R12)
+BOLAO20_PAR    = (7, 8)
+BOLAO20_MAXSEQ = 3
+BOLAO20_MAX_OVERLAP = 11     # compatível com sua malha atual
+BOLAO20_PLANOS = {"A": 10, "B": 20, "C": 48}  # nº de jogos
+BOLAO20_DESCR  = {
+    "A": "10 jogos — 14 frequente (não garantido)",
+    "B": "20 jogos — 14 muito frequente (estilo lotérica)",
+    "C": "36–48 jogos — garantia técnica de 14 se errar ≤1"
+}
+
+# ========================
+# Estado do Bolão 20 (persistência p/ conferência)
+# ========================
+BOLAO20_STATE_PATH = os.path.join(DATA_DIR, "bolao20_state.json")
+BOLAO20_AUTO_MATCH_LAST = True  # tenta casar sessão pendente com o último oficial
+
+# ========================
 # Aprendizado REAL — paths e grades
 # ========================
 LEARN_LOG_PATH = "data/learn_log.csv"   # log de (snapshot_id, oficial, apostas, placares)
@@ -824,6 +845,8 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("mestre_bolao", self.mestre_bolao))
         self.app.add_handler(CommandHandler("refinar_bolao", self.refinar_bolao))
         self.app.add_handler(CommandHandler("estado_bolao", self.estado_bolao))
+        self.app.add_handler(CommandHandler("bolao20", self.bolao20))
+        self.app.add_handler(CommandHandler("conferir_bolao20", self.conferir_bolao20))
         # Handler para comandos desconhecidos (precisa vir DEPOIS dos conhecidos)
         self.app.add_handler(MessageHandler(filters.COMMAND, self._unknown_command))
         logger.info("Handlers ativos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao + unknown command handler")
@@ -2657,6 +2680,369 @@ class LotoFacilBot:
         Compatibilidade para /mestre_bolao: delega para a sua expansão oficial 19→15.
         """
         return self._subsets_19_para_15(matriz19, seed=seed)
+    
+    # ---------- Matriz 20 a partir do Mestre (último + quentes + ausentes fortes) ----------
+    def _matriz20_mestre(self, historico: list[list[int]]) -> list[int]:
+        """
+        Constrói 20 dezenas determinísticas para o bolão:
+        - parte do último oficial (15)
+        - escolhe 5 ausentes por score: (freq_janela - atraso_norm + bias)
+        - sela para manter diversidade (sem viciar)
+        """
+        if not historico:
+            # fallback seguro (nunca quebra)
+            return list(range(1, 21))
+
+        ultimo = self._ultimo_resultado(historico)           # 15 dezenas
+        hist_win = ultimos_n_concursos(historico, BOLAO20_JANELA)
+        if not HISTORY_ORDER_DESC:
+            hist_win = list(reversed(hist_win))
+
+        # frequência e atraso
+        freq = _freq_window(hist_win, bias=_normalize_state_defaults(_bolao_load_state()).get("bias"))
+        atraso = _atrasos_recent_first(hist_win)
+
+        # universo e ausentes do último
+        U = set(range(1, 26))
+        last_set = set(ultimo)
+        ausentes = sorted(list(U - last_set))
+
+        # score determinístico
+        # normaliza atraso para [0,1] (quanto menor atraso, maior score)
+        max_at = max(atraso.values()) if atraso else 1
+        def score(n: int) -> float:
+            at = atraso.get(n, max_at)
+            at_norm = 1.0 - (at / float(max_at or 1))
+            return float(freq.get(n, 0.0)) + 0.75 * at_norm
+
+        # top-5 ausentes por score (sem encadear sequências grandes)
+        cand = sorted(ausentes, key=score, reverse=True)
+        pick = []
+        for n in cand:
+            if len(pick) == 5:
+                break
+            # evita criar correntes longas ao juntar ao último
+            if ((n-1) in last_set and (n+1) in last_set):
+                continue
+            pick.append(n)
+
+        # se faltar, completa pelos próximos
+        i = 0
+        while len(pick) < 5 and i < len(cand):
+            if cand[i] not in pick:
+                pick.append(cand[i])
+            i += 1
+
+        matriz20 = sorted(list(last_set | set(pick)))[:20]
+        return matriz20
+
+    # ---------- Fechamento reduzido 20→15 (determinístico, cobertura balanceada) ----------
+    def _fechamento20_reduzido(self, matriz20: list[int], qtd: int, ultimo: list[int]) -> list[list[int]]:
+        """
+        Gera 'qtd' apostas de 15 dezenas contidas em 'matriz20'.
+        Estratégia:
+          - particiona os 20 números em 5 grupos de 4 (round-robin determinístico)
+          - cada jogo exclui 5 números (4 de um grupo + 1 rotativo de outro)
+          - aplica selagem (paridade 7–8, Seq≤3) e anti-overlap≤11
+        Resultado: lote estável, muito próximo do padrão de lotérica.
+        """
+        m = sorted(set(int(x) for x in matriz20 if 1 <= int(x) <= 25))
+        if len(m) != 20:
+            # fallback robusto
+            U = list(range(1, 26))
+            for x in U:
+                if x not in m:
+                    m.append(x)
+                if len(m) == 20:
+                    break
+            m = sorted(m[:20])
+
+        # grupos determinísticos
+        # usa hash do snapshot para garantir reprodutibilidade por concurso
+        snap = self._latest_snapshot()
+        seed = self._stable_hash_int(snap.snapshot_id) % (10**9)
+        order = sorted(m, key=lambda x: (seed ^ (x * 1315423911)) & 0xFFFFFFFF)
+        grupos = [order[i::5] for i in range(5)]  # 5 grupos de ~4
+
+        jogos = []
+        rot = 0
+        for k in range(max(1, int(qtd))):
+            g_idx = k % 5
+            excl = set(grupos[g_idx])  # 4 números
+            # quinto excluído: pega do próximo grupo, rotacionando
+            prox = (g_idx + 1) % 5
+            extra = grupos[prox][rot % len(grupos[prox])]
+            rot += 1
+            excl.add(extra)
+
+            base = [n for n in m if n not in excl]   # 20 - 5 = 15
+            # selagem de forma (não usa âncoras específicas aqui)
+            base = self._hard_lock_fast(base, ultimo=ultimo or [], anchors=frozenset(),
+                                        alvo_par=BOLAO20_PAR, max_seq=BOLAO20_MAXSEQ)
+            jogos.append(sorted(base))
+
+        # cura duplicados e reduz overlap global
+        jogos = self._dedup_apostas(jogos, ultimo=ultimo, max_overlap=BOLAO20_MAX_OVERLAP, anchors=frozenset())
+        jogos = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset(),
+                                      alvo_par=BOLAO20_PAR, max_seq=BOLAO20_MAXSEQ) for a in jogos]
+        return [sorted(a) for a in jogos[:qtd]]
+
+    # ---------- Comando público /bolao20 ----------
+    async def bolao20(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Uso: /bolao20 [A|B|C]
+          A = 10 jogos (14 frequente, não garantido)
+          B = 20 jogos (14 muito frequente)  <-- recomendado / estilo lotérica
+          C = 36–48 jogos (garantia técnica de 14 se errar ≤1)
+        """
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        # --- autorização + anti-abuso ---
+        if not self._usuario_autorizado(user_id):
+            return await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
+        if not self._is_admin(user_id):
+            if _is_temporarily_blocked(user_id):
+                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
+            allowed, warn = _register_command_event(user_id, is_unknown=False)
+            if not allowed:
+                return await update.message.reply_text(warn)
+            if warn:
+                await update.message.reply_text(warn)
+        if self._hit_cooldown(chat_id, "bolao20"):
+            return await update.message.reply_text("⏳ Aguardando cooldown… tente novamente em alguns segundos.")
+
+        # --- plano escolhido ---
+        plano = "B"
+        if context.args:
+            p = context.args[0].strip().upper()
+            if p in BOLAO20_PLANOS:
+                plano = p
+
+        qtd = BOLAO20_PLANOS[plano]
+
+        # --- histórico e último oficial ---
+        historico = carregar_historico(HISTORY_PATH)
+        ultimo = self._ultimo_resultado(historico) if historico else []
+
+        # --- autoconferência automática de sessões pendentes ---
+        conferidas = self._bolao20_try_autoconferir()
+        if conferidas:
+            await update.message.reply_text(
+                f"ℹ️ {len(conferidas)} sessão(ões) do Bolão 20 conferida(s) automaticamente com o último resultado."
+            )
+
+        # --- Matriz 20 determinística + fechamento reduzido ---
+        matriz20 = self._matriz20_mestre(historico)
+        jogos = self._fechamento20_reduzido(matriz20, qtd=qtd, ultimo=ultimo)
+
+        # --- montagem da mensagem ---
+        linhas = [f"🎰 <b>Bolão Matriz 20</b> — Plano <b>{plano}</b> ({BOLAO20_DESCR[plano]})\n"]
+        linhas.append(f"<b>Matriz 20:</b> {' '.join(f'{n:02d}' for n in matriz20)}\n")
+
+        for i, a in enumerate(jogos, 1):
+            pares = self._contar_pares(a)
+            seq   = self._max_seq(a)
+            linhas.append(
+                f"<b>Jogo {i:02d}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                f"   🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
+            )
+
+        # --- rodapé telemétrico ---
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_sp = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+        linhas.append(
+            f"<i>janela={BOLAO20_JANELA} | α={BOLAO20_ALPHA:.2f} | jogos={qtd} | {now_sp}</i>"
+        )
+
+        # --- registra sessão para conferência posterior ---
+        sid = self._bolao20_register_session(
+            plano=plano,
+            matriz20=matriz20,
+            jogos=jogos,
+            snapshot_id=self._latest_snapshot().snapshot_id,
+            concurso=tentar_descobrir_concurso(carregar_historico(HISTORY_PATH)) if "tentar_descobrir_concurso" in globals() else None
+        )
+        linhas.append(f"<i>SID:</i> {sid}")
+
+        # --- envia ao usuário ---
+        await self._send_long(update, "\n".join(linhas), parse_mode="HTML")
+
+        # ---------- Persistência leve do bolão ----------
+    def _bolao20_state_load(self) -> dict:
+        try:
+            with open(BOLAO20_STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"sessions": []}
+
+    def _bolao20_state_save(self, state: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(BOLAO20_STATE_PATH), exist_ok=True)
+            with open(BOLAO20_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # falha silenciosa não deve quebrar o fluxo
+
+    def _bolao20_register_session(self, plano: str, matriz20: list[int], jogos: list[list[int]], snapshot_id: str, concurso: int | None) -> str:
+        state = self._bolao20_state_load()
+        sid = f"{snapshot_id}|{plano}|{int(time.time())}"
+        state["sessions"].append({
+            "sid": sid,
+            "plano": plano,
+            "matriz20": jogos and sorted(set(matriz20)) or [],
+            "jogos": jogos,
+            "snapshot_id": snapshot_id,
+            "concurso_base": concurso,     # concurso do snapshot (se souber)
+            "checked": False,
+            "result_concurso": None,
+            "result_dezenas": None,
+            "hist": None,                  # preenchido na conferência
+        })
+        self._bolao20_state_save(state)
+        return sid
+
+    # ---------- Contagem de acertos ----------
+    @staticmethod
+    def _count_hits(aposta: list[int], resultado: list[int]) -> int:
+        s = set(aposta)
+        return sum(1 for n in resultado if n in s)
+
+    def _conferir_jogos(self, jogos: list[list[int]], resultado: list[int]) -> dict:
+        """
+        Retorna histograma de acertos e lista de índices por faixa.
+        Ex.: {"15": [idxs...], "14": [...], "13": [...], ...}
+        """
+        hist = {str(k): [] for k in range(6, 16)}  # 6..15 p/ análise
+        for i, a in enumerate(jogos, 1):
+            h = self._count_hits(a, resultado)
+            if str(h) in hist:
+                hist[str(h)].append(i)
+        return hist
+
+    # ---------- Conferência automática (opcional) ----------
+    def _bolao20_try_autoconferir(self) -> list[dict]:
+        """
+        Se BOLAO20_AUTO_MATCH_LAST=True:
+          - pega 'sessions' pendentes (checked=False)
+          - cruza com o último resultado oficial
+          - grava o histograma de acertos
+        Retorna lista de sessões conferidas no ciclo.
+        """
+        if not BOLAO20_AUTO_MATCH_LAST:
+            return []
+        state = self._bolao20_state_load()
+        if not state.get("sessions"):
+            return []
+
+        historico = carregar_historico(HISTORY_PATH)
+        if not historico:
+            return []
+
+        ultimo = self._ultimo_resultado(historico)
+        checked = []
+
+        for s in state["sessions"]:
+            if s.get("checked"):
+                continue
+            jogos = s.get("jogos") or []
+            if not jogos:
+                continue
+            hist = self._conferir_jogos(jogos, ultimo)
+            s["checked"] = True
+            s["result_concurso"] = tentar_descobrir_concurso(historico) if "tentar_descobrir_concurso" in globals() else None
+            s["result_dezenas"] = ultimo
+            s["hist"] = hist
+            checked.append(s)
+
+        if checked:
+            self._bolao20_state_save(state)
+        return checked
+    
+    # ---------- Comando público /conferir_bolao20 ----------
+    async def conferir_bolao20(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Uso:
+          /conferir_bolao20               -> confere sessões pendentes com o último oficial
+          /conferir_bolao20 SID           -> confere/mostra sessão específica
+          /conferir_bolao20 concurso=3531 -> confere com resultado de um concurso específico (se disponível)
+        """
+        user_id = update.effective_user.id
+        if not self._usuario_autorizado(user_id):
+            return await update.message.reply_text("⛔ Você não está autorizado.")
+
+        args = " ".join(context.args) if context.args else ""
+        target_sid = None
+        target_concurso = None
+
+        # parse simples dos argumentos
+        if "concurso=" in args:
+            try:
+                target_concurso = int(args.split("concurso=")[1].strip().split()[0])
+            except Exception:
+                target_concurso = None
+        elif args:
+            target_sid = args.strip()
+
+        # carrega estado
+        state = self._bolao20_state_load()
+        sessions = state.get("sessions", [])
+
+        # define resultado alvo (último ou de concurso específico, se você tiver essa função/histórico)
+        historico = carregar_historico(HISTORY_PATH)
+        if not historico:
+            return await update.message.reply_text("Sem histórico para conferir.")
+
+        if target_concurso and "resultado_por_concurso" in globals():
+            resultado = resultado_por_concurso(historico, target_concurso)  # opcional no seu projeto
+            if not resultado:
+                return await update.message.reply_text(f"Não achei resultado do concurso {target_concurso}.")
+        else:
+            resultado = self._ultimo_resultado(historico)
+
+        # filtra sessões
+        if target_sid:
+            sessions = [s for s in sessions if s.get("sid") == target_sid]
+            if not sessions:
+                return await update.message.reply_text("SID não encontrado.")
+        else:
+            # pega as pendentes para conferência automática
+            pend = [s for s in sessions if not s.get("checked")]
+            sessions = pend or sessions[-3:]  # mostra últimas 3 se não houver pendentes
+
+        # confere e monta resposta
+        linhas = []
+        for s in sessions:
+            jogos = s.get("jogos") or []
+            hist = self._conferir_jogos(jogos, resultado)
+
+            s["checked"] = True
+            s["result_concurso"] = target_concurso or s.get("result_concurso")
+            s["result_dezenas"] = resultado
+            s["hist"] = hist
+
+            linhas.append(f"🧾 <b>SID:</b> {s['sid']}")
+            linhas.append(f"Plano: <b>{s.get('plano')}</b> | Jogos: {len(jogos)}")
+            linhas.append(f"Resultado: {' '.join(f'{n:02d}' for n in resultado)}")
+            # resumo 15/14 (e 13 para fins de telemetria)
+            q15 = len(hist.get("15", []))
+            q14 = len(hist.get("14", []))
+            q13 = len(hist.get("13", []))
+            linhas.append(f"🏆 <b>15 acertos:</b> {q15}  |  ⭐ <b>14 acertos:</b> {q14}  |  13 acertos: {q13}")
+            if q14 or q15:
+                top = []
+                if q15:
+                    top.append("15→ " + ", ".join(f"#{i:02d}" for i in hist["15"]))
+                if q14:
+                    top.append("14→ " + ", ".join(f"#{i:02d}" for i in hist["14"]))
+                linhas.append("• " + " | ".join(top))
+            linhas.append("")  # linha em branco
+
+        self._bolao20_state_save(state)
+        if not linhas:
+            linhas = ["Não há sessões para conferir."]
+        await self._send_long(update, "\n".join(linhas), parse_mode="HTML")
 
     # --- /mestre: pacote Mestre determinístico selado e sem duplicata ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
