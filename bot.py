@@ -2814,12 +2814,12 @@ class LotoFacilBot:
                 nonlocal base, base_set, resv, p
                 if want_even:
                     base_out = next((x for x in base if x % 2 == 1), None)
-                    res_in = next((y for y in resv if y % 2 == 0), None)
+                    res_in  = next((y for y in resv if y % 2 == 0), None)
                     if base_out is None or res_in is None:
                         return False
                 else:
                     base_out = next((x for x in base if x % 2 == 0), None)
-                    res_in = next((y for y in resv if y % 2 == 1), None)
+                    res_in  = next((y for y in resv if y % 2 == 1), None)
                     if base_out is None or res_in is None:
                         return False
                 resv.remove(res_in)
@@ -2829,13 +2829,14 @@ class LotoFacilBot:
                 p = pares(base)
                 return True
 
+        # ---- continue seal_subset ----
             guard = 0
             while (p < target_low or p > target_high) and guard < 12:
                 guard += 1
-                if p < target_low:   # precisamos GANHAR pares
+                if p < target_low:
                     if not swap_for_parity(want_even=True):
                         break
-                elif p > target_high:  # precisamos GANHAR ímpares
+                elif p > target_high:
                     if not swap_for_parity(want_even=False):
                         break
 
@@ -2908,7 +2909,8 @@ class LotoFacilBot:
             base = [n for n in m if n not in excl]   # 20-5=15
             reserva = sorted(list(excl))
             base = seal_subset(base, reserva)
-            # verifica requisitos
+
+            # requisitos
             if max_seq(base) > 3:
                 return None
             p = pares(base)
@@ -2931,7 +2933,7 @@ class LotoFacilBot:
                     continue
                 chosen = cand
                 break
-            # fallback: se ainda não escolheu, relaxa unicidade (aceita 1 duplicado e ajusta depois)
+            # fallback: se ainda não escolheu, aceita 1 duplicado e ajusta depois
             if chosen is None:
                 for off in range(max_try_per_game, max_try_per_game + 8):
                     cand = build_one(k, off)
@@ -2939,45 +2941,84 @@ class LotoFacilBot:
                         chosen = cand
                         break
             if chosen is None:
-                # impossível fechar com as reservas atuais (muito raro) — gera variação mínima
-                base = sorted(m)[k % 6:k % 6 + 15]
-                chosen = seal_subset(base, [n for n in m if n not in base])
+                # >>> CORREÇÃO: fallback garante 15 dezenas e subset de m <<<
+                base_all = sorted(m)
+                shift = (k % 5)
+                excl = set(base_all[shift::5][:5])     # exclui 5 espaçados
+                base = [n for n in base_all if n not in excl][:15]
+                chosen = seal_subset(base, sorted(list(excl)))
+
             t = tuple(chosen)
             if t not in seen:
                 seen.add(t)
                 jogos.append(chosen)
 
         # --- se o dedup natural deixou com menos que 'qtd', gera variações até completar ---
+        def _alt_build(index_seed: int) -> list[int] | None:
+            """
+            Estratégia alternativa: varia o 5º excluído em DOIS grupos vizinhos
+            e também permuta 1 número leve na base, tudo determinístico.
+            """
+            for ghop in (1, 2):  # saltos de grupo para variar reserva
+                for off in range(24):
+                    g_idx = index_seed % 5
+                    excl = set(grupos[g_idx])
+                    alt = grupos[(g_idx + ghop) % 5]
+                    extra = alt[(index_seed + off) % len(alt)]
+                    excl.add(extra)
+
+                    base = [n for n in m if n not in excl]
+                    reserva = sorted(list(excl))
+                    cand = seal_subset(base, reserva)
+                    if max_seq(cand) > 3:
+                        continue
+                    p = sum(1 for x in cand if x % 2 == 0)
+                    if not (7 <= p <= 8):
+                        continue
+
+                    t = tuple(sorted(cand))
+                    if t in seen:
+                        # micro-variação: tenta 1 swap base<->reserva mantendo regras
+                        for r in reserva:
+                            if r in cand:
+                                continue
+                            for b in cand:
+                                if b in reserva:
+                                    continue
+                                cand2 = sorted((y if y != b else r) for y in cand)
+                                if tuple(cand2) in seen:
+                                    continue
+                                if max_seq(cand2) <= 3 and 7 <= sum(1 for xx in cand2 if xx % 2 == 0) <= 8:
+                                    return cand2
+                        continue
+                    return sorted(cand)
+            return None
+
         guard_global = 0
         while len(jogos) < qtd and guard_global < 200:
             guard_global += 1
-            k = len(jogos)
-            cand = None
-            for off in range(max_try_per_game + guard_global, max_try_per_game + guard_global + 12):
-                c = build_one(k, off)
-                if c is None:
-                    continue
-                t = tuple(c)
-                if t in seen:
-                    continue
-                cand = c
-                break
+            idx = len(jogos) + guard_global  # muda semente determinística
+            cand = _alt_build(idx)
             if cand:
-                seen.add(tuple(cand))
-                jogos.append(cand)
-            else:
-                # força microvariação determinística dentro de m
-                base = sorted(m)
-                # corta 5 espaçados para compor 15
-                step = 5 + (guard_global % 3)
-                excl = set(base[::step][:5])
-                cand0 = [n for n in base if n not in excl][:15]
-                cand0 = seal_subset(cand0, sorted(list(excl)))
-                if max_seq(cand0) <= 3 and 7 <= pares(cand0) <= 8:
-                    t = tuple(cand0)
-                    if t not in seen:
-                        seen.add(t)
-                        jogos.append(sorted(cand0))
+                t = tuple(cand)
+                if t not in seen:
+                    seen.add(t)
+                    jogos.append(cand)
+
+        # garantia final: se ainda faltar (caso extremo), gera micro-variações dentro da matriz até completar
+        idx = 0
+        while len(jogos) < qtd and idx < 300:
+            idx += 1
+            base_all = sorted(m)
+            shift = (idx % 5)
+            excl = set(base_all[shift::5][:5])           # 5 excluídos espaçados
+            cand = [n for n in base_all if n not in excl][:15]
+            cand = seal_subset(cand, sorted(list(excl)))
+            if max_seq(cand) <= 3 and 7 <= sum(1 for x in cand if x % 2 == 0) <= 8:
+                t = tuple(sorted(cand))
+                if t not in seen:
+                    seen.add(t)
+                    jogos.append(sorted(cand))
 
         return [sorted(a) for a in jogos[:qtd]]
 
