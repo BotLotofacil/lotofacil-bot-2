@@ -1,0 +1,13 @@
+{
+  "locks": {
+    "enabled": true,
+    "scope": "gerar_only",
+    "janela": 60,
+    "alpha": 0.36,
+    "bias_scalars": {
+      "R": 0.023,
+      "par": 0.016,
+      "seq": 0.05
+    }
+  }
+}
