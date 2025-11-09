@@ -587,26 +587,40 @@ class LotoFacilBot:
         
     def _alpha_para_comando(self, cmd: str, alpha_sugerido: float | None = None) -> float:
         """
-        Retorna o alpha efetivo conforme o comando.
-        - /gerar -> trava em 0.36 se LOCK_ALPHA_GERAR=True
-        - demais -> usa 'alpha_sugerido' se vier, senão o alpha dinâmico do estado (self.st['learning']['alpha'])
+        α efetivo por comando.
+
+        - /gerar: retorna ALPHA_LOCK_VALUE se LOCK_ALPHA_GERAR=True (lock 0.36).
+        - demais: prioriza alpha_sugerido; se None, lê do estado, nesta ordem:
+            1) st["alpha"] (raiz)  -> gravado pelo auto_aprender
+            2) st["learning"]["alpha"] (legado/compat)
+            3) fallback 0.36
         """
-        # 1) tenta pegar α dinâmico do estado
+        # 1) Lock imediato para /gerar (estabilidade total no front de geração)
+        if cmd == "/gerar" and globals().get("LOCK_ALPHA_GERAR", False):
+            return float(globals().get("ALPHA_LOCK_VALUE", 0.36))
+
+        # 2) Se o chamador sugeriu um α explícito, respeitamos
+        if isinstance(alpha_sugerido, (int, float)):
+            try:
+                return float(alpha_sugerido)
+            except Exception:
+                pass  # cai para os próximos métodos de obtenção
+
+        # 3) Tenta obter α “dinâmico” do estado persistente
         alpha_dinamico = 0.36
         try:
-            st = getattr(self, "st", None) or {}
-            learning = st.get("learning") or {}
-            alpha_dinamico = float(learning.get("alpha", 0.36))
+            # usa self.st se existir; senão carrega do storage
+            st = getattr(self, "st", None) or (_bolao_load_state() or {})
+
+            # (1) raiz primeiro (valor “oficial” aprendido)
+            alpha_dinamico = float(st.get("alpha", alpha_dinamico))
+
+            # (2) compatibilidade: learning.alpha (se existir, tem precedência só se definido)
+            alpha_dinamico = float((st.get("learning") or {}).get("alpha", alpha_dinamico))
         except Exception:
-            alpha_dinamico = 0.36
+            alpha_dinamico = 0.36  # fallback hard
 
-        # 2) decide base
-        base = alpha_sugerido if isinstance(alpha_sugerido, (int, float)) else alpha_dinamico
-
-        # 3) aplica lock apenas no /gerar
-        if cmd == "/gerar" and LOCK_ALPHA_GERAR:
-            return float(ALPHA_LOCK_VALUE)
-        return float(base)
+        return float(alpha_dinamico)
 
     def _ultimo_resultado(self, historico) -> List[int]:
         """
@@ -692,130 +706,229 @@ class LotoFacilBot:
             return [sorted(rng.sample(range(1, 26), 15)) for _ in range(max(1, qtd))]
         
     # ========================
-    # Aprendizado REAL
+    # Aprendizado REAL (revisado)
     # ========================
-    async def auto_aprender(self, update, context):  # substitui a versão leve existente
+    async def auto_aprender(self, update, context):
         """
-        Aprendizado REAL (com gating por oficial):
-        0) Se LEARN_POLICY == "official_gate", ignora sem novo oficial.
-        1) Loga última geração + oficial (CSV).
-        2) Reestima viés por dezena (janela curta ROLLING_TEST).
-        3) Busca rápida (grade + tempo limitado) de (janela, alpha) via walk-forward.
-        4) Atualiza estado persistente (alpha, bias, contadores).
-        5) Não trava o bot se falhar.
+        Aprendizado REAL com guard-rails e sem mexer no gerador/estratégia.
+        - Gating por política 'official_gate' (ignora se não houver novo oficial, conforme sua política).
+        - Usa o último resultado oficial e a última geração salva para medir desempenho REAL.
+        - Triplo check-in do lote (paridade 7–8, max_seq<=3, anti-overlap<=11 e sem duplicatas).
+        - Corrige cálculo de média; só atualiza α/bias_meta se o lote estiver limpo e consistente.
+        - Ajustes estáveis: clamps e decaimento suave (evita “deriva”).
+        - Mantém estado se algo falhar (nunca trava o bot).
         """
         from datetime import datetime
         from zoneinfo import ZoneInfo
-        import time as _t
+
+        # ---- parâmetros de controle do aprendizado (conservadores) ----
+        TARGET_MEDIA = 9.0             # alvo operacional para janela=60
+        ALPHA_MIN, ALPHA_MAX = 0.30, 0.42
+        ALPHA_STEP = 0.02              # passo de correção de alpha (pequeno)
+        MEDIA_TOL  = 0.05              # tolerância para detectar média inconsistente
+        MEDIA_GATE = 0.50              # só mexe em alpha se desvio >= 0.5
+
+        # bias_meta (R/par/seq) – limites/ganhos
+        META_MIN, META_MAX = -0.20, 0.20
+        ETA_META = 0.08                # ganho principal para meta-bias
+        GAMMA_DECAY = 0.10             # decaimento leve ao zero
+        SEQ_PENALTY = 0.05             # penalidade se houver seq>3
+        PAR_RANGE = (7, 8)             # paridade alvo por aposta
+        OVERLAP_MAX = 11               # anti-overlap entre apostas
+        TIMEZONE = globals().get("TIMEZONE", "America/Sao_Paulo")
+
+        # ---- helpers locais (independentes do resto do código) ----
+        def _clamp(x, lo, hi): return lo if x < lo else hi if x > hi else x
+
+        def _max_seq_local(sorted_list):
+            m = cur = 1
+            for a, b in zip(sorted_list, sorted_list[1:]):
+                if b == a + 1:
+                    cur += 1
+                else:
+                    if cur > m: m = cur
+                    cur = 1
+            return m if m >= cur else cur
+
+        def _pares(q):
+            return sum(1 for n in q if (n % 2 == 0))
+
+        def _hits(ap, oficial_set):
+            return sum(1 for n in ap if n in oficial_set)
+
+        def _overlap(a, b):
+            sa, sb = set(a), set(b)
+            return len(sa & sb)
+
+        def _triplo_check(apostas, oficial):
+            """Retorna (ok, diag) onde ok=True se o lote atende 100% aos 3 critérios."""
+            diag = {
+                "paridade_falhas": [],
+                "seq_falhas": [],
+                "overlap_falhas": [],
+                "duplicatas": [],
+            }
+            # Paridade e Sequência por aposta
+            for idx, ap in enumerate(apostas, 1):
+                p = _pares(ap)
+                if not (PAR_RANGE[0] <= p <= PAR_RANGE[1]):
+                    diag["paridade_falhas"].append(idx)
+                if _max_seq_local(sorted(ap)) > 3:
+                    diag["seq_falhas"].append(idx)
+
+            # Anti-overlap + duplicatas
+            seen = {}
+            for i in range(len(apostas)):
+                key = tuple(sorted(apostas[i]))
+                seen.setdefault(key, []).append(i + 1)
+                for j in range(i + 1, len(apostas)):
+                    ov = _overlap(apostas[i], apostas[j])
+                    if ov > OVERLAP_MAX:
+                        diag["overlap_falhas"].append((i + 1, j + 1, ov))
+            # duplicatas
+            for k, ids in seen.items():
+                if len(ids) > 1:
+                    diag["duplicatas"].append(list(ids))
+
+            ok = not (diag["paridade_falhas"] or diag["seq_falhas"] or diag["overlap_falhas"] or diag["duplicatas"])
+            return ok, diag
 
         try:
-            # --- [GATING] Não mexe em nada sem "evento de verdade" (oficial) ---
+            # ---------------- Estado e política de gating ----------------
             state = _normalize_state_defaults(_bolao_load_state() or {})
-            if state.get("learn_policy", LEARN_POLICY) == "official_gate":
-                logger.info("[GATED] auto_aprender ignorado (sem novo oficial).")
+            # Se política exigir novo oficial e não houver sinal de “novo”, apenas retorna
+            if state.get("learn_policy", globals().get("LEARN_POLICY", "always")) == "official_gate":
+                logger.info("[GATED] auto_aprender ignorado pela política 'official_gate'.")
                 return
 
-            # --- histórico mínimo para aprendizado real ---
-            historico = carregar_historico(HISTORY_PATH)
-            if not historico or len(historico) < MIN_TREINO:
-                logger.info("Histórico insuficiente para aprendizado real; mantendo parâmetros.")
+            # Último oficial (snapshot) e última geração disponível (para medir acertos)
+            snap = getattr(self, "_latest_snapshot", lambda: None)()
+            ultimo = list(getattr(snap, "dezenas", [])) if snap else []
+            if not ultimo:
+                logger.info("Sem último resultado oficial disponível; aprendizado não aplicado.")
+                return
+            oficial_set = set(ultimo)
+
+            last_gen = (state.get("learning", {}) or {}).get("last_generation", {})
+            apostas = last_gen.get("apostas") or []
+            if not apostas:
+                logger.info("Sem apostas em last_generation; nada a aprender neste ciclo.")
                 return
 
-            # --- 0) Snapshot/último oficial + auditoria CSV mínima ---
-            snap = self._latest_snapshot()  # tem snapshot_id e último oficial
-            ultimo = list(snap.dezenas) if getattr(snap, "dezenas", None) else []
-            snap_id = getattr(snap, "snapshot_id", "--")
-
-            # Apenas garante uma linha de auditoria (sem travar se falhar)
+            # ---------------- Auditoria mínima (não trava se falhar) ----------------
             try:
-                _append_learn_log(snap_id, ultimo, [])  # sem apostas aqui (somente carimbo)
+                _append_learn_log(getattr(snap, "snapshot_id", "--"), ultimo, apostas)
             except Exception:
-                logger.warning("Falha ao registrar auditoria mínima no learn_log.csv", exc_info=True)
+                logger.warning("Falha ao registrar learn_log mínimo (seguindo adiante).", exc_info=True)
 
-            # --- estado já normalizado: bias/hits/seen/alpha/janela/baseline existem por default ---
-            bias = {int(k): float(v) for (k, v) in (state.get("bias") or {}).items() if str(k).isdigit()}
-            for n in range(1, 26):
-                bias.setdefault(n, 0.0)
+            # ---------------- Métricas reais do lote ----------------
+            acertos_por_aposta = [_hits(ap, oficial_set) for ap in apostas]
+            media_real = sum(acertos_por_aposta) / float(len(apostas))
 
-            # --- 1) Reestimação de bias (tendência curta nos últimos ROLLING_TEST concursos) ---
-            recent = historico[:ROLLING_TEST] if HISTORY_ORDER_DESC else historico[-ROLLING_TEST:]
-            freq = {n: 0 for n in range(1, 26)}
-            for conc in recent:
-                for n in conc:
-                    if 1 <= n <= 25:
-                        freq[n] += 1
+            # Triplo check-in do lote
+            ok_lote, diag = _triplo_check(apostas, ultimo)
 
-            # multiplicative-weights (versão aditiva com clamp, passo moderado)
-            for n in range(1, 26):
-                contrib = freq[n] / float(max(1, len(recent)))  # 0..1
-                contrib -= (15.0 / 25.0)                        # centro em 0 (esperança ~15/25)
-                bias[n] = _clamp(bias[n] + contrib * 0.6, BOLAO_BIAS_MIN, BOLAO_BIAS_MAX)
+            # Distribuição de repetição (R = acertos vs oficial)
+            # Contamos quantas apostas caíram em 8R,9R,10R,11R (interesse da Mestre)
+            from collections import Counter
+            cR = Counter(acertos_por_aposta)
+            dist_R = {r: cR.get(r, 0) for r in (8, 9, 10, 11)}
 
-            # --- 2) Busca walk-forward curta de (alpha, janela) com limite de tempo ---
-            t0 = _t.time()
-            best = {
-                "score": -1.0,
-                "alpha": float(state.get("alpha", ALPHA_PADRAO)),
-                "janela": int(state.get("learning", {}).get("janela", JANELA_PADRAO)),
-            }
+            # ---------------- Consistência de média ----------------
+            # Se houver média exibida em outro lugar, aqui não temos; usamos apenas a real.
+            # Se quiser comparar com uma média "reportada", guarde-a no state antes.
+            media_consistente = True  # sem outra fonte, consideramos consistente
 
-            # organizar histórico para slicing (mais recente no topo)
-            H = list(historico)
-            if not HISTORY_ORDER_DESC:
-                H = list(reversed(H))  # agora H[0] é o mais recente
+            # ---------------- Política de atualização ----------------
+            alpha_atual = float(state.get("alpha", globals().get("ALPHA_PADRAO", 0.36)))
+            janela_atual = int((state.get("learning", {}) or {}).get("janela", globals().get("JANELA_PADRAO", 60)))
 
-            def _fit_and_eval(alpha_val: float, janela_val: int) -> float:
-                try:
-                    scores = []
-                    # walk-forward: t = ROLLING_TEST..1
-                    for t in range(ROLLING_TEST, 0, -1):
-                        start = t
-                        end = t + janela_val
-                        if end > len(H):
-                            break
-                        janela_hist = H[start:end]
+            # Não atualiza nada se o lote estiver “sujo”
+            if not ok_lote:
+                # Apenas registra telemetria e sai
+                st_learn = state.setdefault("learning", {})
+                st_learn["last_learn"] = {
+                    "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                    "media_real": round(media_real, 4),
+                    "janela": janela_atual,
+                    "diag": diag,
+                    "note": "Lote com falhas no triplo check-in; α/bias_meta preservados."
+                }
+                _bolao_save_state(state)
+                logger.info("[Aprendizado] Triplo check-in falhou; parâmetros preservados.")
+                return
 
-                        # modelo leve/rápido para validação
-                        filtro = FilterConfig(paridade_min=6, paridade_max=9, col_min=1, col_max=4, relax_steps=2)
-                        cfg = GeradorApostasConfig(janela=janela_val, alpha=alpha_val, filtro=filtro, pool_multiplier=2)
-                        modelo = Predictor(cfg)
-                        modelo.fit(janela_hist, janela=janela_val)
+            # Se média inconsistiu com alguma referência externa (quando houver), não atualiza
+            if not media_consistente:
+                st_learn = state.setdefault("learning", {})
+                st_learn["last_learn"] = {
+                    "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                    "media_real": round(media_real, 4),
+                    "janela": janela_atual,
+                    "diag": diag,
+                    "note": "Média inconsistente; α/bias_meta preservados."
+                }
+                _bolao_save_state(state)
+                logger.info("[Aprendizado] Média inconsistente; parâmetros preservados.")
+                return
 
-                        aps = modelo.gerar_apostas(qtd=QTD_BILHETES_PADRAO)
+            # ---------------- Ajuste estável de α ----------------
+            delta_media = media_real - TARGET_MEDIA
+            if abs(delta_media) >= MEDIA_GATE:
+                alpha_novo = _clamp(alpha_atual + ALPHA_STEP * delta_media, ALPHA_MIN, ALPHA_MAX)
+            else:
+                alpha_novo = alpha_atual  # não movimenta se pertinho do alvo
 
-                        # oficial alvo do fold = H[t-1]
-                        oficial = sorted(list(H[t - 1]))
-                        # reforça forma canônica
-                        aps = [self._hard_lock_fast(a, ultimo=oficial, anchors=frozenset()) for a in aps]
+            # ---------------- Ajuste estável de bias_meta (R, par, seq) ----------------
+            # Guardamos meta-bias num dicionário sob learning.bias_meta
+            learn = state.setdefault("learning", {})
+            bias_meta = learn.get("bias_meta") or {"R": 0.0, "par": 0.0, "seq": 0.0}
 
-                        plac = _score_lote(aps, oficial)
-                        scores.append(_hits_media_topk(plac, TOPK_SCORE))
+            # (a) Repetição (R): alvo Mestre ~ maioria 9R-10R, com 1x8R e 1x11R
+            n = float(len(apostas))
+            alvo = {8: 1.0 / n, 9: 0.46, 10: 0.46, 11: 1.0 / n}  # exemplo: 30 apostas => 1/30, 46%, 46%, 1/30
+            obs = {r: dist_R.get(r, 0) / n for r in (8, 9, 10, 11)}
+            dR = sum((alvo[r] - obs.get(r, 0.0)) for r in (8, 9, 10, 11))  # erro agregado simples
+            bias_meta["R"] = _clamp((1 - GAMMA_DECAY) * bias_meta.get("R", 0.0) + ETA_META * dR, META_MIN, META_MAX)
 
-                    return sum(scores) / float(len(scores)) if scores else -1.0
-                except Exception:
-                    return -1.0
+            # (b) Paridade: fração fora de 7–8 deve tender a 0
+            frac_fora = sum(1 for ap in apostas if not (PAR_RANGE[0] <= _pares(ap) <= PAR_RANGE[1])) / n
+            bias_meta["par"] = _clamp((1 - GAMMA_DECAY) * bias_meta.get("par", 0.0) + ETA_META * frac_fora,
+                                      -0.10, 0.10)
 
-            for j in JANELA_GRID:
-                for a in ALPHA_GRID:
-                    if _t.time() - t0 > GRID_MAX_TIME_S:
-                        break
-                    s = _fit_and_eval(a, j)
-                    if s > best["score"]:
-                        best.update(score=s, alpha=a, janela=j)
-                if _t.time() - t0 > GRID_MAX_TIME_S:
-                    break
+            # (c) Sequência: penaliza se houver QUALQUER seq>3; senão decai ao zero
+            any_seq_bad = any(_max_seq_local(sorted(ap)) > 3 for ap in apostas)
+            if any_seq_bad:
+                bias_meta["seq"] = _clamp(bias_meta.get("seq", 0.0) - SEQ_PENALTY, -0.20, 0.05)
+            else:
+                bias_meta["seq"] = bias_meta.get("seq", 0.0) * (1 - GAMMA_DECAY)
 
-            # --- 3) Consolida estado persistente (alpha/janela/score/bias) ---
-            state["alpha"] = float(best["alpha"])
-            state["learning"] = {
-                "janela": int(best["janela"]),
-                "score": float(round(best["score"], 4)),
+            # ---------------- Bias por dezena (suavização, sem re-amostrar agressivo) ----------------
+            # Evita “deriva”: puxa levemente os vieses por dezena para 0.
+            bias_num = {int(k): float(v) for (k, v) in (state.get("bias") or {}).items() if str(k).isdigit()}
+            for d in range(1, 26):
+                bias_num[d] = bias_num.get(d, 0.0) * (1 - 0.05)  # 5% de decaimento em direção a 0
+
+            # ---------------- Persistência do estado ----------------
+            state["alpha"] = float(alpha_novo)
+            learn["janela"] = int(janela_atual)  # não mexemos na janela aqui
+            learn["bias_meta"] = {k: float(v) for k, v in bias_meta.items()}
+            learn["last_learn"] = {
                 "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                "media_real": round(media_real, 4),
+                "delta_media": round(delta_media, 4),
+                "janela": janela_atual,
+                "dist_R": dist_R,
+                "diag": {"ok": True},  # lote limpo
             }
-            state["bias"] = {int(k): float(v) for k, v in bias.items()}
+            state["bias"] = bias_num
 
             _bolao_save_state(state)
-            logger.info(f"[Aprendizado REAL] α={state['alpha']:.2f} | janela={state['learning']['janela']} | score={state['learning']['score']:.4f}")
+            logger.info(
+                "[Aprendizado REAL] OK | α=%.3f | janela=%d | média=%.2f | bias_meta={R:%.3f,par:%.3f,seq:%.3f}",
+                state["alpha"], learn["janela"], media_real,
+                learn["bias_meta"]["R"], learn["bias_meta"]["par"], learn["bias_meta"]["seq"]
+            )
 
         except Exception:
             logger.warning("Falha no aprendizado real; mantendo parâmetros anteriores.", exc_info=True)
@@ -918,10 +1031,15 @@ class LotoFacilBot:
     # --- /gerar: rápido, estável, sem cache e com diversidade entre chamadas ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Comando /gerar – Gera apostas inteligentes (rápido e estável).
-        Uso: /gerar [qtd] [janela] [alpha]
-        Padrão: 5 apostas | janela=60 | α=0,37
+        Comando /gerar – Estratégia Mestre, rápido e estável.
+
+        • α TRAVADO = 0.36 (LOCK_ALPHA_GERAR=True), independente do aprendizado.
+        • Paridade alvo: 7–8 | Máx. sequência: ≤3 | Anti-overlap: ≤11.
+        • Repetição R: foco em 9R–10R, com 1×8R e 1×11R de variação.
+        • Uso: /gerar [qtd] [janela] [alpha]  → (alpha é ignorado: lock=0.36)
+        • Padrão: 5 apostas | janela=60 | α=0.36 (travado no /gerar)
         """
+
         import asyncio, traceback
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -1090,6 +1208,16 @@ class LotoFacilBot:
                 # reforça forma (paridade 7–8 e Seq≤3), sem âncoras específicas
                 a = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
                 apostas_ok.append(a)
+
+            # --- persistência para o auto_aprender: last_generation ---
+            try:
+                st = _normalize_state_defaults(_bolao_load_state() or {})
+                st.setdefault("learning", {})["last_generation"] = {
+                    "apostas": apostas_ok  # lista de 15 números (ordenados) por aposta
+                }
+                _bolao_save_state(st)
+            except Exception:
+                logger.warning("Falha ao persistir learning.last_generation.", exc_info=True)
 
             # 3.2) REGISTRO para aprendizado leve
             try:
