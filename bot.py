@@ -195,6 +195,10 @@ ALPHA_MIN,  ALPHA_MAX  = 0.05, 0.95
 HISTORY_PATH = "data/history.csv"
 WHITELIST_PATH = "whitelist.txt"
 
+# --- Alpha lock (apenas no /gerar) ---
+LOCK_ALPHA_GERAR = True      # deixe True para travar /gerar em 0.36
+ALPHA_LOCK_VALUE  = 0.36     # valor travado só para /gerar
+
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
 
@@ -580,6 +584,29 @@ class LotoFacilBot:
             return qtd, janela, alpha
         except Exception:
             return QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
+        
+    def _alpha_para_comando(self, cmd: str, alpha_sugerido: float | None = None) -> float:
+        """
+        Retorna o alpha efetivo conforme o comando.
+        - /gerar -> trava em 0.36 se LOCK_ALPHA_GERAR=True
+        - demais -> usa 'alpha_sugerido' se vier, senão o alpha dinâmico do estado (self.st['learning']['alpha'])
+        """
+        # 1) tenta pegar α dinâmico do estado
+        alpha_dinamico = 0.36
+        try:
+            st = getattr(self, "st", None) or {}
+            learning = st.get("learning") or {}
+            alpha_dinamico = float(learning.get("alpha", 0.36))
+        except Exception:
+            alpha_dinamico = 0.36
+
+        # 2) decide base
+        base = alpha_sugerido if isinstance(alpha_sugerido, (int, float)) else alpha_dinamico
+
+        # 3) aplica lock apenas no /gerar
+        if cmd == "/gerar" and LOCK_ALPHA_GERAR:
+            return float(ALPHA_LOCK_VALUE)
+        return float(base)
 
     def _ultimo_resultado(self, historico) -> List[int]:
         """
@@ -932,6 +959,10 @@ class LotoFacilBot:
         qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
         target_qtd = max(1, int(qtd))  # garante respeitar /gerar 50, etc.
 
+        # >>> trava α somente no /gerar (sem afetar demais comandos)
+        alpha = self._alpha_para_comando("/gerar", alpha_sugerido=alpha)
+        # <<< trava α somente no /gerar
+
         # Histórico/último seguro
         try:
             historico = carregar_historico(HISTORY_PATH)
@@ -962,7 +993,7 @@ class LotoFacilBot:
                         if n not in keep:
                             keep.append(n)
                             if len(keep) == 15:
-                                break
+                               break
                 a = keep
             elif len(a) < 15:
                 comp = [n for n in universo if n not in a]
@@ -1090,15 +1121,25 @@ class LotoFacilBot:
                 logger.warning("Falha ao registrar pending_batch.", exc_info=True)
             # <<< FIM NOVO
 
-            # 4) Formatação + envio (usa α persistido no estado, se existir)
+            # >>> alpha efetivo usado no /gerar (já travado pelo _alpha_para_comando)
+            alpha_usado = alpha
+            # <<<
+
+            # 4) Formatação + envio (usa α efetivo do /gerar)
             try:
                 st = _normalize_state_defaults(_bolao_load_state() or {})
             except Exception:
                 st = None
+            # Mantemos a leitura do estado caso você use em outros lugares,
+            # mas para a resposta vamos exibir o alpha_usado (travado no /gerar).
             alpha_eff = float(st.get("alpha", alpha)) if isinstance(st, dict) else alpha
 
             try:
-                resposta = self._formatar_resposta(apostas_ok, janela, alpha_eff)
+                # TROQUE esta linha (que usava alpha_eff):
+                # resposta = self._formatar_resposta(apostas_ok, janela, alpha_eff)
+
+                # PELA linha abaixo (usa o α realmente aplicado no /gerar):
+                resposta = self._formatar_resposta(apostas_ok, janela, alpha_usado)
             except Exception:
                 # Fallback de formatação (mantém seu visual atual)
                 linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
@@ -1110,9 +1151,12 @@ class LotoFacilBot:
                         f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
                     )
                 if SHOW_TIMESTAMP:
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
                     now_sp = datetime.now(ZoneInfo(TIMEZONE))
                     carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    linhas.append(f"<i>janela={janela} | α={alpha_eff:.2f} | {carimbo}</i>")
+                    # Aqui também use o alpha_usado:
+                    linhas.append(f"<i>janela={janela} | α={alpha_usado:.2f} (travado em /gerar)</i>")
                 resposta = "\n".join(linhas)
 
             # 5) Saída
