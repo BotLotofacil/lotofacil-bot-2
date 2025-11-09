@@ -177,7 +177,7 @@ except Exception:
 # ========================
 # Parâmetros padrão do gerador
 # ========================
-# Quantidade: permitir até 200 no /gerar
+# Quantidade: permitir até 50 no /gerar
 QTD_BILHETES_PADRAO = 5
 QTD_BILHETES_MIN = 1
 QTD_BILHETES_MAX = 200
@@ -624,70 +624,6 @@ class LotoFacilBot:
             suffix = f"\n\n<i>Parte {i}/{total}</i>" if total > 1 else ""
             await update.message.reply_text(p + suffix, parse_mode=parse_mode)
 
-    # ---------- Helpers de travamento de parâmetros (/gerar) ----------
-    def _get_param_locks(self) -> dict:
-        """
-        Lê travas persistentes de parâmetros em data/bolao_state.json.
-        Estrutura esperada:
-          {
-            "locks": {
-              "enabled": true/false,
-              "scope": "gerar_only" | "full",
-              "janela": 60,
-              "alpha": 0.36,
-              "bias_scalars": {"R": 0.023, "par": 0.016, "seq": 0.05}
-            }
-          }
-        Retorna dicionário normalizado com defaults seguros.
-        """
-        try:
-            st = _normalize_state_defaults(_bolao_load_state() or {})
-            locks = dict((st.get("locks") or {}))
-            enabled = bool(locks.get("enabled", True))  # default: travado
-            scope = str(locks.get("scope", "gerar_only"))
-            j = int(locks.get("janela", JANELA_PADRAO))
-            a = float(locks.get("alpha", ALPHA_PADRAO))
-            bias_scalars = dict(locks.get("bias_scalars") or {})
-            # normaliza bias
-            bR  = float(bias_scalars.get("R",   0.0))
-            bPa = float(bias_scalars.get("par", 0.0))
-            bSq = float(bias_scalars.get("seq", 0.0))
-            # clamp defensivo
-            _, j, a = self._clamp_params(QTD_BILHETES_PADRAO, j, a)
-            return {
-                "enabled": enabled,
-                "scope": scope,
-                "janela": j,
-                "alpha": a,
-                "bias_scalars": {"R": bR, "par": bPa, "seq": bSq},
-            }
-        except Exception:
-            return {
-                "enabled": True,
-                "scope": "gerar_only",
-                "janela": JANELA_PADRAO,
-                "alpha": ALPHA_PADRAO,
-                "bias_scalars": {"R": 0.0, "par": 0.0, "seq": 0.0},
-            }
-
-    def _apply_param_locks(self, qtd: int, janela: int, alpha: float):
-        """
-        Aplica travas (se habilitadas). Retorna:
-          (qtd, janela_eff, alpha_eff, bias_scalars_eff, locked_flag, scope)
-        """
-        qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
-        locks = self._get_param_locks()
-        if locks.get("enabled", False):
-            return (
-                qtd,
-                int(locks["janela"]),
-                float(locks["alpha"]),
-                dict(locks["bias_scalars"]),
-                True,
-                str(locks.get("scope", "gerar_only")),
-            )
-        return (qtd, janela, alpha, {"R": 0.0, "par": 0.0, "seq": 0.0}, False, "gerar_only")
-
     # ------------- Gerador preditivo -------------
     def _gerar_apostas_inteligentes(
         self,
@@ -738,7 +674,7 @@ class LotoFacilBot:
         1) Loga última geração + oficial (CSV).
         2) Reestima viés por dezena (janela curta ROLLING_TEST).
         3) Busca rápida (grade + tempo limitado) de (janela, alpha) via walk-forward.
-        4) Atualiza estado persistente (alpha, bias, contadores) — respeitando locks.
+        4) Atualiza estado persistente (alpha, bias, contadores).
         5) Não trava o bot se falhar.
         """
         from datetime import datetime
@@ -842,39 +778,14 @@ class LotoFacilBot:
                 if _t.time() - t0 > GRID_MAX_TIME_S:
                     break
 
-            # --- 3) Consolida estado persistente (alpha/janela/score/bias) — respeitando locks ---
-            locks = (_bolao_load_state() or {}).get("locks") or {}
-            lock_enabled = bool(locks.get("enabled", False))
-            lock_scope = str(locks.get("scope", "gerar_only"))
-            lock_bias = dict((locks.get("bias_scalars") or {}))
-
-            if lock_enabled and lock_scope == "gerar_only":
-                # Não altera alpha/janela/bias – mantém apenas score e timestamp (telemetria ok)
-                state["learning"] = {
-                    "janela": int(state.get("learning", {}).get("janela", JANELA_PADRAO)),
-                    "score": float(round(best["score"], 4)),
-                    "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
-                }
-                # Reforça α travado/Bias travado no state (para consistência visual)
-                state["alpha"] = float(locks.get("alpha", state.get("alpha", ALPHA_PADRAO)))
-                if lock_bias:
-                    # mantém bias por dezena intocado; aqui só espelha scalars no state se desejar
-                    state.setdefault("bias_scalars", {})
-                    state["bias_scalars"] = {
-                        "R": float(lock_bias.get("R", 0.0)),
-                        "par": float(lock_bias.get("par", 0.0)),
-                        "seq": float(lock_bias.get("seq", 0.0)),
-                    }
-                # NÃO atualiza state["bias"] (vetor por dezena)
-            else:
-                # Sem lock: atualiza normalmente
-                state["alpha"] = float(best["alpha"])
-                state["learning"] = {
-                    "janela": int(best["janela"]),
-                    "score": float(round(best["score"], 4)),
-                    "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
-                }
-                state["bias"] = {int(k): float(v) for k, v in bias.items()}
+            # --- 3) Consolida estado persistente (alpha/janela/score/bias) ---
+            state["alpha"] = float(best["alpha"])
+            state["learning"] = {
+                "janela": int(best["janela"]),
+                "score": float(round(best["score"], 4)),
+                "updated_at": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+            }
+            state["bias"] = {int(k): float(v) for k, v in bias.items()}
 
             _bolao_save_state(state)
             logger.info(f"[Aprendizado REAL] α={state['alpha']:.2f} | janela={state['learning']['janela']} | score={state['learning']['score']:.4f}")
@@ -936,7 +847,6 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("diagbase", self.diagbase))
         self.app.add_handler(CommandHandler("ping", self.ping))
         self.app.add_handler(CommandHandler("versao", self.versao))
-        self.app.add_handler(CommandHandler("locks", self.locks))
         self.app.add_handler(CommandHandler("mestre_bolao", self.mestre_bolao))
         self.app.add_handler(CommandHandler("refinar_bolao", self.refinar_bolao))
         self.app.add_handler(CommandHandler("estado_bolao", self.estado_bolao))
@@ -978,12 +888,12 @@ class LotoFacilBot:
         )
         await update.message.reply_text(mensagem, parse_mode="HTML")
 
-    # --- /gerar: rápido, estável, com TRAVAS de parâmetros e diversidade entre chamadas ---
+    # --- /gerar: rápido, estável, sem cache e com diversidade entre chamadas ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Comando /gerar – Gera apostas inteligentes (rápido e estável).
-        Quando locks.enabled=True: ignora argumentos e usa janela/α/bias do estado.
-        Travado conforme: janela=60 | α=0.36 | bias_scalars={R:+0.023, par:+0.016, seq:+0.05}
+        Uso: /gerar [qtd] [janela] [alpha]
+        Padrão: 5 apostas | janela=60 | α=0,37
         """
         import asyncio, traceback
         from datetime import datetime
@@ -1004,10 +914,10 @@ class LotoFacilBot:
                 await update.message.reply_text(warn)
         # <<< anti-abuso
 
-        # Defaults (só serão usados se lock estiver desligado)
+        # Defaults
         qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
 
-        # Parse argumentos posicionais (opcionais, aceitos apenas se lock OFF)
+        # Parse argumentos posicionais (opcionais)
         try:
             if context.args and len(context.args) >= 1:
                 qtd = int(context.args[0])
@@ -1016,16 +926,11 @@ class LotoFacilBot:
             if context.args and len(context.args) >= 3:
                 alpha = float(context.args[2].replace(",", "."))
         except Exception:
-            pass  # mantém defaults se houver erro de parse
+            pass  # mantém defaults
 
-        # Aplica travas persistentes (se enabled=True); devolve efetivos e flag
-        (qtd,
-         janela_eff,
-         alpha_eff,
-         bias_scalars_eff,
-         is_locked,
-         lock_scope) = self._apply_param_locks(qtd, janela, alpha)
-        target_qtd = max(1, int(qtd))
+        # Clamps defensivos
+        qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
+        target_qtd = max(1, int(qtd))  # garante respeitar /gerar 50, etc.
 
         # Histórico/último seguro
         try:
@@ -1046,13 +951,32 @@ class LotoFacilBot:
             a = [int(x) for x in a if 1 <= int(x) <= 25]
             a = sorted(set(a))
             if len(a) > 15:
-                a = a[:15]
+                keep = []
+                for n in a:
+                    if len(keep) == 15:
+                        break
+                    if (len(keep) % 2 == 0 and n in u_set) or (len(keep) % 2 == 1 and n not in u_set):
+                        keep.append(n)
+                if len(keep) < 15:
+                    for n in a:
+                        if n not in keep:
+                            keep.append(n)
+                            if len(keep) == 15:
+                                break
+                a = keep
             elif len(a) < 15:
                 comp = [n for n in universo if n not in a]
                 for n in comp:
-                    a.append(n)
-                    if len(a) == 15:
-                        break
+                    if (n - 1 not in a) and (n + 1 not in a):
+                        a.append(n)
+                        if len(a) == 15:
+                            break
+                if len(a) < 15:
+                    for n in comp:
+                        if n not in a:
+                            a.append(n)
+                            if len(a) == 15:
+                                break
                 a = sorted(a)
             return a
 
@@ -1085,35 +1009,9 @@ class LotoFacilBot:
                 base.append(_selar(a))
             return base
 
-        # --------- Preditor SEM cache (injeta bias_scalars se suportado) ----------
+        # --------- Preditor SEM cache (sempre gera lote novo) ----------
         async def _run_preditor():
-            def _go():
-                filtro = FilterConfig(paridade_min=6, paridade_max=9, col_min=1, col_max=4, relax_steps=2)
-                cfg = GeradorApostasConfig(
-                    janela=janela_eff,
-                    alpha=alpha_eff,
-                    filtro=filtro,
-                    pool_multiplier=3,
-                )
-                # tenta acoplar os vieses travados na config/modelo
-                try:
-                    setattr(cfg, "bias_scalars", dict(bias_scalars_eff))
-                except Exception:
-                    pass
-
-                modelo = Predictor(cfg)
-                try:
-                    if hasattr(modelo, "set_bias_scalars"):
-                        modelo.set_bias_scalars(bias_scalars_eff)
-                    elif hasattr(modelo, "bias_scalars"):
-                        modelo.bias_scalars = dict(bias_scalars_eff)
-                except Exception:
-                    # compatibilidade silenciosa se a versão não suportar
-                    pass
-
-                modelo.fit(ultimos_n_concursos(historico, janela_eff), janela=janela_eff)
-                return modelo.gerar_apostas(qtd=target_qtd)
-            return await asyncio.to_thread(_go)
+            return await asyncio.to_thread(self._gerar_apostas_inteligentes, target_qtd, janela, alpha)
 
         # --------- Pipeline principal ----------
         try:
@@ -1141,7 +1039,7 @@ class LotoFacilBot:
                     apostas.append(_selar(extra))
                     seen.add(t)
 
-            # 3) Pós-filtro unificado (forma + dedup/overlap)
+            # 3) Pós-filtro unificado (forma + dedup/overlap + bias + forma)
             if ultimo:
                 try:
                     apostas = self._pos_filtro_unificado(apostas, ultimo)
@@ -1149,70 +1047,78 @@ class LotoFacilBot:
                     logger.warning("pos_filtro_unificado falhou; aplicando hard_lock por aposta.", exc_info=True)
                     apostas = [self._hard_lock_fast(a, ultimo, anchors=frozenset()) for a in apostas]
             else:
+                # histórico indisponível: aplica ao menos o hard_lock
                 apostas = [self._hard_lock_fast(a, ultimo=[], anchors=frozenset()) for a in apostas]
 
-            # 3.1) Corte ao target e validação final
+            # 3.1) Corte ao target e validação teimosa final (belt and suspenders)
             apostas_ok = []
             for a in apostas[:target_qtd]:
                 a = _selar(a)
                 if len(a) != 15 or len(set(a)) != 15:
                     a = _selar(_canon(a))
+                # reforça forma (paridade 7–8 e Seq≤3), sem âncoras específicas
                 a = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
                 apostas_ok.append(a)
 
-            # 3.2) Registro para aprendizado leve (não altera α/bias travados)
+            # 3.2) REGISTRO para aprendizado leve
             try:
                 self._registrar_geracao(apostas_ok, base_resultado=ultimo or [])
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/gerar).", exc_info=True)
 
-            # 3.3) Registrar pending_batches (com α/janela/bias efetivos)
+            # >>> NOVO: registrar o lote no estado (pending_batches)
             try:
                 st = _normalize_state_defaults(_bolao_load_state() or {})
                 batches = st.get("pending_batches", [])
+
                 batches.append({
                     "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
                     "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
-                    "alpha": float(st.get("alpha", alpha_eff)),
-                    "janela": int((st.get("learning") or {}).get("janela", janela_eff)),
-                    "bias_scalars": {k: float(v) for k, v in bias_scalars_eff.items()},
+                    "alpha": float(st.get("alpha", ALPHA_PADRAO)),
+                    "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
                     "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
                     "qtd": len(apostas_ok),
+                    # opcional: salvar as apostas (atenção ao tamanho do estado)
                     "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_ok],
-                    "locked": bool(is_locked),
-                    "lock_scope": lock_scope,
                 })
+
+                # mantém histórico curto de lotes pendentes
                 st["pending_batches"] = batches[-100:]
                 _bolao_save_state(st)
+
             except Exception:
                 logger.warning("Falha ao registrar pending_batch.", exc_info=True)
+            # <<< FIM NOVO
 
-            # 4) Formatação + envio (rodapé mostra lock e bias quando ativo)
+            # 4) Formatação + envio (usa α persistido no estado, se existir)
             try:
-                rodape = f"janela={janela_eff} | α={alpha_eff:.2f}"
-                if is_locked:
-                    br = bias_scalars_eff
-                    rodape += f" | bias[R]={br['R']:+.3f} bias[par]={br['par']:+.3f} bias[seq]={br['seq']:+.3f} | travado"
-                now_sp = datetime.now(ZoneInfo(TIMEZONE))
-                carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+                st = _normalize_state_defaults(_bolao_load_state() or {})
+            except Exception:
+                st = None
+            alpha_eff = float(st.get("alpha", alpha)) if isinstance(st, dict) else alpha
 
+            try:
+                resposta = self._formatar_resposta(apostas_ok, janela, alpha_eff)
+            except Exception:
+                # Fallback de formatação (mantém seu visual atual)
                 linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
-                for i, aposta in enumerate(apostas_ok, 1):
-                    pares = sum(1 for n in aposta if n % 2 == 0)
+                for i, a in enumerate(apostas_ok, 1):
+                    pares = self._contar_pares(a) if hasattr(self, "_contar_pares") else sum(1 for n in a if n % 2 == 0)
+                    seq = self._max_seq(a) if hasattr(self, "_max_seq") else 0
                     linhas.append(
-                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
-                        f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
+                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                        f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
                     )
                 if SHOW_TIMESTAMP:
-                    linhas.append(f"<i>{rodape} | {carimbo}</i>")
+                    now_sp = datetime.now(ZoneInfo(TIMEZONE))
+                    carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    linhas.append(f"<i>janela={janela} | α={alpha_eff:.2f} | {carimbo}</i>")
                 resposta = "\n".join(linhas)
-            except Exception:
-                # Fallback de formatação (mantém visual atual)
-                resposta = self._formatar_resposta(apostas_ok, janela_eff, alpha_eff, is_locked, bias_scalars_eff)
 
+            # 5) Saída
             await self._send_long(update, resposta, parse_mode="HTML")
 
-            # Opcional: auto_aprender (com lock ligado no escopo gerar_only, ele só telemetra)
+            # Opcional: auto_aprender (com gating ativo ele retorna sem mexer)
             try:
                 await self.auto_aprender(update, context)
             except Exception:
@@ -1222,18 +1128,8 @@ class LotoFacilBot:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
 
-    def _formatar_resposta(
-        self,
-        apostas: List[List[int]],
-        janela: int,
-        alpha: float,
-        locked: bool = False,
-        bias_scalars: dict | None = None
-    ) -> str:
-        """Formata a resposta com apostas + rodapé informativo (compatível com lock)."""
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
+    def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
+        """Formata a resposta com apostas + rodapé informativo."""
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
         for i, aposta in enumerate(apostas, 1):
             pares = sum(1 for n in aposta if n % 2 == 0)
@@ -1241,154 +1137,11 @@ class LotoFacilBot:
                 f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in aposta)}\n"
                 f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
             )
-
         if SHOW_TIMESTAMP:
             now_sp = datetime.now(ZoneInfo(TIMEZONE))
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-            rodape = f"janela={janela} | α={alpha:.2f}"
-            if locked and bias_scalars:
-                rodape += f" | bias[R]={bias_scalars.get('R',0.0):+.3f} " \
-                          f"bias[par]={bias_scalars.get('par',0.0):+.3f} " \
-                          f"bias[seq]={bias_scalars.get('seq',0.0):+.3f} | travado"
-            linhas.append(f"<i>{rodape} | {carimbo}</i>")
-
+            linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
         return "\n".join(linhas)
-    
-    async def locks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        /locks — Admin: liga/desliga travas, ajusta parâmetros e consulta estado.
-
-        Exemplos:
-          /locks                          -> mostra estado atual
-          /locks on                       -> enabled=true
-          /locks off                      -> enabled=false
-          /locks scope=gerar_only         -> escopo "gerar_only"
-          /locks scope=full               -> escopo "full"
-          /locks alpha=0.36 janela=60     -> ajusta alpha/janela travados
-          /locks R=0.023 par=0.016 seq=0.05 -> ajusta bias_scalars travados
-          /locks show                     -> sinônimo de status
-
-        Observação: valores são validados pelos clamps do bot.
-        """
-        user_id = update.effective_user.id
-        if not self._is_admin(user_id):
-            return await update.message.reply_text("⛔ Apenas o administrador pode usar /locks.")
-
-        # Carrega estado e locks atuais (com saneamento)
-        st = _normalize_state_defaults(_bolao_load_state() or {})
-        locks = dict(st.get("locks") or {})
-        # defaults seguros
-        locks.setdefault("enabled", True)
-        locks.setdefault("scope", "gerar_only")
-        locks.setdefault("janela", JANELA_PADRAO)
-        locks.setdefault("alpha", ALPHA_PADRAO)
-        locks.setdefault("bias_scalars", {"R": 0.0, "par": 0.0, "seq": 0.0})
-
-        # Sem argumentos -> apenas mostra
-        args = [a.strip() for a in (context.args or [])]
-        if not args or args == ["show"]:
-            return await self._locks__reply_status(update, locks)
-
-        # Atalhos 'on'/'off'
-        if len(args) == 1 and args[0].lower() in ("on", "off"):
-            locks["enabled"] = (args[0].lower() == "on")
-            st["locks"] = locks
-            _bolao_save_state(st)
-            return await self._locks__reply_status(update, locks, changed=True)
-
-        # Parse chave=valor (aceita vírgula decimal)
-        kv = {}
-        for tok in args:
-            if "=" in tok:
-                k, v = tok.split("=", 1)
-                kv[k.strip().lower()] = v.strip().replace(",", ".")
-            else:
-                # tokens soltos (ex.: 'show') já tratados acima; ignorar outros
-                pass
-
-        changed = False
-
-        # scope
-        if "scope" in kv:
-            scope = kv["scope"].lower()
-            if scope in ("gerar_only", "full"):
-                locks["scope"] = scope
-                changed = True
-
-        # alpha/janela (com clamp)
-        qtmp, jtmp, atmp = self._clamp_params(QTD_BILHETES_PADRAO,
-                                              int(kv.get("janela", locks["janela"])) if kv.get("janela") else locks["janela"],
-                                              float(kv.get("alpha", locks["alpha"])) if kv.get("alpha") else locks["alpha"])
-        if jtmp != locks["janela"]:
-            locks["janela"] = jtmp; changed = True
-        if abs(atmp - float(locks["alpha"])) > 1e-12:
-            locks["alpha"] = float(atmp); changed = True
-
-        # bias_scalars (R, par, seq)
-        bs = dict(locks.get("bias_scalars") or {})
-        def _maybe_set_float(key):
-            nonlocal changed
-            if key in kv:
-                try:
-                    val = float(kv[key])
-                    bs[key] = float(val)
-                    changed = True
-                except Exception:
-                    pass
-
-        _maybe_set_float("R")
-        _maybe_set_float("par")
-        _maybe_set_float("seq")
-        locks["bias_scalars"] = {"R": float(bs.get("R", 0.0)),
-                                 "par": float(bs.get("par", 0.0)),
-                                 "seq": float(bs.get("seq", 0.0))}
-
-        # Persiste se houve mudanças
-        if changed:
-            st["locks"] = locks
-            _bolao_save_state(st)
-
-        return await self._locks__reply_status(update, locks, changed=changed)
-
-    async def _locks__reply_status(self, update: Update, locks: dict, changed: bool = False):
-        """Formata a resposta do /locks (JSON + resumo legível)."""
-        import json
-        enabled = bool(locks.get("enabled", False))
-        scope = str(locks.get("scope", "gerar_only"))
-        janela = int(locks.get("janela", JANELA_PADRAO))
-        alpha = float(locks.get("alpha", ALPHA_PADRAO))
-        bs = dict(locks.get("bias_scalars") or {})
-        bs.setdefault("R", 0.0); bs.setdefault("par", 0.0); bs.setdefault("seq", 0.0)
-
-        bloco_json = {
-            "locks": {
-                "enabled": enabled,
-                "scope": scope,
-                "janela": janela,
-                "alpha": alpha,
-                "bias_scalars": {
-                    "R": float(bs["R"]),
-                    "par": float(bs["par"]),
-                    "seq": float(bs["seq"]),
-                }
-            }
-        }
-
-        resumo = [
-            "<b>LOCKS</b>",
-            f"• enabled: <b>{'ON' if enabled else 'OFF'}</b>",
-            f"• scope: <b>{scope}</b>",
-            f"• janela: <b>{janela}</b> | α: <b>{alpha:.2f}</b>",
-            f"• bias_scalars: R=<b>{bs['R']:+.3f}</b>  par=<b>{bs['par']:+.3f}</b>  seq=<b>{bs['seq']:+.3f}</b>",
-            "",
-            "<i>Dica:</i> /locks on | /locks off | /locks scope=gerar_only | /locks scope=full",
-            "       /locks alpha=0.36 janela=60 R=0.023 par=0.016 seq=0.05",
-        ]
-
-        prefix = "✅ Atualizado.\n\n" if changed else ""
-        txt = prefix + "\n".join(resumo) + "\n\n<pre>" + json.dumps(bloco_json, ensure_ascii=False, indent=2) + "</pre>"
-        return await update.message.reply_text(txt, parse_mode="HTML")
-
 
     # ---------- Utilitários Mestre (baseado só no último resultado) ----------
     @staticmethod
@@ -1611,7 +1364,7 @@ class LotoFacilBot:
         ]
         return [sorted(a) for a in norm]
     
-    # ---------- Aprendizado leve por bias (pós-swap controlado) -----------
+        # ---------- Aprendizado leve por bias (pós-swap controlado) -----------
     def _aplicar_bias(self, apostas: list[list[int]]) -> list[list[int]]:
         """
         Aplica viés leve pós-geração:
@@ -1677,7 +1430,7 @@ class LotoFacilBot:
         out = [self._hard_lock_fast(a, ultimo, anchors=frozenset()) for a in out]
         return [sorted(a) for a in out]
 
-    # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
+        # ---------- UTILITÁRIOS DE SELAGEM FINAL E DEDUP -----------
     def _enforce_rules(self, a: list[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
         """
         Garante paridade 7–8 e seq<=3, preservando âncoras quando possível.
@@ -1749,7 +1502,7 @@ class LotoFacilBot:
         apostas = [self._enforce_rules(a, anchors=anchors) for a in apostas]
         return [sorted(a) for a in apostas]
     
-    # ---------- LOCK RÁPIDO (paridade 7–8 e Seq≤3) -----------
+        # ---------- LOCK RÁPIDO (paridade 7–8 e Seq≤3) -----------
     def _hard_lock_fast(self, aposta: list[int], ultimo: list[int] | set[int], anchors=frozenset(), alvo_par=(7, 8), max_seq=3) -> list[int]:
         """
         Enforca rapidamente a forma:
@@ -4194,13 +3947,27 @@ class LotoFacilBot:
     async def auto_aprender(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Aprendizado leve entre concursos / após fechamento de ciclo:
-        CAMADA 1 (micro por dezena) e CAMADA 2 (macro estrutural R/par/seq/alpha).
-        Respeita travas em data/bolao_state.json > locks.
+        Faz duas camadas de adaptação:
+
+        CAMADA 1 (micro por dezena):
+        - Lê a última geração salva em st["learning"]["last_generation"]["apostas"].
+        - Compara cada aposta com o último resultado oficial (self._ultimo_resultado()).
+        - Para cada dezena (1..25):
+            · Se a dezena apareceu nas apostas e saiu no resultado oficial → recompensa (BOLAO_BIAS_HIT).
+            · Se a dezena apareceu e NÃO saiu → penaliza (BOLAO_BIAS_MISS).
+          Âncoras (ex: 09 e 11) usam escala reduzida (BOLAO_BIAS_ANCHOR_SCALE).
+        - Atualiza mapas de 'bias' (por dezena), 'hits' e 'seen'
+          e salva snapshot atual.
+
+        CAMADA 2 (macro estrutural):
+        - Mede a média de acertos do lote (mu).
+        - Mede desvio de paridade alvo (7–8), seq ≤3, e alvo de repetição ideal (9R–10R).
+        - Ajusta bias agregados 'R', 'paridade', 'seq' em st["bias"]
+          e ajusta alpha (st["alpha"]) levemente dentro da faixa [0.30, 0.42].
+
+        Por fim, persiste tudo em bolao_state.json e retorna um resumo rápido.
         """
         from statistics import mean
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
         try:
             # ===== 0) Carregar estado atual e histórico =====
             st = _normalize_state_defaults(_bolao_load_state() or {})
@@ -4215,6 +3982,7 @@ class LotoFacilBot:
             last_gen = learning.get("last_generation", {}) or {}
             ult_apostas: list[list[int]] = last_gen.get("apostas", []) or []
 
+            # se não tem apostas registradas, não tem o que aprender
             if not ult_apostas:
                 await update.message.reply_text(
                     "🤖 Aprendizado leve: nenhuma geração registrada. (Nada a ajustar ainda.)"
@@ -4224,15 +3992,20 @@ class LotoFacilBot:
             # carrega histórico oficial para saber o último resultado sorteado
             historico = carregar_historico(HISTORY_PATH)
             if not historico:
-                await update.message.reply_text("🤖 Aprendizado leve: histórico indisponível.")
+                await update.message.reply_text(
+                    "🤖 Aprendizado leve: histórico indisponível."
+                )
                 return
 
-            oficial = self._ultimo_resultado(historico)  # lista ordenada com 15 dezenas
+            oficial = self._ultimo_resultado(historico)  # lista de 15 dezenas sorteadas, ordenada
             oficial_set = set(int(x) for x in oficial)
 
             # ===== 1) CAMADA MICRO - ajuste de bias por dezena =====
+            # normaliza bias numérico por dezena
             bias_num = {}
             for k, v in (st.get("bias") or {}).items():
+                # st["bias"] pode ter chaves 'R','paridade','seq' misturadas com '1','2',...,
+                # então só absorvemos os inteiros válidos 1..25 aqui
                 try:
                     kk = int(k)
                     if 1 <= kk <= 25:
@@ -4249,57 +4022,67 @@ class LotoFacilBot:
             for aposta in ult_apostas:
                 aposta_set = set(int(x) for x in aposta)
                 for dez in range(1, 26):
-                    # seen: conta tentativas por dezena
-                    if dez in aposta_set:
-                        seen_map[str(dez)] = int(seen_map.get(str(dez), 0)) + 1
+                    # seen: conta quantas vezes tentamos usar a dezena
+                    seen_map[str(dez)] = int(seen_map.get(str(dez), 0)) + (1 if dez in aposta_set else 0)
 
-                        if dez in oficial_set:
-                            # recompensa
-                            scale = BOLAO_BIAS_ANCHOR_SCALE if dez in anchors_set else 1.0
-                            delta = BOLAO_BIAS_HIT * scale
-                            hits_map[str(dez)] = int(hits_map.get(str(dez), 0)) + 1
-                        else:
-                            # penaliza
-                            scale = BOLAO_BIAS_ANCHOR_SCALE if dez in anchors_set else 1.0
-                            delta = BOLAO_BIAS_MISS * scale
+                    # calculo delta de bias para aquela dezena
+                    if dez in aposta_set and dez in oficial_set:
+                        # A dezena estava na aposta e realmente saiu no resultado → recompensa
+                        scale = BOLAO_BIAS_ANCHOR_SCALE if dez in anchors_set else 1.0
+                        delta = BOLAO_BIAS_HIT * scale
+                        hits_map[str(dez)] = int(hits_map.get(str(dez), 0)) + 1
+                    elif dez in aposta_set and dez not in oficial_set:
+                        # A dezena estava na aposta mas NÃO saiu → penaliza
+                        scale = BOLAO_BIAS_ANCHOR_SCALE if dez in anchors_set else 1.0
+                        delta = BOLAO_BIAS_MISS * scale
+                    else:
+                        # dez não estava na aposta → não mexe
+                        continue
 
-                        bias_num[dez] = _clamp(
-                            float(bias_num.get(dez, 0.0)) + float(delta),
-                            float(BOLAO_BIAS_MIN),
-                            float(BOLAO_BIAS_MAX),
-                        )
+                    # aplica clamp após somar delta
+                    bias_num[dez] = _clamp(
+                        float(bias_num.get(dez, 0.0)) + float(delta),
+                        float(BOLAO_BIAS_MIN),
+                        float(BOLAO_BIAS_MAX),
+                    )
 
-            # snapshot atual (para auditoria)
+            # atualiza snapshot_id atual
             snap = self._latest_snapshot()
-            st["last_snapshot"] = getattr(snap, "snapshot_id", "--")
+            st["last_snapshot"] = snap.snapshot_id
 
             # ===== 2) CAMADA MACRO - ajuste estrutural (alpha, R, paridade, seq) =====
+            # média de acertos reais por aposta
             hits_list = [self._contar_acertos(ap, oficial) for ap in ult_apostas]
             mu_hits = mean(hits_list) if hits_list else 0.0
 
+            # seq média e violações de seq>3
             seq_list = [self._max_seq(ap) for ap in ult_apostas]
             seq_mu = mean(seq_list) if seq_list else 0.0
             seq_viol = sum(1 for s in seq_list if s > 3)
 
+            # paridade média (pares)
+            # self._paridade(ap) deve retornar (pares, impares)
             pares_medios = mean(self._paridade(ap)[0] for ap in ult_apostas) if ult_apostas else 0.0
 
-            # alvo repetição global (9R–10R ~ 9.5)
+            # alvo de repetição global (9R–10R ~ 9.5)
             alvo_R = 9.5
-            delta_R = mu_hits - alvo_R
+            delta_R = mu_hits - alvo_R  # positivo = repetindo demais (talvez overfit), negativo = repetindo pouco
 
+            # carregamos (ou criamos) bias agregados 'R', 'paridade', 'seq'
             bias_global_R   = float((st.get("bias") or {}).get("R", 0.0))
             bias_global_par = float((st.get("bias") or {}).get("paridade", 0.0))
             bias_global_seq = float((st.get("bias") or {}).get("seq", 0.0))
 
             # ganhos pequenos e estáveis
-            k_R = 0.02
-            k_P = 0.01
-            k_S = 0.02
- 
+            k_R = 0.02  # quão rápido corrigimos alvo de repetição
+            k_P = 0.01  # quão rápido empurramos paridade pro 7.5 pares
+            k_S = 0.02  # quão rápido punimos sequência longa
+
             bias_global_R  -= k_R * delta_R
             bias_global_par += k_P * (7.5 - pares_medios)
             bias_global_seq += k_S * ((seq_mu - 3.0) + 0.5 * (seq_viol / max(1, len(ult_apostas))))
 
+            # clamp seguro dessas componentes globais
             def _clamp_local(x, lo, hi):
                 return max(lo, min(hi, x))
 
@@ -4307,79 +4090,55 @@ class LotoFacilBot:
             bias_global_par = _clamp_local(bias_global_par, -0.15,  0.15)
             bias_global_seq = _clamp_local(bias_global_seq, -0.20,  0.20)
 
+            # atualiza alpha (α)
             alpha_atual = float(st.get("alpha", ALPHA_PADRAO))
             if   mu_hits < 9.0:
-                delta_alpha = -0.01
+                delta_alpha = -0.01  # média baixa → tenta abrir mais diversidade
             elif mu_hits > 10.0:
-                delta_alpha = 0.01
+                delta_alpha = 0.01   # média alta → tenta concentrar mais repetição
             else:
                 delta_alpha = 0.0
+
             alpha_atual = _clamp_local(alpha_atual + delta_alpha, 0.30, 0.42)
 
-            # Monta bias novo (SEM COMMIT AINDA)
+            # ===== 3) Persistir tudo em st e salvar disco =====
+            # Monta dicionário final de bias misturando:
+            # - bias_num por dezena (1..25)
+            # - chaves especiais globais ('R', 'paridade', 'seq')
             new_bias_out: dict[str, float] = {}
+            # primeiro salva viés por dezena
             for dez, val in bias_num.items():
                 new_bias_out[str(dez)] = float(val)
-            new_bias_out["R"]        = round(bias_global_R,   6)
-            new_bias_out["paridade"] = round(bias_global_par, 6)
-            new_bias_out["seq"]      = round(bias_global_seq, 6)
+            # depois salva viés global estrutural
+            new_bias_out["R"]         = round(bias_global_R,   6)
+            new_bias_out["paridade"]  = round(bias_global_par, 6)
+            new_bias_out["seq"]       = round(bias_global_seq, 6)
 
-            # ===== 3) Respeitar LOCK ao persistir =====
-            locks = (_bolao_load_state() or {}).get("locks") or {}
-            lock_enabled = bool(locks.get("enabled", False))
-            lock_scope   = str(locks.get("scope", "gerar_only"))
-            lock_alpha   = float(locks.get("alpha", ALPHA_PADRAO))
-            lock_bias_sc = dict(locks.get("bias_scalars") or {})
-            lock_R   = float(lock_bias_sc.get("R",   0.0))
-            lock_Par = float(lock_bias_sc.get("par", 0.0))
-            lock_Seq = float(lock_bias_sc.get("seq", 0.0))
-
-            # Sempre atualizar hits/seen/last_auto/updated_at (telemetria segura)
+            st["bias"] = new_bias_out
             st["hits"] = hits_map
             st["seen"] = seen_map
-            st.setdefault("learning", {})
-            st["learning"]["updated_at"] = datetime.now(ZoneInfo(TIMEZONE)).isoformat()
+            st["alpha"] = round(alpha_atual, 4)
             st["last_auto"] = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-            if lock_enabled and lock_scope in ("gerar_only", "full"):
-                # NÃO altera alpha/bias quando lock ON
-                alpha_para_exibir = lock_alpha
-                R_para_exibir     = lock_R
-                par_para_exibir   = lock_Par
-                seq_para_exibir   = lock_Seq
-
-                # opcional: espelhar scalars para UI
-                st["alpha"] = float(lock_alpha)
-                st["bias_scalars"] = {"R": lock_R, "par": lock_Par, "seq": lock_Seq}
-                # st["bias"] (por dezena) permanece como estava (não comitamos new_bias_out)
-
-            else:
-                # Lock OFF -> aplica normalmente
-                st["alpha"] = round(alpha_atual, 4)
-                st["bias"] = new_bias_out
-                # scalars espelhados (conveniência para UI)
-                alpha_para_exibir = st["alpha"]
-                R_para_exibir     = float(new_bias_out["R"])
-                par_para_exibir   = float(new_bias_out["paridade"])
-                seq_para_exibir   = float(new_bias_out["seq"])
-                st["bias_scalars"] = {"R": R_para_exibir, "par": par_para_exibir, "seq": seq_para_exibir}
 
             _bolao_save_state(st)
 
-            # ===== 4) Mensagem final (mostra TRAVADO quando lock ON) =====
-            linhas = []
-            linhas.append("📈 Aprendizado leve atualizado.")
-            linhas.append(f"• Lote avaliado: {len(ult_apostas)} apostas")
-            linhas.append(f"• Média de acertos: {mu_hits:.2f}")
-            linhas.append(f"• α agora: {alpha_para_exibir:.2f}")
-            linhas.append(
-                f"• bias[R]={R_para_exibir:+.3f}  bias[par]={par_para_exibir:+.3f}  bias[seq]={seq_para_exibir:+.3f}"
-            )
-            msg_leve = "\n".join(linhas)
-            await self._send_long(update, msg_leve)
+            # ===== 4) Feedback resumido no chat =====
+            try:
+                await update.message.reply_text(
+                    "📈 Aprendizado leve atualizado.\n"
+                    f"• Lote avaliado: {len(ult_apostas)} apostas\n"
+                    f"• Média de acertos: {mu_hits:.2f}\n"
+                    f"• α agora: {st['alpha']:.2f}\n"
+                    f"• bias[R]={new_bias_out['R']:+.3f}  "
+                    f"bias[par]={new_bias_out['paridade']:+.3f}  "
+                    f"bias[seq]={new_bias_out['seq']:+.3f}"
+                )
+            except Exception:
+                # se der erro só no reply_text não queremos quebrar o fluxo
+                pass
 
         except Exception:
-            logger.warning("Falha no aprendizado leve; mantendo parâmetros anteriores.", exc_info=True)
+            logger.warning("auto_aprender falhou internamente.", exc_info=True)
 
     # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
     def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
