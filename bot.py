@@ -10,7 +10,7 @@ import json
 import time
 from collections import deque
 from functools import partial
-from typing import List, Set, Tuple
+from typing import List, Set, Tuple, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
