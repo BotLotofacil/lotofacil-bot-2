@@ -632,6 +632,23 @@ class LotoFacilBot:
             raise ValueError("Histórico vazio.")
         ult = historico[0] if HISTORY_ORDER_DESC else historico[-1]
         return sorted(list(ult))
+    
+    def _media_real_do_lote_persistido(self) -> float:
+        """
+        Lê o lote definitivo salvo em st["learning"]["last_generation"]["apostas"]
+        e calcula a média REAL de acertos contra o último oficial.
+        Robusto a falhas: retorna 0.00 se algo der errado.
+        """
+        try:
+            st = _normalize_state_defaults(_bolao_load_state() or {})
+            aps = (st.get("learning") or {}).get("last_generation", {}).get("apostas") or []
+            oficial = set(self._ultimo_resultado(carregar_historico(HISTORY_PATH)))
+            if aps:
+                hits = [sum(1 for n in a if n in oficial) for a in aps]
+                return round(sum(hits) / float(len(hits)), 2)
+            return 0.00
+        except Exception:
+            return 0.00
 
     def _latest_snapshot(self) -> _Snapshot:
         historico = carregar_historico(HISTORY_PATH)
@@ -642,7 +659,7 @@ class LotoFacilBot:
         h8 = _hash_dezenas(ultimo)
         snapshot_id = f"{tamanho}|{h8}"
         return _Snapshot(snapshot_id=snapshot_id, tamanho=tamanho, dezenas=ultimo)
-
+    
     async def _send_long(self, update: Update, text: str, parse_mode: str = "HTML"):
         # quebra por "blocos" separados por linhas em branco
         blocks = text.split("\n\n")
@@ -1216,12 +1233,50 @@ class LotoFacilBot:
                 a = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
                 apostas_ok.append(a)
 
-            # 3.1c) Passada final anti-overlap no lote final (garantia extra)
+            # 3.1b) **GARANTIA**: completa até target_qtd com overlap ≤ limite
+            try:
+                limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
+                apostas_ok = self._refill_to_target(
+                    apostas=apostas_ok,
+                    target_qtd=target_qtd,
+                    ultimo=ultimo or [],
+                    salt_base=call_salt,
+                    limite=limite_overlap
+                )
+            except Exception:
+                logger.warning("refill_to_target falhou; tentando fallback simples.", exc_info=True)
+                rep_salt = call_salt
+                seen = {tuple(x) for x in apostas_ok}
+                while len(apostas_ok) < target_qtd:
+                    rep_salt += 1
+                    extra = _fallback(1, rep_salt)[0]
+                    t = tuple(extra)
+                    if t not in seen:
+                        apostas_ok.append(_selar(extra))
+                        seen.add(t)
+
+            # 3.1c) Anti-overlap final (idempotente) antes do registro e formatação
             try:
                 limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
                 apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=limite_overlap)
             except Exception:
-                logger.warning("forcar_anti_overlap (final) falhou; seguindo mesmo assim.", exc_info=True)
+                logger.warning("anti-overlap final falhou; seguindo assim mesmo.", exc_info=True)
+
+            # 3.1d) Selagem final de SHAPE (garante paridade 7–8 e seq ≤3 após o anti-overlap final)
+            try:
+                apostas_ok = [
+                    self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+                    for a in apostas_ok
+                ]
+            except Exception:
+                logger.warning("Selagem final de shape falhou; aplicando ajuste básico aposta a aposta.", exc_info=True)
+                try:
+                    apostas_ok = [
+                        self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                        for a in apostas_ok
+                    ]
+                except Exception:
+                    pass  # último recurso: segue como está
 
             # --- persistência para o auto_aprender: last_generation ---
             try:
@@ -1263,6 +1318,27 @@ class LotoFacilBot:
                 logger.warning("Falha ao registrar pending_batch.", exc_info=True)
             # <<< FIM NOVO
 
+            # --- Mensagem "Aprendizado leve atualizado" com média REAL do lote persistido ---
+            try:
+                media_real = self._media_real_do_lote_persistido()
+
+                st_msg = _normalize_state_defaults(_bolao_load_state() or {})
+                alpha_atual = float(st_msg.get("alpha", ALPHA_PADRAO))
+                bias_meta = (st_msg.get("learning") or {}).get("bias_meta", {}) or {}
+
+                msg = (
+                    "📈 Aprendizado leve atualizado.\n"
+                    f"• Lote avaliado: {len(apostas_ok)} apostas\n"
+                    f"• Média de acertos: {media_real:.2f}\n"
+                    f"• α agora: {alpha_atual:.2f}\n"
+                    f"• bias[R]={bias_meta.get('R', 0.0):+.3f}  "
+                    f"bias[par]={bias_meta.get('par', 0.0):+.3f}  "
+                    f"bias[seq]={bias_meta.get('seq', 0.0):+.3f}"
+                )
+                await update.message.reply_text(msg)
+            except Exception:
+                logger.warning("Falha ao compor/enviar mensagem de aprendizado leve.", exc_info=True)
+
             # >>> alpha efetivo usado no /gerar (já travado pelo _alpha_para_comando)
             alpha_usado = alpha
             # <<<
@@ -1277,10 +1353,7 @@ class LotoFacilBot:
             alpha_eff = float(st.get("alpha", alpha)) if isinstance(st, dict) else alpha
 
             try:
-                # TROQUE esta linha (que usava alpha_eff):
-                # resposta = self._formatar_resposta(apostas_ok, janela, alpha_eff)
-
-                # PELA linha abaixo (usa o α realmente aplicado no /gerar):
+                # usa o α realmente aplicado no /gerar:
                 resposta = self._formatar_resposta(apostas_ok, janela, alpha_usado)
             except Exception:
                 # Fallback de formatação (mantém seu visual atual)
@@ -1293,11 +1366,8 @@ class LotoFacilBot:
                         f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
                     )
                 if SHOW_TIMESTAMP:
-                    from datetime import datetime
-                    from zoneinfo import ZoneInfo
                     now_sp = datetime.now(ZoneInfo(TIMEZONE))
                     carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    # Aqui também use o alpha_usado:
                     linhas.append(f"<i>janela={janela} | α={alpha_usado:.2f} (travado em /gerar)</i>")
                 resposta = "\n".join(linhas)
 
@@ -1355,7 +1425,7 @@ class LotoFacilBot:
     def _paridade(self, aposta: list[int]) -> tuple[int, int]:
         pares = sum(1 for x in aposta if x % 2 == 0)
         return pares, (len(aposta) - pares)
-
+    
     @staticmethod
     def _complemento(last_set):
         return [n for n in range(1, 26) if n not in last_set]
@@ -1494,6 +1564,66 @@ class LotoFacilBot:
                 return self._ajustar_paridade_e_seq(sorted(base), alvo_par=(7, 8), max_seq=3)
             except Exception:
                 return sorted(base)
+            
+    def _candidate_ok(self, cand: list[int], lote: list[list[int]], ultimo: list[int], limite: int) -> bool:
+        """Valida paridade 7–8, seq≤3, sem duplicar aposta e overlap ≤ limite com o lote."""
+        c = sorted(set(int(x) for x in cand if 1 <= int(x) <= 25))
+        if len(c) != 15:
+            return False
+        # shape
+        pares = sum(1 for n in c if n % 2 == 0)
+        if not (7 <= pares <= 8):
+            return False
+        try:
+            if self._max_seq(c) > 3:
+                return False
+        except Exception:
+            pass
+        # duplicata
+        if tuple(c) in {tuple(a) for a in lote}:
+            return False
+        # overlap
+        for a in lote:
+            if self._overlap_count(a, c) > limite:
+                return False
+        return True
+
+    def _refill_to_target(self, apostas: list[list[int]], target_qtd: int, ultimo: list[int], salt_base: int, limite: int) -> list[list[int]]:
+        """
+        Repõe apostas até atingir target_qtd, respeitando shape Mestre e overlap ≤ limite.
+        Usa o fallback determinístico com sal progressivo e selagem final.
+        """
+        universo = list(range(1, 26))
+
+        def _fallback_unit(salt: int) -> list[int]:
+            L = list(ultimo) or universo[:15]
+            C = [n for n in universo if n not in L]
+            offL = (salt * 3) % len(L)
+            offC = (salt * 5) % len(C) if C else 0
+            a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
+            try:
+                a = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            return sorted(set(a))[:15]
+
+        salt = max(1, int(salt_base))
+        guard = 0
+        while len(apostas) < target_qtd and guard < 400:
+            guard += 1
+            salt += 1
+            cand = _fallback_unit(salt)
+            # pequena diversificação: tente uma segunda reconstrução se bater em overlap
+            if not self._candidate_ok(cand, apostas, ultimo, limite):
+                cand = self._rebuild_candidate(cand, ultimo=ultimo or [])
+            if self._candidate_ok(cand, apostas, ultimo, limite):
+                # selagem teimosa final
+                try:
+                    cand = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset())
+                except Exception:
+                    cand = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
+                apostas.append(sorted(cand))
+        return apostas
 
     def _forcar_anti_overlap(self, apostas: list[list[int]], ultimo: list[int], limite: int = 11) -> list[list[int]]:
         """
