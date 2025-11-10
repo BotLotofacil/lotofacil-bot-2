@@ -1199,6 +1199,13 @@ class LotoFacilBot:
                 # histórico indisponível: aplica ao menos o hard_lock
                 apostas = [self._hard_lock_fast(a, ultimo=[], anchors=frozenset()) for a in apostas]
 
+            # 3.0b) Força anti-overlap ≤ limite (sem perder shape Mestre)
+            try:
+                limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
+                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo or [], limite=limite_overlap)
+            except Exception:
+                logger.warning("forcar_anti_overlap falhou; seguindo sem ajuste adicional.", exc_info=True)
+
             # 3.1) Corte ao target e validação teimosa final (belt and suspenders)
             apostas_ok = []
             for a in apostas[:target_qtd]:
@@ -1208,6 +1215,13 @@ class LotoFacilBot:
                 # reforça forma (paridade 7–8 e Seq≤3), sem âncoras específicas
                 a = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
                 apostas_ok.append(a)
+
+            # 3.1c) Passada final anti-overlap no lote final (garantia extra)
+            try:
+                limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
+                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=limite_overlap)
+            except Exception:
+                logger.warning("forcar_anti_overlap (final) falhou; seguindo mesmo assim.", exc_info=True)
 
             # --- persistência para o auto_aprender: last_generation ---
             try:
@@ -1446,6 +1460,93 @@ class LotoFacilBot:
             _ = tentar_quebrar_sequencias(a, comp)
 
         return sorted(a)
+    
+    def _overlap_count(self, a: list[int], b: list[int]) -> int:
+        return len(set(a) & set(b))
+
+    def _rebuild_candidate(self, base: list[int], ultimo: list[int]) -> list[int]:
+        """
+        Gera uma variação segura do bilhete 'base' para quebrar overlap alto.
+        Mantém shape Mestre (paridade 7–8, seq≤3).
+        """
+        try:
+            universo = list(range(1, 26))
+            fora = [n for n in universo if n not in base]
+
+            # Troca até 3 números, priorizando tirar os que estão em clusters (vizinhos)
+            troca = []
+            for n in base:
+                if (n - 1 in base) or (n + 1 in base):
+                    troca.append(n)
+                if len(troca) == 3:
+                    break
+
+            novo = [n for n in base if n not in troca]
+            comp = [n for n in fora if n not in novo][:len(troca)]
+            novo += comp
+            novo = sorted(set(novo))[:15]
+
+            # Reforça shape
+            novo = self._hard_lock_fast(novo, ultimo=ultimo or [], anchors=frozenset())
+            return sorted(novo)
+        except Exception:
+            try:
+                return self._ajustar_paridade_e_seq(sorted(base), alvo_par=(7, 8), max_seq=3)
+            except Exception:
+                return sorted(base)
+
+    def _forcar_anti_overlap(self, apostas: list[list[int]], ultimo: list[int], limite: int = 11) -> list[list[int]]:
+        """
+        Garante: sem duplicatas e overlap(a_i,a_j) ≤ limite.
+        Tenta reconstruir a aposta que mais viola até convergir ou esgotar tentativas.
+        """
+        apostas = [sorted(list(set(a))) for a in apostas]
+
+        # remove duplicatas exatas
+        uniq = []
+        seen = set()
+        for a in apostas:
+            t = tuple(a)
+            if t not in seen:
+                uniq.append(a)
+                seen.add(t)
+        apostas = uniq
+
+        MAX_ITERS = 40
+        it = 0
+        while it < MAX_ITERS:
+            it += 1
+            worst = None  # (ov, i, j)
+            for i in range(len(apostas)):
+                for j in range(i + 1, len(apostas)):
+                    ov = self._overlap_count(apostas[i], apostas[j])
+                    if ov > limite and (worst is None or ov > worst[0]):
+                        worst = (ov, i, j)
+            if not worst:
+                break  # convergiu
+            _, i, j = worst
+
+            def _score_shape(a):
+                pares = sum(1 for n in a if n % 2 == 0)
+                par_pen = abs(7.5 - pares)  # pequeno por volta de 7–8
+                try:
+                    smax = self._max_seq(a)
+                except Exception:
+                    smax = 4
+                return par_pen + (smax - 1) * 0.5
+
+            si = _score_shape(apostas[i])
+            sj = _score_shape(apostas[j])
+            idx_rebuild = i if si > sj else j
+
+            novo = self._rebuild_candidate(apostas[idx_rebuild], ultimo=ultimo)
+            # evita duplicata
+            if tuple(novo) in {tuple(x) for x in apostas if x is not apostas[idx_rebuild]}:
+                novo = self._rebuild_candidate(novo, ultimo=ultimo)
+
+            apostas[idx_rebuild] = sorted(novo)
+
+        return [sorted(a) for a in apostas]
 
     def _construir_aposta_por_repeticao(self, last_sorted, comp_sorted, repeticoes, offset_last=0, offset_comp=0):
         """
