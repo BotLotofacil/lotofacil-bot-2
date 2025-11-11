@@ -2260,6 +2260,7 @@ class LotoFacilBot:
         return len(sa & sb)
 
     # --- TRIPLO CHECK (stricto) ---
+    @staticmethod
     def _triplo_check_stricto(apostas: list[list[int]],
                               alvo_par=(7, 8),
                               max_seq: int = 3,
@@ -2297,7 +2298,6 @@ class LotoFacilBot:
             a = sorted(set(int(n) for n in a))  # únicos + ordenado
             norm.append(a)
 
-            # checagens por aposta
             erros = []
             if len(a) != 15:
                 erros.append(f"len={len(a)}≠15")
@@ -4709,7 +4709,7 @@ class LotoFacilBot:
             )
 
         # Enforce TRIPLO CHECK-IN antes de qualquer coisa
-        ok_lote, diag = _triplo_check_stricto(apostas)
+        ok_lote, diag = self._triplo_check_stricto(apostas)
         if not ok_lote:
             linhas = ["⛔ <b>TRIPLO CHECK-IN FALHOU</b> — bloqueando auditoria/aprendizado.\n"]
             if diag["paridade_falhas"]:
