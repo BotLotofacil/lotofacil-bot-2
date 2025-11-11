@@ -1328,66 +1328,67 @@ class LotoFacilBot:
             except Exception:
                 logger.warning("forcar_anti_overlap falhou; seguindo sem ajuste adicional.", exc_info=True)
 
-            # 3.1) Corte ao target e validação teimosa final (belt and suspenders)
+            # =====================================================================
+            # --------------------  SELAGEM DE SAÍDA (NOVO)  ----------------------
+            # Garante: paridade 7–8, seq≤3 e anti-overlap≤11 ANTES de persistir/mostrar
+            try:
+                OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+            except Exception:
+                OVERLAP_MAX = 11
+
+            # Normaliza forma
+            apostas = [sorted(set(a)) for a in apostas]
+
+            # 1) Paridade e sequência (corrige/descarta inválidas)
             apostas_ok = []
-            for a in apostas[:target_qtd]:
-                a = _selar(a)
-                if len(a) != 15 or len(set(a)) != 15:
-                    a = _selar(_canon(a))
-                # reforça forma (paridade 7–8 e Seq≤3), sem âncoras específicas
-                a = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
-                apostas_ok.append(a)
+            for a in apostas:
+                pares = sum(1 for n in a if n % 2 == 0)
+                if 7 <= pares <= 8 and self._max_seq(a) <= 3:
+                    apostas_ok.append(a)
+                else:
+                    # reparo rápido mantendo shape Mestre
+                    try:
+                        a_fix = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+                    except Exception:
+                        a_fix = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                    apostas_ok.append(sorted(set(a_fix)))
 
-            # 3.1b) **GARANTIA**: completa até target_qtd com overlap ≤ limite
+            # 2) Anti-overlap ≤ limite
             try:
-                limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
-                apostas_ok = self._refill_to_target(
-                    apostas=apostas_ok,
-                    target_qtd=target_qtd,
-                    ultimo=ultimo or [],
-                    salt_base=call_salt,
-                    limite=limite_overlap
-                )
+                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
             except Exception:
-                logger.warning("refill_to_target falhou; tentando fallback simples.", exc_info=True)
-                rep_salt = call_salt
-                seen = {tuple(x) for x in apostas_ok}
-                while len(apostas_ok) < target_qtd:
-                    rep_salt += 1
-                    extra = _fallback(1, rep_salt)[0]
-                    t = tuple(extra)
-                    if t not in seen:
-                        apostas_ok.append(_selar(extra))
-                        seen.add(t)
+                logger.warning("forcar_anti_overlap falhou; seguindo com lote atual.", exc_info=True)
 
-            # 3.1c) Anti-overlap final (idempotente) antes do registro e formatação
-            try:
-                limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
-                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=limite_overlap)
-            except Exception:
-                logger.warning("anti-overlap final falhou; seguindo assim mesmo.", exc_info=True)
+            # 3) Triplo check final; se reprovar por overlap → tenta reparo
+            ok_final, _diag_tc = self._triplo_check_stricto(apostas_ok)
+            if not ok_final:
+                try:
+                    apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+                except Exception:
+                    pass
 
-            # 3.1d) Selagem final de SHAPE (garante paridade 7–8 e seq ≤3 após o anti-overlap final)
+            # 4) Selagem final (garante 7–8 e seq≤3 após anti-overlap)
             try:
                 apostas_ok = [
                     self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
                     for a in apostas_ok
                 ]
             except Exception:
-                logger.warning("Selagem final de shape falhou; aplicando ajuste básico aposta a aposta.", exc_info=True)
-                try:
-                    apostas_ok = [
-                        self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                        for a in apostas_ok
-                    ]
-                except Exception:
-                    pass  # último recurso: segue como está
+                apostas_ok = [
+                    self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                    for a in apostas_ok
+                ]
+
+            # Usa a versão selada
+            apostas = [sorted(a) for a in apostas_ok]
+            # ------------------  FIM SELAGEM DE SAÍDA (NOVO)  --------------------
+            # =====================================================================
 
             # --- persistência para o auto_aprender: last_generation ---
             try:
                 st2 = _normalize_state_defaults(_bolao_load_state() or {})
                 st2.setdefault("learning", {})["last_generation"] = {
-                    "apostas": apostas_ok  # lista de 15 números (ordenados) por aposta
+                    "apostas": apostas  # lista de 15 números (ordenados) por aposta
                 }
                 _bolao_save_state(st2)
             except Exception:
@@ -1395,7 +1396,7 @@ class LotoFacilBot:
 
             # 3.2) REGISTRO para aprendizado leve
             try:
-                self._registrar_geracao(apostas_ok, base_resultado=ultimo or [])
+                self._registrar_geracao(apostas, base_resultado=ultimo or [])
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/gerar).", exc_info=True)
 
@@ -1410,9 +1411,9 @@ class LotoFacilBot:
                     "alpha": float(st3.get("alpha", ALPHA_PADRAO)),
                     "janela": int((st3.get("learning") or {}).get("janela", JANELA_PADRAO)),
                     "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
-                    "qtd": len(apostas_ok),
+                    "qtd": len(apostas),
                     # opcional: salvar as apostas (atenção ao tamanho do estado)
-                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_ok],
+                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
                 })
 
                 # mantém histórico curto de lotes pendentes
