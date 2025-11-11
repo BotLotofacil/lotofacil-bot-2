@@ -1323,8 +1323,11 @@ class LotoFacilBot:
 
             # 3.0b) Força anti-overlap ≤ limite (sem perder shape Mestre)
             try:
-                limite_overlap = globals().get("BOLAO_MAX_OVERLAP", 11)
-                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo or [], limite=limite_overlap)
+                limite_overlap_inicial = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+            except Exception:
+                limite_overlap_inicial = 11
+            try:
+                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo or [], limite=limite_overlap_inicial)
             except Exception:
                 logger.warning("forcar_anti_overlap falhou; seguindo sem ajuste adicional.", exc_info=True)
 
@@ -1359,7 +1362,7 @@ class LotoFacilBot:
             except Exception:
                 logger.warning("forcar_anti_overlap falhou; seguindo com lote atual.", exc_info=True)
 
-            # 3) Triplo check final; se reprovar por overlap → tenta reparo
+            # 3) Triplo check final; se reprovar por overlap → tenta reparo rápido
             ok_final, _diag_tc = self._triplo_check_stricto(apostas_ok)
             if not ok_final:
                 try:
@@ -1379,7 +1382,19 @@ class LotoFacilBot:
                     for a in apostas_ok
                 ]
 
-            # Usa a versão selada
+            # 5) REPARO CONTROLADO: garante aprovação no TRIPLO CHECK
+            try:
+                limite_overlap = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+            except Exception:
+                limite_overlap = 11
+            apostas_ok = self._reparar_ate_passar_triplo_check(
+                apostas=apostas_ok,
+                ultimo=ultimo or [],
+                limite_overlap=limite_overlap,
+                max_tentativas=3
+            )
+
+            # Usa a versão selada/reparada daqui em diante
             apostas = [sorted(a) for a in apostas_ok]
             # ------------------  FIM SELAGEM DE SAÍDA (NOVO)  --------------------
             # =====================================================================
@@ -1388,7 +1403,7 @@ class LotoFacilBot:
             try:
                 st2 = _normalize_state_defaults(_bolao_load_state() or {})
                 st2.setdefault("learning", {})["last_generation"] = {
-                    "apostas": apostas  # lista de 15 números (ordenados) por aposta
+                    "apostas": apostas_ok  # lista de 15 números (ordenados) por aposta
                 }
                 _bolao_save_state(st2)
             except Exception:
@@ -1396,7 +1411,7 @@ class LotoFacilBot:
 
             # 3.2) REGISTRO para aprendizado leve
             try:
-                self._registrar_geracao(apostas, base_resultado=ultimo or [])
+                self._registrar_geracao(apostas_ok, base_resultado=ultimo or [])
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/gerar).", exc_info=True)
 
@@ -1404,25 +1419,21 @@ class LotoFacilBot:
             try:
                 st3 = _normalize_state_defaults(_bolao_load_state() or {})
                 batches = st3.get("pending_batches", [])
-
                 batches.append({
                     "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
                     "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
                     "alpha": float(st3.get("alpha", ALPHA_PADRAO)),
                     "janela": int((st3.get("learning") or {}).get("janela", JANELA_PADRAO)),
                     "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
-                    "qtd": len(apostas),
+                    "qtd": len(apostas_ok),
                     # opcional: salvar as apostas (atenção ao tamanho do estado)
-                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
+                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_ok],
                 })
-
                 # mantém histórico curto de lotes pendentes
                 st3["pending_batches"] = batches[-100:]
                 _bolao_save_state(st3)
-
             except Exception:
                 logger.warning("Falha ao registrar pending_batch.", exc_info=True)
-            # <<< FIM NOVO
 
             # --- Mensagem "Aprendizado leve atualizado" com média REAL do lote persistido ---
             try:
@@ -1453,7 +1464,6 @@ class LotoFacilBot:
                     f"bias[seq]={bias_meta.get('seq', 0.0):+.3f}"
                 )
                 await update.message.reply_text(msg)
-
             except Exception:
                 logger.warning("Falha ao compor/enviar mensagem de aprendizado leve.", exc_info=True)
 
@@ -1479,7 +1489,6 @@ class LotoFacilBot:
                 if SHOW_TIMESTAMP:
                     now_sp = datetime.now(ZoneInfo(TIMEZONE))
                     carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    # rodapé claro com alpha travado/proposto
                     alpha_prop = (st.get("learning") or {}).get("alpha_proposto", None)
                     if st["locks"].get("alpha_travado", True):
                         if alpha_prop is None:
@@ -1537,6 +1546,42 @@ class LotoFacilBot:
                 cur = 1
         return best
     
+    # --- Helper: reparar lote até passar o TRIPLO CHECK ---
+    def _reparar_ate_passar_triplo_check(self, apostas: list[list[int]], ultimo: list[int] | None = None,
+                                         limite_overlap: int = 11, max_tentativas: int = 3) -> list[list[int]]:
+        """
+        Repara o lote garantindo: paridade 7–8, seq≤3, anti-overlap≤limite.
+    Tenta no máx. 'max_tentativas' ciclos de reparo.
+        """
+        ultimo = ultimo or []
+        for _ in range(max_tentativas):
+            # 1) corrige forma por aposta
+            fixadas = []
+            for a in apostas:
+                try:
+                    a2 = self._hard_lock_fast(a, ultimo=ultimo, anchors=frozenset())
+                except Exception:
+                    a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                fixadas.append(sorted(set(a2)))
+            apostas = fixadas
+
+            # 2) força anti-overlap
+            try:
+                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo, limite=limite_overlap)
+            except Exception:
+                pass
+
+            # 3) selagem final e verificação
+            try:
+                apostas = [self._hard_lock_fast(a, ultimo=ultimo, anchors=frozenset()) for a in apostas]
+            except Exception:
+                apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
+
+            ok, _ = self._triplo_check_stricto(apostas)
+            if ok:
+                break
+        return [sorted(a) for a in apostas]
+
     # ===== Helpers para métricas do aprendizado leve =====
     def _contar_acertos(self, aposta: list[int], resultado: list[int]) -> int:
         rset = set(int(x) for x in resultado if 1 <= int(x) <= 25)
