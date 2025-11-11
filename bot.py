@@ -1561,39 +1561,124 @@ class LotoFacilBot:
         return best
     
     # --- Helper: reparar lote até passar o TRIPLO CHECK ---
-    def _reparar_ate_passar_triplo_check(self, apostas: list[list[int]], ultimo: list[int] | None = None,
-                                         limite_overlap: int = 11, max_tentativas: int = 3) -> list[list[int]]:
+    def _reparar_ate_passar_triplo_check(
+        self,
+        apostas: list[list[int]],
+        ultimo: list[int] | None = None,
+        limite_overlap: int = 11,
+        max_tentativas: int = 5,
+    ) -> list[list[int]]:
         """
         Repara o lote garantindo: paridade 7–8, seq≤3, anti-overlap≤limite.
-    Tenta no máx. 'max_tentativas' ciclos de reparo.
+        Estratégia:
+          1) Lock de forma aposta a aposta (quebra corridas >3 e ajusta paridade).
+          2) Reduz overlap: identifica o par com pior overlap e substitui a aposta mais "conflitante"
+             por uma nova variação que:
+                - evita a interseção problemática,
+                - preserva 7–8 e seq≤3,
+                - tenta manter R (repetição) próximo do alvo (9–10).
+          3) Repete o ciclo até passar no Triplo Check ou esgotar tentativas.
         """
+        from itertools import combinations
+
         ultimo = ultimo or []
+        universo = list(range(1, 26))
+        u_set = set(ultimo)
+
+        def _hard_shape(a: list[int]) -> list[int]:
+            try:
+                b = self._hard_lock_fast(a, ultimo=ultimo, anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            b = sorted(set(int(x) for x in b if 1 <= int(x) <= 25))
+            # reforço: se por acaso voltou a ter seq longa, aplica ajuste básico
+            if self._max_seq(b) > 3 or not (7 <= sum(1 for n in b if n % 2 == 0) <= 8):
+                b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3)
+                b = sorted(set(b))
+            return b
+
+        def _overlap(a: list[int], b: list[int]) -> int:
+            return len(set(a) & set(b))
+
+        def _worst_pair(l: list[list[int]]) -> tuple[int, int, int]:
+            """retorna (i, j, ovmax) do pior par por overlap."""
+            worst = (None, None, -1)
+            for i, j in combinations(range(len(l)), 2):
+                ov = _overlap(l[i], l[j])
+                if ov > worst[2]:
+                    worst = (i, j, ov)
+            return worst
+
+        def _score_total_overlap(l: list[list[int]], idx: int) -> int:
+            return sum(_overlap(l[idx], l[k]) for k in range(len(l)) if k != idx)
+
+        def _nova_variacao(base: list[int], bloquear: set[int], alvo_R=(9, 10)) -> list[int]:
+            """
+            Gera uma variação determinística evitando 'bloquear' (interseção problemática).
+            Mantém ~metade de 'ultimo' (para R≈9–10) e completa com complemento evitando corridas.
+            """
+            base = [n for n in base if n not in bloquear]
+            keep = [n for n in base if n in u_set][:8]  # 7–8 do último
+            comp = [n for n in universo if n not in keep]
+            # completa evitando vizinhos diretos para reduzir seq
+            for n in comp:
+                if len(keep) == 15:
+                    break
+                if (n-1 not in keep) and (n+1 not in keep):
+                    keep.append(n)
+            if len(keep) < 15:
+                for n in comp:
+                    if len(keep) == 15:
+                        break
+                    if n not in keep:
+                        keep.append(n)
+            return _hard_shape(keep[:15])
+
+        apostas = [sorted(set(a)) for a in apostas]
+
         for _ in range(max_tentativas):
-            # 1) corrige forma por aposta
-            fixadas = []
-            for a in apostas:
-                try:
-                    a2 = self._hard_lock_fast(a, ultimo=ultimo, anchors=frozenset())
-                except Exception:
-                    a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                fixadas.append(sorted(set(a2)))
-            apostas = fixadas
+            # 1) lock de forma em todas
+            apostas = [_hard_shape(a) for a in apostas]
 
-            # 2) força anti-overlap
-            try:
-                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo, limite=limite_overlap)
-            except Exception:
-                pass
-
-            # 3) selagem final e verificação
-            try:
-                apostas = [self._hard_lock_fast(a, ultimo=ultimo, anchors=frozenset()) for a in apostas]
-            except Exception:
-                apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas]
-
-            ok, _ = self._triplo_check_stricto(apostas)
-            if ok:
+            # 2) checa overlap global
+            i, j, ov = _worst_pair(apostas)
+            if ov is None:
                 break
+            if ov <= limite_overlap:
+                ok, _ = self._triplo_check_stricto(apostas)
+                if ok:
+                    return [sorted(a) for a in apostas]
+                # mesmo com overlap ok, se ainda reprovar por forma, reforça shape e segue
+                apostas = [_hard_shape(a) for a in apostas]
+                ok, _ = self._triplo_check_stricto(apostas)
+                if ok:
+                    return [sorted(a) for a in apostas]
+                continue
+
+            # 3) reduzir overlap do pior par
+            # escolhe qual substituir: a mais "conflitante" com o lote
+            sco_i = _score_total_overlap(apostas, i)
+            sco_j = _score_total_overlap(apostas, j)
+            trocar = i if sco_i >= sco_j else j
+
+            inter = set(apostas[i]) & set(apostas[j])  # o que está causando o conflito
+            base  = apostas[trocar]
+            nova  = _nova_variacao(base, bloquear=inter)
+
+            # se, por acaso, nova ficou igual, force um giro simples
+            if set(nova) == set(base):
+                # rotaciona números fora do último p/ reduzir interseção
+                fora = [n for n in universo if n not in set(base)]
+                if fora:
+                    nova = sorted(set(list(base)[1:] + fora[:1]))
+                    nova = _hard_shape(nova)
+
+            apostas[trocar] = nova
+
+            # volta ao loop (novo ciclo), repetindo lock + checagem
+        # fim for
+
+        # se chegou aqui, retorna o melhor possível
         return [sorted(a) for a in apostas]
 
     # ===== Helpers para métricas do aprendizado leve =====
