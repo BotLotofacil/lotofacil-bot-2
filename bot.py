@@ -2259,37 +2259,93 @@ class LotoFacilBot:
         sa, sb = set(a), set(b)
         return len(sa & sb)
 
-    def _triplo_check_stricto(apostas):
-        """Retorna (ok, diag) garantindo: paridade 7–8, seq<=3, anti-overlap<=11, sem duplicatas."""
-        diag = {
-            "paridade_falhas": [],
-            "seq_falhas": [],
-            "overlap_falhas": [],
-            "duplicatas": [],
-        }
-        # paridade/seq por aposta
-        for idx, ap in enumerate(apostas, 1):
-            p = _pares(ap)
-            if not (PAR_RANGE[0] <= p <= PAR_RANGE[1]):
-                diag["paridade_falhas"].append(idx)
-            if _max_seq_local(sorted(ap)) > 3:
-                diag["seq_falhas"].append(idx)
+    # --- TRIPLO CHECK (stricto) ---
+    def _triplo_check_stricto(apostas: list[list[int]],
+                              alvo_par=(7, 8),
+                              max_seq: int = 3,
+                              max_overlap: int = 11) -> tuple[bool, str]:
+        """
+        Valida o LOTE inteiro:
+          • Cada aposta: 15 dezenas únicas entre 1..25, paridade 7–8, sequência máxima ≤3
+          • Lote: sem duplicatas exatas e overlap(a_i, a_j) ≤ max_overlap para todo par
+        Retorna: (ok_lote: bool, diag_html: str)
+        """
 
-        # anti-overlap + duplicatas
-        seen = {}
-        for i in range(len(apostas)):
-            key = tuple(sorted(apostas[i]))
-            seen.setdefault(key, []).append(i + 1)
-            for j in range(i + 1, len(apostas)):
-                ov = _overlap(apostas[i], apostas[j])
-                if ov > OVERLAP_MAX:
-                    diag["overlap_falhas"].append((i + 1, j + 1, ov))
-        for k, ids in seen.items():
-            if len(ids) > 1:
-                diag["duplicatas"].append(list(ids))
+        def _max_seq_local(nums: list[int]) -> int:
+            s = sorted(nums)
+            run = best = 1
+            for i in range(1, len(s)):
+                if s[i] == s[i-1] + 1:
+                    run += 1
+                    if run > best:
+                        best = run
+                else:
+                    run = 1
+            return best
 
-        ok = not (diag["paridade_falhas"] or diag["seq_falhas"] or diag["overlap_falhas"] or diag["duplicatas"])
-        return ok, diag
+        def _overlap(a: list[int], b: list[int]) -> int:
+            return len(set(a) & set(b))
+
+        linhas = ["<b>🔎 TRIPLO CHECK (stricto)</b>"]
+        ok_lote = True
+
+        # Normaliza + valida cada aposta
+        norm = []
+        seen = set()
+        dup_count = 0
+        for idx, a in enumerate(apostas, 1):
+            a = sorted(set(int(n) for n in a))  # únicos + ordenado
+            norm.append(a)
+
+            # checagens por aposta
+            erros = []
+            if len(a) != 15:
+                erros.append(f"len={len(a)}≠15")
+            if not all(1 <= n <= 25 for n in a):
+                erros.append("fora do domínio 1..25")
+
+            pares = sum(1 for n in a if n % 2 == 0)
+            if not (alvo_par[0] <= pares <= alvo_par[1]):
+                erros.append(f"paridade={pares}")
+
+            smax = _max_seq_local(a)
+            if smax > max_seq:
+                erros.append(f"seq_max={smax}")
+
+            t = tuple(a)
+            if t in seen:
+                dup_count += 1
+                erros.append("duplicada no lote")
+            seen.add(t)
+
+            if erros:
+                ok_lote = False
+                linhas.append(f"• Aposta {idx:02d}: ❌ " + ", ".join(erros))
+            else:
+                linhas.append(f"• Aposta {idx:02d}: ✅ (pares={pares}, seq_max={smax})")
+
+        # Anti-overlap do lote
+        worst_ov = 0
+        worst_pair = None
+        for i in range(len(norm)):
+            for j in range(i+1, len(norm)):
+                ov = _overlap(norm[i], norm[j])
+                if ov > worst_ov:
+                    worst_ov = ov
+                    worst_pair = (i+1, j+1)
+        if worst_ov > max_overlap:
+            ok_lote = False
+            linhas.append(f"• Overlap máximo: ❌ {worst_ov} (> {max_overlap}) entre Aposta {worst_pair[0]:02d} e {worst_pair[1]:02d}")
+        else:
+            linhas.append(f"• Overlap máximo: ✅ {worst_ov} (≤ {max_overlap})")
+
+        if dup_count > 0:
+            ok_lote = False
+            linhas.append(f"• Duplicatas detectadas no lote: ❌ {dup_count}")
+        else:
+            linhas.append("• Duplicatas no lote: ✅ nenhuma")
+
+        return ok_lote, "\n".join(linhas)
 
     def _coocorrencias(apostas):
         """Retorna contagem de pares (i,j) que apareceram juntos no lote."""
