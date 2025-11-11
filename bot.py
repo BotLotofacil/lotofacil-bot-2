@@ -4695,21 +4695,18 @@ class LotoFacilBot:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
         
+    # --- Auditoria do lote + preparo do /refinar_bolão e dica do /mestre ---
     async def _auditar_e_preparar_refino(self, update, context, oficial_15: list[int]):
         """
-        Usa o último lote registrado (learning.last_generation.apostas) e o oficial fornecido
-        para:
+        Usa o último lote registrado (learning.last_generation.apostas) e o oficial fornecido para:
           - TRIPLO CHECK-IN (regra inquebrável)
           - Contar acertos reais por aposta, média, melhor
           - Detectar coocorrências 'fortes'
           - Calcular reward/penalty por dezena (âncoras com escala reduzida)
           - Preparar bloco /refinar_bolão (α=0.36, janela=60) pronto para colar
-          - Preparar bloco Mestre otimizado para o próximo concurso com 20–30% de R-alto
+          - Preparar bloco Mestre otimizado p/ próximo concurso com 20–30% de R-alto
         """
-        # Parâmetro de overlap (fallback=11 se não houver global)
-        OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
-
-        # Normaliza estado e recupera último lote
+        # --- carrega o último lote persistido ---
         st = _normalize_state_defaults(_bolao_load_state() or {})
         learn = st.get("learning") or {}
         last_gen = learn.get("last_generation") or {}
@@ -4717,49 +4714,62 @@ class LotoFacilBot:
 
         if not apostas:
             return await update.message.reply_text(
-                "Não encontrei um lote recente em memória (learning.last_generation). "
-                "Gere um lote e tente novamente."
+                "Não encontrei um lote recente em memória (learning.last_generation). Gere um lote e tente novamente."
             )
 
-        # ---------- TRIPLO CHECK (regra inquebrável) ----------
-        ok_lote, diag = self._triplo_check_stricto(apostas)
-        if not ok_lote:
-            linhas = ["⛔ <b>TRIPLO CHECK-IN FALHOU</b> — bloqueando auditoria/aprendizado.\n"]
+        # --- TRIPLO CHECK (não interrompe mais o relatório) ---
+        ok_lote, diag = self._triplo_check_stricto(apostas)  # retorna (bool, str) ou (bool, dict)
 
-            # Se 'diag' vier como dict (normal), formatamos; se vier string, mostramos direto
-            if isinstance(diag, dict):
-                linhas.append(self._formatar_triplo_check_diag(diag, max_overlap=OVERLAP_MAX))
-            else:
-                linhas.append(str(diag))
-
-            linhas.append("\nGere um novo lote conforme as regras e repita a confirmação.")
-            return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
-
-        # ---------- Oficial ----------
-        # Normaliza o oficial (garante ints no domínio e 15 únicos)
-        oficial_15 = sorted(set(int(n) for n in oficial_15 if 1 <= int(n) <= 25))[:15]
+        # --- métricas sempre calculadas (mesmo com reprovação) ---
         oficial_set = set(oficial_15)
 
-        # ---------- Métricas de acerto ----------
-        acertos = _hits_por_aposta(apostas, oficial_set)          # -> list[int]
-        media = sum(acertos) / float(len(acertos)) if acertos else 0.0
-        melhor = max(acertos) if acertos else 0
-        idx_melhores = [i + 1 for i, v in enumerate(acertos) if v == melhor]
+        def _hits_por_aposta(_aps: list[list[int]], _of: set[int]) -> list[int]:
+            return [sum(1 for n in a if n in _of) for a in _aps]
 
-        # ---------- Coocorrências ----------
-        cooc = _coocorrencias(apostas)                            # -> dict[(a,b)] = cont
+        def _coocorrencias(_aps: list[list[int]]):
+            from collections import Counter
+            c = Counter()
+            for a in _aps:
+                s = sorted(a)
+                for i in range(len(s)):
+                    for j in range(i+1, len(s)):
+                        c[(s[i], s[j])] += 1
+            return c
+
+        def _reward_penalty(_aps: list[list[int]], _of: set[int]):
+            # âncoras recebem escala reduzida
+            ANCHORS = set(globals().get("BOLAO_ANCHORS", (9, 11)))
+            HIT = float(globals().get("BOLAO_BIAS_HIT", +0.5))
+            MISS = float(globals().get("BOLAO_BIAS_MISS", -0.2))
+            SCALE = float(globals().get("BOLAO_BIAS_ANCHOR_SCALE", 0.5))
+            d = {n: 0.0 for n in range(1, 26)}
+            for a in _aps:
+                for n in a:
+                    if n in _of:
+                        d[n] += (HIT * (SCALE if n in ANCHORS else 1.0))
+                    else:
+                        d[n] += (MISS * (SCALE if n in ANCHORS else 1.0))
+            return d
+
+        def _format_dez(lst: list[int]) -> str:
+            return " ".join(f"{n:02d}" for n in sorted(lst))
+
+        acertos = _hits_por_aposta(apostas, oficial_set)
+        media = sum(acertos) / float(len(acertos))
+        melhor = max(acertos) if acertos else 0
+        idx_melhores = [i+1 for i, v in enumerate(acertos) if v == melhor]
+
+        cooc = _coocorrencias(apostas)
         top_pairs = sorted(cooc.items(), key=lambda kv: (-kv[1], kv[0]))[:10] if cooc else []
 
-        # ---------- Reward / Penalty por dezena ----------
-        deltas = _reward_penalty(apostas, oficial_set)            # -> dict[num] = delta(float)
+        deltas = _reward_penalty(apostas, oficial_set)
         recompensas = sorted([n for n, d in deltas.items() if d > 0], key=lambda n: (-deltas[n], n))
         penalizacoes = sorted([n for n, d in deltas.items() if d < 0], key=lambda n: (deltas[n], n))
 
-        # ---------- Bloco /refinar_bolão (α e janela preservados) ----------
-        alpha_fix = st.get("runtime", {}).get("alpha_usado", 0.36)     # mantém travado no runtime
-        janela_fix = int((st.get("learning") or {}).get("janela", 60)) # default 60
+        # ===== Bloco /refinar_bolão (α e janela preservados) =====
+        alpha_fix = st.get("runtime", {}).get("alpha_usado", 0.36)
+        janela_fix = int((st.get("learning") or {}).get("janela", 60))
 
-        # Normaliza mapa de bias para diffs aplicáveis
         bias_update_lines = []
         for n in range(1, 26):
             delta = deltas.get(n, 0.0)
@@ -4767,54 +4777,85 @@ class LotoFacilBot:
                 bias_update_lines.append(f"{n:02d}:{delta:+.3f}")
         bias_blob = " ".join(bias_update_lines) if bias_update_lines else "(sem ajustes)"
 
+        OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
         refinar_block = (
             f"/refinar_bolao alpha={alpha_fix:.2f} janela={janela_fix} "
             f"bias_delta=\"{bias_blob}\" "
             f"regras=\"paridade 7–8 | seq≤3 | anti-overlap≤{OVERLAP_MAX}\""
         )
 
-        # ---------- Meta para próximo concurso (R-alto 20–30%) ----------
-        learn_meta = learn.get("meta", {}) if isinstance(learn.get("meta", {}), dict) else {}
-        learn_meta["R_alto_target"] = 0.25  # 25% central dentro de 20–30%
-        learn["meta"] = learn_meta
-        st["learning"] = learn
-        _bolao_save_state(st)
+        # ===== meta do Mestre (não mexe em estado se o lote reprovou) =====
+        if ok_lote:
+            learn_meta = learn.get("meta", {}) if isinstance(learn.get("meta", {}), dict) else {}
+            learn_meta["R_alto_target"] = 0.25
+            learn["meta"] = learn_meta
+            st["learning"] = learn
+            _bolao_save_state(st)
 
         mestre_hint = (
-            "/mestre "
-            "r_alto_target=0.25 "
-            f"regras=\"paridade 7–8 | seq≤3 | anti-overlap≤{OVERLAP_MAX}\" "
-            "ancoras=\"leves\""
+            "/mestre r_alto_target=0.25 "
+            f"regras=\"paridade 7–8 | seq≤3 | anti-overlap≤{OVERLAP_MAX}\" ancoras=\"leves\""
         )
 
-        # ---------- Relatório para o chat ----------
+        # ===== Mensagem para o chat =====
         linhas = []
-        linhas.append("✅ <b>CONFIRMAÇÃO REGISTRADA</b> — auditoria REAL aplicada ao último lote.\n")
-        linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial_15))
 
+        if not ok_lote:
+            linhas.append("⛔ <b>TRIPLO CHECK-IN FALHOU</b> — bloqueando aprendizado/reforço.\n")
+            # diag pode ser str (relatório pronto) ou dict (estruturado)
+            if isinstance(diag, dict):
+                linhas.append("<b>🔎 TRIPLO CHECK (stricto)</b>")
+                pf = diag.get("paridade_falhas") or []
+                sf = diag.get("seq_falhas") or []
+                ovf = diag.get("overlap_falhas") or []
+                dups = diag.get("duplicatas") or []
+                linhas.append(f"• Paridade: {'✅ todas em 7–8' if not pf else '❌ fora em '+str(pf)}")
+                linhas.append(f"• Sequência: {'✅ OK' if not sf else '❌ >3 nas apostas: '+str(sf)}")
+                if ovf:
+                    worst = max(ovf, key=lambda t: t[2])
+                    linhas.append(f"• Overlap máximo: ❌ {worst[2]} (> {OVERLAP_MAX}) entre Aposta {worst[0]:02d} e {worst[1]:02d}")
+                else:
+                    linhas.append(f"• Overlap máximo: ✅ ≤ {OVERLAP_MAX}")
+                linhas.append(f"• Duplicatas: {'✅ nenhuma' if not dups else '❌ ' + str(dups)}")
+                linhas.append("")
+            else:
+                linhas.append(str(diag) + "\n")
+
+        # Sempre mostramos os resultados do lote (visibilidade total)
+        linhas.append("🧮 <b>Acertos por aposta</b>")
         for i, ap in enumerate(apostas, 1):
-            linhas.append(f"<b>Aposta {i:02d}:</b> {' '.join(f'{n:02d}' for n in ap)}  → <b>{acertos[i-1]}</b> acertos")
-
+            linhas.append(f"<b>Aposta {i:02d}:</b> {_format_dez(ap)}  →  <b>{acertos[i-1]}</b> acertos")
         linhas.append("")
         linhas.append("📊 <b>Resumo do Lote</b>")
         linhas.append(f"• Melhor aposta: <b>{melhor}</b> (IDs: {idx_melhores})")
         linhas.append(f"• Média do lote: <b>{media:.2f}</b> acertos")
-        linhas.append(f"• TRIPLO CHECK-IN: <b>OK</b> (paridade 7–8, seq≤3, anti-overlap≤{OVERLAP_MAX}, sem duplicatas)")
+        linhas.append(f"• Oficial: " + " ".join(f"{n:02d}" for n in sorted(oficial_15)))
+        if ok_lote:
+            linhas.append(f"• TRIPLO CHECK-IN: <b>OK</b> (paridade 7–8, seq≤3, anti-overlap≤{OVERLAP_MAX}, sem duplicatas)")
+        else:
+            linhas.append(f"• TRIPLO CHECK-IN: <b>REPROVADO</b> (sem reforço)")
+
         linhas.append("")
         linhas.append("🤝 <b>Coocorrências fortes</b> (top 10):")
         if top_pairs:
-            linhas += [f"• ({a:02d},{b:02d}) → {c}x" for (a, b), c in top_pairs]
+            linhas += [f"• ({a:02d},{b:02d}) → {c}x" for (a,b), c in top_pairs]
         else:
             linhas.append("• (n/d)")
+
         linhas.append("")
         linhas.append("⚖️ <b>Recompensas</b>: " + (_format_dez(recompensas) if recompensas else "(nenhuma)"))
         linhas.append("🔻 <b>Penalizações</b>: " + (_format_dez(penalizacoes) if penalizacoes else "(nenhuma)"))
         linhas.append("")
-        linhas.append("🛠️ <b>Bloco /refinar_bolão (copiar e colar):</b>")
-        linhas.append(refinar_block)
-        linhas.append("")
-        linhas.append("🎯 <b>Próximo passo</b> (R-alto 20–30% habilitado):")
-        linhas.append(mestre_hint)
+
+        # Só mostra o bloco de refino e a dica do Mestre se o triplo check passar
+        if ok_lote:
+            linhas.append("🛠️ <b>Bloco /refinar_bolão (copiar e colar):</b>")
+            linhas.append(refinar_block)
+            linhas.append("")
+            linhas.append("🎯 <b>Próximo passo</b> (R-alto 20–30% habilitado):")
+            linhas.append(mestre_hint)
+        else:
+            linhas.append("🔒 Lote reprovado: gere um novo lote conforme as regras e repita /confirmar.")
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
