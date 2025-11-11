@@ -1394,8 +1394,17 @@ class LotoFacilBot:
                 max_tentativas=3
             )
 
-            # Usa a versão selada/reparada daqui em diante
+            # >>> REPARO FINAL PARA PASSAR TRIPLO CHECK <<<
+            apostas_ok = self._reparar_ate_passar_triplo_check(
+                apostas=apostas_ok,
+                ultimo=ultimo or [],
+                limite_overlap=OVERLAP_MAX,
+                max_tentativas=3
+            )
+
             apostas = [sorted(a) for a in apostas_ok]
+            # <<< FIM DO REPARO FINAL >>>
+
             # ------------------  FIM SELAGEM DE SAÍDA (NOVO)  --------------------
             # =====================================================================
 
