@@ -2259,18 +2259,20 @@ class LotoFacilBot:
         sa, sb = set(a), set(b)
         return len(sa & sb)
 
-    # --- TRIPLO CHECK (stricto) ---
-    @staticmethod
-    def _triplo_check_stricto(apostas: list[list[int]],
+    # --- TRIPLO CHECK (stricto) — retorna DICT para consumo interno ---
+    def _triplo_check_stricto(self,
+                              apostas: list[list[int]],
                               alvo_par=(7, 8),
                               max_seq: int = 3,
-                              max_overlap: int = 11) -> tuple[bool, str]:
+                              max_overlap: int | None = None) -> tuple[bool, dict]:
         """
         Valida o LOTE inteiro:
           • Cada aposta: 15 dezenas únicas entre 1..25, paridade 7–8, sequência máxima ≤3
-          • Lote: sem duplicatas exatas e overlap(a_i, a_j) ≤ max_overlap para todo par
-        Retorna: (ok_lote: bool, diag_html: str)
+          • Lote: sem duplicatas exatas e overlap(a_i, a_j) ≤ max_overlap
+        Retorna: (ok_lote: bool, diag_dict: {paridade_falhas, seq_falhas, overlap_falhas, duplicatas})
         """
+        if max_overlap is None:
+            max_overlap = int(globals().get("BOLAO_MAX_OVERLAP", 11))
 
         def _max_seq_local(nums: list[int]) -> int:
             s = sorted(nums)
@@ -2287,65 +2289,71 @@ class LotoFacilBot:
         def _overlap(a: list[int], b: list[int]) -> int:
             return len(set(a) & set(b))
 
-        linhas = ["<b>🔎 TRIPLO CHECK (stricto)</b>"]
-        ok_lote = True
+        diag = {
+            "paridade_falhas": [],   # [idx_aposta]
+            "seq_falhas": [],        # [idx_aposta]
+            "overlap_falhas": [],    # [(i,j,ov)]
+            "duplicatas": []         # [[ids...], ...]
+        }
 
-        # Normaliza + valida cada aposta
-        norm = []
-        seen = set()
-        dup_count = 0
+        # valida por aposta
+        seen = {}
         for idx, a in enumerate(apostas, 1):
-            a = sorted(set(int(n) for n in a))  # únicos + ordenado
-            norm.append(a)
-
-            erros = []
+            a = sorted(set(int(n) for n in a if 1 <= int(n) <= 25))
             if len(a) != 15:
-                erros.append(f"len={len(a)}≠15")
-            if not all(1 <= n <= 25 for n in a):
-                erros.append("fora do domínio 1..25")
-
+                # se quiser sinalizar tamanho errado, use seq_falhas para “travar”
+                diag["seq_falhas"].append(idx)
             pares = sum(1 for n in a if n % 2 == 0)
             if not (alvo_par[0] <= pares <= alvo_par[1]):
-                erros.append(f"paridade={pares}")
-
-            smax = _max_seq_local(a)
-            if smax > max_seq:
-                erros.append(f"seq_max={smax}")
-
+                diag["paridade_falhas"].append(idx)
+            if _max_seq_local(a) > max_seq:
+                diag["seq_falhas"].append(idx)
             t = tuple(a)
-            if t in seen:
-                dup_count += 1
-                erros.append("duplicada no lote")
-            seen.add(t)
+            seen.setdefault(t, []).append(idx)
 
-            if erros:
-                ok_lote = False
-                linhas.append(f"• Aposta {idx:02d}: ❌ " + ", ".join(erros))
-            else:
-                linhas.append(f"• Aposta {idx:02d}: ✅ (pares={pares}, seq_max={smax})")
+        # duplicatas
+        for _, ids in seen.items():
+            if len(ids) > 1:
+                diag["duplicatas"].append(ids)
 
-        # Anti-overlap do lote
-        worst_ov = 0
-        worst_pair = None
+        # overlaps
+        norm = [sorted(set(a)) for a in apostas]
         for i in range(len(norm)):
-            for j in range(i+1, len(norm)):
+            for j in range(i + 1, len(norm)):
                 ov = _overlap(norm[i], norm[j])
-                if ov > worst_ov:
-                    worst_ov = ov
-                    worst_pair = (i+1, j+1)
-        if worst_ov > max_overlap:
-            ok_lote = False
-            linhas.append(f"• Overlap máximo: ❌ {worst_ov} (> {max_overlap}) entre Aposta {worst_pair[0]:02d} e {worst_pair[1]:02d}")
-        else:
-            linhas.append(f"• Overlap máximo: ✅ {worst_ov} (≤ {max_overlap})")
+                if ov > max_overlap:
+                    diag["overlap_falhas"].append((i + 1, j + 1, ov))
 
-        if dup_count > 0:
-            ok_lote = False
-            linhas.append(f"• Duplicatas detectadas no lote: ❌ {dup_count}")
-        else:
-            linhas.append("• Duplicatas no lote: ✅ nenhuma")
+        ok_lote = not (diag["paridade_falhas"] or diag["seq_falhas"] or diag["overlap_falhas"] or diag["duplicatas"])
+        return ok_lote, diag
 
-        return ok_lote, "\n".join(linhas)
+
+    def _formatar_triplo_check_diag(self, diag: dict, max_overlap: int | None = None) -> str:
+        """Gera um HTML compacto a partir do diag-dict do _triplo_check_stricto."""
+        if max_overlap is None:
+            max_overlap = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+
+        linhas = ["<b>🔎 TRIPLO CHECK (stricto)</b>"]
+        if diag.get("paridade_falhas"):
+            linhas.append(f"• Paridade fora de 7–8 nas apostas: {diag['paridade_falhas']}")
+        else:
+            linhas.append("• Paridade: ✅ todas em 7–8")
+        if diag.get("seq_falhas"):
+            linhas.append(f"• Sequência >3 nas apostas: {diag['seq_falhas']}")
+        else:
+            linhas.append("• Sequência: ✅ todas com seq≤3")
+        if diag.get("overlap_falhas"):
+            worst = max(diag["overlap_falhas"], key=lambda t: t[2]) if diag["overlap_falhas"] else None
+            if worst:
+                i, j, ov = worst
+                linhas.append(f"• Overlap máximo: ❌ {ov} (> {max_overlap}) entre Aposta {i:02d} e {j:02d}")
+        else:
+            linhas.append(f"• Overlap máximo: ✅ ≤ {max_overlap}")
+        if diag.get("duplicatas"):
+            linhas.append(f"• Duplicatas detectadas: ❌ {diag['duplicatas']}")
+        else:
+            linhas.append("• Duplicatas: ✅ nenhuma")
+        return "\n".join(linhas)
 
     def _coocorrencias(apostas):
         """Retorna contagem de pares (i,j) que apareceram juntos no lote."""
@@ -4698,6 +4706,10 @@ class LotoFacilBot:
           - Preparar bloco /refinar_bolão (α=0.36, janela=60) pronto para colar
           - Preparar bloco Mestre otimizado para o próximo concurso com 20–30% de R-alto
         """
+        # Parâmetro de overlap (fallback=11 se não houver global)
+        OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+
+        # Normaliza estado e recupera último lote
         st = _normalize_state_defaults(_bolao_load_state() or {})
         learn = st.get("learning") or {}
         last_gen = learn.get("last_generation") or {}
@@ -4705,48 +4717,47 @@ class LotoFacilBot:
 
         if not apostas:
             return await update.message.reply_text(
-                "Não encontrei um lote recente em memória (learning.last_generation). Gere um lote e tente novamente."
+                "Não encontrei um lote recente em memória (learning.last_generation). "
+                "Gere um lote e tente novamente."
             )
 
-        # Enforce TRIPLO CHECK-IN antes de qualquer coisa
+        # ---------- TRIPLO CHECK (regra inquebrável) ----------
         ok_lote, diag = self._triplo_check_stricto(apostas)
         if not ok_lote:
             linhas = ["⛔ <b>TRIPLO CHECK-IN FALHOU</b> — bloqueando auditoria/aprendizado.\n"]
-            if diag["paridade_falhas"]:
-                linhas.append(f"• Paridade fora de 7–8 nas apostas: {diag['paridade_falhas']}")
-            if diag["seq_falhas"]:
-                linhas.append(f"• Sequência >3 nas apostas: {diag['seq_falhas']}")
-            if diag["overlap_falhas"]:
-                linhas.append(f"• Overlap >{OVERLAP_MAX} em pares: {diag['overlap_falhas']}")
-            if diag["duplicatas"]:
-                linhas.append(f"• Duplicatas: {diag['duplicatas']}")
+
+            # Se 'diag' vier como dict (normal), formatamos; se vier string, mostramos direto
+            if isinstance(diag, dict):
+                linhas.append(self._formatar_triplo_check_diag(diag, max_overlap=OVERLAP_MAX))
+            else:
+                linhas.append(str(diag))
+
             linhas.append("\nGere um novo lote conforme as regras e repita a confirmação.")
             return await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
+        # ---------- Oficial ----------
+        # Normaliza o oficial (garante ints no domínio e 15 únicos)
+        oficial_15 = sorted(set(int(n) for n in oficial_15 if 1 <= int(n) <= 25))[:15]
         oficial_set = set(oficial_15)
 
-        # Métricas
-        acertos = _hits_por_aposta(apostas, oficial_set)
-        media = sum(acertos) / float(len(acertos))
+        # ---------- Métricas de acerto ----------
+        acertos = _hits_por_aposta(apostas, oficial_set)          # -> list[int]
+        media = sum(acertos) / float(len(acertos)) if acertos else 0.0
         melhor = max(acertos) if acertos else 0
-        idx_melhores = [i+1 for i, v in enumerate(acertos) if v == melhor]
+        idx_melhores = [i + 1 for i, v in enumerate(acertos) if v == melhor]
 
-        # Coocorrências
-        cooc = _coocorrencias(apostas)
-        if cooc:
-            # top 10 pares (maior contagem)
-            top_pairs = sorted(cooc.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
-        else:
-            top_pairs = []
+        # ---------- Coocorrências ----------
+        cooc = _coocorrencias(apostas)                            # -> dict[(a,b)] = cont
+        top_pairs = sorted(cooc.items(), key=lambda kv: (-kv[1], kv[0]))[:10] if cooc else []
 
-        # Reward/Penalty por dezena
-        deltas = _reward_penalty(apostas, oficial_set)
+        # ---------- Reward / Penalty por dezena ----------
+        deltas = _reward_penalty(apostas, oficial_set)            # -> dict[num] = delta(float)
         recompensas = sorted([n for n, d in deltas.items() if d > 0], key=lambda n: (-deltas[n], n))
         penalizacoes = sorted([n for n, d in deltas.items() if d < 0], key=lambda n: (deltas[n], n))
 
-        # ===== Bloco /refinar_bolão (α e janela preservados) =====
-        alpha_fix = st.get("runtime", {}).get("alpha_usado", 0.36)  # mantém travado no runtime
-        janela_fix = int((st.get("learning") or {}).get("janela", 60))
+        # ---------- Bloco /refinar_bolão (α e janela preservados) ----------
+        alpha_fix = st.get("runtime", {}).get("alpha_usado", 0.36)     # mantém travado no runtime
+        janela_fix = int((st.get("learning") or {}).get("janela", 60)) # default 60
 
         # Normaliza mapa de bias para diffs aplicáveis
         bias_update_lines = []
@@ -4762,8 +4773,7 @@ class LotoFacilBot:
             f"regras=\"paridade 7–8 | seq≤3 | anti-overlap≤{OVERLAP_MAX}\""
         )
 
-        # ===== Bloco Mestre p/ próximo concurso (20–30% de R-alto) =====
-        # Sinaliza na meta que queremos um bucket de 20–30% 10R–11R
+        # ---------- Meta para próximo concurso (R-alto 20–30%) ----------
         learn_meta = learn.get("meta", {}) if isinstance(learn.get("meta", {}), dict) else {}
         learn_meta["R_alto_target"] = 0.25  # 25% central dentro de 20–30%
         learn["meta"] = learn_meta
@@ -4777,12 +4787,14 @@ class LotoFacilBot:
             "ancoras=\"leves\""
         )
 
-        # ===== Relatório para o chat =====
+        # ---------- Relatório para o chat ----------
         linhas = []
         linhas.append("✅ <b>CONFIRMAÇÃO REGISTRADA</b> — auditoria REAL aplicada ao último lote.\n")
         linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial_15))
+
         for i, ap in enumerate(apostas, 1):
-            linhas.append(f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in ap)}  → <b>{acertos[i-1]}</b> acertos")
+            linhas.append(f"<b>Aposta {i:02d}:</b> {' '.join(f'{n:02d}' for n in ap)}  → <b>{acertos[i-1]}</b> acertos")
+
         linhas.append("")
         linhas.append("📊 <b>Resumo do Lote</b>")
         linhas.append(f"• Melhor aposta: <b>{melhor}</b> (IDs: {idx_melhores})")
@@ -4791,7 +4803,7 @@ class LotoFacilBot:
         linhas.append("")
         linhas.append("🤝 <b>Coocorrências fortes</b> (top 10):")
         if top_pairs:
-            linhas += [f"• ({a:02d},{b:02d}) → {c}x" for (a,b), c in top_pairs]
+            linhas += [f"• ({a:02d},{b:02d}) → {c}x" for (a, b), c in top_pairs]
         else:
             linhas.append("• (n/d)")
         linhas.append("")
