@@ -322,14 +322,6 @@ PARES_PENALIZADOS = {(23, 2), (22, 19), (24, 20), (11, 1)}
 RUIDOS = {2, 1, 14, 19, 20, 10, 7, 15, 21, 9}
 # No pacote de 10 apostas do Mestre, cada ruído pode aparecer no máx. 6 apostas
 RUIDO_CAP_POR_LOTE = 6
-# Alpha alternativo para A/B
-ALPHA_TEST_B = 0.39
-
-# ========================
-# Ciclo C (ancorado no último resultado)
-# ========================
-CICLO_C_ANCHORS = (9, 11)
-CICLO_C_PLANOS = [8, 11, 10, 10, 9, 9, 9, 9, 10, 10]
 
 # ========================
 # Cache e utilitários globais
@@ -454,7 +446,7 @@ def _normalize_state_defaults(state: dict) -> dict:
     state = dict(state or {})
     # política de aprendizado: “gated” por oficial, a menos que você troque por “free_run”
     state.setdefault("learn_policy", LEARN_POLICY)
-    # fila de lotes pendentes de avaliação (cada /gerar, /mestre, /ab, etc, empilha aqui — sem aprender ainda)
+    # fila de lotes pendentes de avaliação (cada /gerar, /mestre, etc, empilha aqui — sem aprender ainda)
     state.setdefault("pending_batches", [])
     # baseline (score/α/janela) usado para decidir se um novo parâmetro realmente melhorou
     state.setdefault(
@@ -1064,10 +1056,10 @@ class LotoFacilBot:
         # Clamp final
         bilhetes_por_concurso, janela, alpha = self._clamp_params(bilhetes_por_concurso, janela, alpha)
         return janela, bilhetes_por_concurso, alpha
-
+    
+    # ------------- Handlers -------------
     def _setup_handlers(self):
-        from telegram.ext import CommandHandler, MessageHandler, filters
-
+        
         # Comandos “visíveis”
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("gerar", self.gerar_apostas))
@@ -1076,7 +1068,6 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("remover", self.remover))
         self.app.add_handler(CommandHandler("backtest", self.backtest))
         self.app.add_handler(CommandHandler("mestre", self.mestre))
-        self.app.add_handler(CommandHandler("ab", self.ab))
         self.app.add_handler(CommandHandler("diagbase", self.diagbase))
         self.app.add_handler(CommandHandler("ping", self.ping))
         self.app.add_handler(CommandHandler("versao", self.versao))
@@ -1086,13 +1077,11 @@ class LotoFacilBot:
         self.app.add_handler(CommandHandler("bolao20", self.bolao20))
         self.app.add_handler(CommandHandler("conferir_bolao20", self.conferir_bolao20))
         self.app.add_handler(CommandHandler("confirmar", self.confirmar))  # <-- novo comando
-
         # Handler para comandos desconhecidos (DEVE ficar por último)
         self.app.add_handler(MessageHandler(filters.COMMAND, self._unknown_command))
-
         logger.info(
             "Handlers ativos: /start /gerar /mestre /mestre_bolao /refinar_bolao "
-            "/ab /meuid /autorizar /remover /backtest /diagbase /ping /versao "
+            "/meuid /autorizar /remover /backtest /diagbase /ping /versao "
             "/estado_bolao /bolao20 /conferir_bolao20 /confirmar + unknown"
         )
 
@@ -3245,195 +3234,6 @@ class LotoFacilBot:
         ]
         return apostas
     
-    # ===== utilitário seguro =====
-    @staticmethod
-    def _safe_remove(a: list[int], x: int) -> bool:
-        try:
-            a.remove(x)
-            return True
-        except ValueError:
-            return False
-
-    def _fechar_ciclo_c(
-        self,
-        apostas: list[list[int]],
-        ultimo: list[int],
-        anchors: tuple[int, int] = (9, 11),
-    ) -> list[list[int]]:
-        """
-        Selagem determinística do Ciclo C com metas rígidas:
-          - Paridade 7–8
-          - SeqMax ≤ 3
-          - Repetições (R) EXATAS por aposta, conforme CICLO_C_PLANOS[i]
-          - Dedup + anti-overlap ≤ BOLAO_MAX_OVERLAP
-        Preserva ÂNCORAS sempre que possível.
-        """
-        anchors_set = set(int(x) for x in anchors if 1 <= int(x) <= 25)
-        u_set = set(int(x) for x in ultimo if 1 <= int(x) <= 25)
-        universo = list(range(1, 26))
-        comp_all = [n for n in universo if n not in u_set]
-
-        def _is_ok_shape(a: list[int]) -> bool:
-            return (len(a) == 15) and (len(set(a)) == 15) and (7 <= self._contar_pares(a) <= 8) and (self._max_seq(a) <= 3)
-
-        def _canon(a: list[int]) -> list[int]:
-            a = [int(x) for x in a if 1 <= int(x) <= 25]
-            a = sorted(set(a))
-            if len(a) < 15:
-                # completa por complemento atual evitando criar sequência
-                comp_now = [n for n in universo if n not in a]
-                for n in comp_now:
-                    if (n-1 not in a) and (n+1 not in a):
-                        a.append(n)
-                        if len(a) == 15:
-                            break
-                if len(a) < 15:
-                    for n in comp_now:
-                        if n not in a:
-                            a.append(n)
-                            if len(a) == 15:
-                                break
-            elif len(a) > 15:
-                a = a[:15]
-            return sorted(a)
-
-        def _ensure_anchors(a: list[int]) -> list[int]:
-            if not anchors_set:
-                return a
-            a = a[:]
-            for anc in anchors_set:
-                if anc not in a:
-                    # troca o primeiro que não é âncora
-                    rem = next((x for x in a if x not in anchors_set), None)
-                    if rem is not None and rem != anc:
-                        if self._safe_remove(a, rem):
-                            a.append(anc)
-                            a.sort()
-            return a
-
-        def _force_R(a: list[int], r_alvo: int) -> list[int]:
-            """
-            Ajusta R (repetições vs 'ultimo') EXATAMENTE para r_alvo.
-            - se R baixo: troca COM->ULTIMO (sem mexer em âncoras)
-            - se R alto:  troca ULTIMO->COM
-            """
-            a = a[:]
-            r_atual = sum(1 for n in a if n in u_set)
-            if r_atual == r_alvo:
-                return a
-
-            # Complemento dinâmico da aposta
-            def comp_now():
-                return [n for n in universo if n not in a]
-
-            if r_atual < r_alvo:
-                # precisa aumentar R: trazer números do 'ultimo'
-                faltam = [n for n in ultimo if n not in a]
-                for add in faltam:
-                    rem = next((x for x in a if x not in u_set and x not in anchors_set), None) \
-                          or next((x for x in a if x not in u_set), None)
-                    if rem is None:
-                        break
-                    if self._safe_remove(a, rem):
-                        a.append(add); a.sort()
-                        r_atual += 1
-                        if r_atual == r_alvo:
-                            break
-            else:
-                # precisa diminuir R: expulsar itens do 'ultimo' e trazer do complemento
-                for rem in [x for x in sorted(a, reverse=True) if x in u_set and x not in anchors_set]:
-                    add = next((c for c in comp_now() if c not in a), None)
-                    if add is None:
-                        break
-                    if self._safe_remove(a, rem):
-                        a.append(add); a.sort()
-                        r_atual -= 1
-                        if r_atual == r_alvo:
-                            break
-
-            return a
-
-        def _enforce_shape_then_R(a: list[int], r_alvo: int) -> list[int]:
-            """
-            Faz convergir forma e R:
-              - primeiro ajusta forma (pares/seq)
-              - corrige R fino
-              - repete poucas vezes
-            """
-            a = _canon(a)
-            for _ in range(8):
-                # trava forma
-                try:
-                    a = self._hard_lock_fast(a, list(u_set), anchors=frozenset(anchors_set))
-                except Exception:
-                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-                    a = _canon(a)
-
-                # corrige R com cuidado
-                a = _force_R(a, r_alvo)
-                a = _ensure_anchors(a)
-                a = _canon(a)
-
-                # pequena retocada na forma (pode mexer em R levemente, então iteramos no laço)
-                if _is_ok_shape(a) and (sum(1 for n in a if n in u_set) == r_alvo):
-                    break
-            return a
-
-        # ---------- 0) Normaliza e ancora ----------
-        apostas = [ _ensure_anchors(_canon(a)) for a in apostas ]
-
-        # ---------- 1) Força R exato e forma por plano ----------
-        for i in range(len(apostas)):
-            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in apostas[i] if n in u_set)
-            apostas[i] = _enforce_shape_then_R(apostas[i], r_alvo)
-
-        # ---------- 2) Dedup com cura local (respeita âncoras) ----------
-        try:
-            apostas = self._dedup_apostas(apostas, ultimo=list(u_set), max_overlap=None, anchors=anchors_set)
-        except Exception:
-            # fallback simples de dedup
-            seen, uniq = set(), []
-            for a in apostas:
-                t = tuple(a)
-                if t not in seen:
-                    seen.add(t); uniq.append(a)
-            apostas = uniq
-
-        # ---------- 3) Anti-overlap global ----------
-        try:
-            apostas = self._anti_overlap(apostas, ultimo=list(u_set), comp=comp_all, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
-        except Exception:
-            pass
-
-        # ---------- 4) Selagem final (curta) ----------
-        final = []
-        for i, a in enumerate(apostas):
-            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
-            a = _enforce_shape_then_R(a, r_alvo)
-            final.append(a)
-
-        # ---------- 5) Passada extra de dedup + shape (garantia) ----------
-        try:
-            final = self._dedup_apostas(final, ultimo=list(u_set), max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors_set)
-        except Exception:
-            pass
-
-        out = []
-        for i, a in enumerate(final):
-            r_alvo = CICLO_C_PLANOS[i] if i < len(CICLO_C_PLANOS) else sum(1 for n in a if n in u_set)
-            a = _enforce_shape_then_R(a, r_alvo)
-            if not _is_ok_shape(a):
-                # teimosia extra
-                for _ in range(4):
-                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_set)
-                    a = _force_R(a, r_alvo)
-                    a = _ensure_anchors(a)
-                    a = _canon(a)
-                    if _is_ok_shape(a) and sum(1 for n in a if n in u_set) == r_alvo:
-                        break
-            out.append(a)
-
-        return out
 
     # --------- Gerador mestre (com seed por usuário/chat) ---------
     def _gerar_mestre_por_ultimo_resultado(self, historico, seed: int | None = None):
@@ -5928,141 +5728,6 @@ class LotoFacilBot:
         except Exception:
             logger.warning("auto_aprender falhou internamente.", exc_info=True)
     
-    # --------- Gerador Ciclo C (ancorado no último resultado) — versão reforçada ---------
-    def _gerar_ciclo_c_por_ultimo_resultado(self, historico):
-        if not historico:
-            raise ValueError("Histórico vazio no Ciclo C.")
-
-        ultimo = self._ultimo_resultado(historico)
-        u_set = set(ultimo)
-        comp_list = sorted(self._complemento(u_set))  # <- garante lista ordenada
-        anchors = set(CICLO_C_ANCHORS)
-
-        def _forcar_repeticoes(a: list[int], r_alvo: int) -> list[int]:
-            a = a[:]
-            r_atual = sum(1 for n in a if n in u_set)
-            if r_atual == r_alvo:
-                return a
-
-            if r_atual < r_alvo:
-                faltam = [n for n in ultimo if n not in a]
-                for add in faltam:
-                    # preserva âncoras, troca um não-último quando possível
-                    rem = next((x for x in a if x not in u_set and x not in anchors), None)
-                    if rem is None:
-                        rem = next((x for x in a if x not in u_set), None)
-                    if rem is None:
-                        break
-                    a.remove(rem); a.append(add); a.sort()
-                    r_atual += 1
-                    if r_atual == r_alvo:
-                        break
-            else:
-                # r_atual > r_alvo: remova um do último (não âncora) e insira do complemento
-                for rem in [x for x in reversed(a) if x in u_set and x not in anchors]:
-                    add = next((c for c in comp_list if c not in a), None)
-                    if add is None:
-                        break
-                    a.remove(rem); a.append(add); a.sort()
-                    r_atual -= 1
-                    if r_atual == r_alvo:
-                        break
-            return a
-
-        def _ok(a: list[int], r_alvo: int) -> bool:
-            pares = self._contar_pares(a)
-            return (7 <= pares <= 8) and (self._max_seq(a) <= 3) and (sum(1 for n in a if n in u_set) == r_alvo)
-
-        apostas: list[list[int]] = []
-        for i, r_alvo in enumerate(CICLO_C_PLANOS):
-            off_last = (i * 3) % 15
-            off_comp = (i * 5) % len(comp_list) if len(comp_list) > 0 else 0
-
-            a = self._construir_aposta_por_repeticao(
-                last_sorted=ultimo,
-                comp_sorted=comp_list,
-                repeticoes=r_alvo,
-                offset_last=off_last,
-                offset_comp=off_comp,
-            )
-
-            # força âncoras (trocando preferencialmente um número do último que não é âncora)
-            for anc in anchors:
-                if anc not in a:
-                    rem = next((x for x in a if x in u_set and x not in anchors), None)
-                    if rem is None:
-                        rem = next((x for x in reversed(a) if x not in anchors), None)
-                    if rem is not None and rem != anc:
-                        a.remove(rem); a.append(anc); a.sort()
-
-            # forma-base: repetição alvo + paridade/seq
-            a = _forcar_repeticoes(a, r_alvo)
-            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-
-            # reforço “miolo”: garantir pelo menos 3 na faixa 12..18
-            mid_lo, mid_hi = 12, 18
-            mid = [n for n in a if mid_lo <= n <= mid_hi]
-            if len(mid) < 3:
-                need = 3 - len(mid)
-                cand_add = [n for n in comp_list if mid_lo <= n <= mid_hi and n not in a]
-                cand_rem = [x for x in sorted(a, reverse=True) if not (mid_lo <= x <= mid_hi) and x not in anchors]
-                j = 0
-                while need > 0 and j < len(cand_add) and j < len(cand_rem):
-                    add, rem = cand_add[j], cand_rem[j]
-                    if add not in a and rem in a:
-                        a.remove(rem); a.append(add); a.sort()
-                        a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                        a = _forcar_repeticoes(a, r_alvo)
-                        need -= 1
-                    j += 1
-
-            apostas.append(sorted(a))
-
-        # cobertura de ausentes do complemento (se algum não apareceu em nenhuma aposta)
-        ausentes = set(comp_list)
-        presentes = set(n for ap in apostas for n in ap)
-        faltantes = [n for n in ausentes if n not in presentes]
-        if faltantes:
-            a = apostas[-1][:]
-            for n in faltantes:
-                rem = next((x for x in reversed(a) if x in u_set and x not in anchors), None)
-                if rem is None:
-                    break
-                if n not in a:
-                    a.remove(rem); a.append(n); a.sort()
-                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                    a = _forcar_repeticoes(a, CICLO_C_PLANOS[-1])
-            apostas[-1] = a
-
-        # normalização de forma + anti-overlap antes da selagem
-        apostas = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors) for a in apostas]
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
-
-        # estabilização por plano
-        for i, r_alvo in enumerate(CICLO_C_PLANOS):
-            if i >= len(apostas):
-                break
-            a = apostas[i][:]
-            for anc in anchors:
-                if anc not in a:
-                    rem = next((x for x in reversed(a) if x not in anchors), None)
-                    if rem is not None and rem != anc:
-                        a.remove(rem); a.append(anc); a.sort()
-            for _ in range(12):  # limite defensivo
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors)
-                a = _forcar_repeticoes(a, r_alvo)
-                if _ok(a, r_alvo):
-                    break
-            apostas[i] = sorted(a)
-
-        # anti-overlap adicional antes da selagem final
-        apostas = self._anti_overlap(apostas, ultimo=ultimo, comp=comp_list, max_overlap=BOLAO_MAX_OVERLAP, anchors=anchors)
-
-        # >>> Selagem final do Ciclo C (paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras
-        apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=tuple(anchors))
-        # <<<
-
-        return apostas
 
     @staticmethod
     def _contar_repeticoes(aposta, ultimo):
@@ -6421,7 +6086,7 @@ class LotoFacilBot:
             f"🤖 Versão do bot\n"
             f"- BUILD_TAG: <code>{BUILD_TAG}</code>\n"
             f"- Import layout: <code>{LAYOUT}</code>\n"
-            f"- Comandos: /start /gerar /mestre /mestre_bolao /refinar_bolao /ab /meuid /autorizar /remover /backtest /diagbase /ping /versao"
+            f"- Comandos: /start /gerar /mestre /mestre_bolao /refinar_bolao /meuid /autorizar /remover /backtest /diagbase /ping /versao"
         )
         await update.message.reply_text(txt, parse_mode="HTML")
 
@@ -6469,234 +6134,10 @@ class LotoFacilBot:
         else:
             await update.message.reply_text("ℹ️ Usuário não está na whitelist.")
 
-    # --- A/B técnico + Ciclo C ---
-    async def ab(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not self._usuario_autorizado(user_id):
-            return await update.message.reply_text("⛔ Você não está autorizado.")
-
-        # >>> anti-abuso
-        if not self._is_admin(user_id):
-            if _is_temporarily_blocked(user_id):
-                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
-            allowed, warn = _register_command_event(user_id, is_unknown=False)
-            if not allowed:
-                return await update.message.reply_text(warn)
-            if warn:
-                await update.message.reply_text(warn)
-        # <<< anti-abuso
-
-        chat_id = update.effective_chat.id
-        if self._hit_cooldown(chat_id, "ab"):
-            return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /ab novamente.")
-
-        # ---------------------------------------------------------
-        # MODO CICLO C ("/ab c" ou "/ab ciclo")
-        # ---------------------------------------------------------
-        mode_ciclo = (len(context.args) >= 1 and str(context.args[0]).lower() in {"ciclo", "c"})
-        if mode_ciclo:
-            try:
-                import hashlib, traceback
-                from datetime import datetime
-                from zoneinfo import ZoneInfo
-
-                snap = self._latest_snapshot()
-
-                historico = carregar_historico(HISTORY_PATH)
-                if not historico:
-                    return await update.message.reply_text("Erro: histórico vazio.")
-
-                # 1) geração bruta do Ciclo C
-                ultimo = self._ultimo_resultado(historico)
-                apostas = self._gerar_ciclo_c_por_ultimo_resultado(historico)
-
-                # 2) SELAGEM FINAL do Ciclo C (R exato, paridade 7–8, seq≤3, dedup e anti-overlap), preservando âncoras
-                try:
-                    anchors = tuple(CICLO_C_ANCHORS)  # ex.: (9, 11)
-                except Exception:
-                    anchors = (9, 11)
-
-                try:
-                    apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=anchors)
-                except Exception:
-                    logger.warning("Falha ao selar Ciclo C via _fechar_ciclo_c; seguindo com apostas atuais.", exc_info=True)
-
-                # 2.1) Pós-filtro unificado
-                try:
-                    apostas = self._pos_filtro_unificado(apostas, ultimo=ultimo)
-                except Exception:
-                    logger.warning("Pós-filtro unificado falhou; seguindo com apostas seladas.", exc_info=True)
-
-                # 2.2) RESELAGEM para garantir R-alvo exato após o pós-filtro
-                try:
-                    apostas = self._fechar_ciclo_c(apostas, ultimo=ultimo, anchors=anchors)
-                except Exception:
-                    logger.warning("Reselagem do Ciclo C falhou após pós-filtro.", exc_info=True)
-
-                # 2.3) REGISTRO para aprendizado leve (/ab ciclo C)
-                try:
-                    self._registrar_geracao(apostas, base_resultado=ultimo or [])
-                except Exception:
-                    logger.warning("Falha ao registrar geração para aprendizado leve (/ab ciclo C).", exc_info=True)
-
-                # --- NOVO: registrar o lote no estado (pending_batches) ---
-                try:
-                    st = _normalize_state_defaults(_bolao_load_state() or {})
-                    batches = st.get("pending_batches", [])
-                    batches.append({
-                        "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
-                        "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
-                        "alpha": float(st.get("alpha", ALPHA_PADRAO)),
-                        "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
-                        "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
-                        "qtd": len(apostas),
-                        "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
-                    })
-                    st["pending_batches"] = batches[-100:]  # mantém histórico curto
-                    _bolao_save_state(st)
-                except Exception:
-                    logger.warning("Falha ao registrar pending_batch no /ab ciclo C.", exc_info=True)
-                # --- FIM NOVO ---
-
-                # 3) CSV de auditoria externa (aprendizado REAL)
-                try:
-                    _append_learn_log(snap.snapshot_id, ultimo or [], apostas)
-                except Exception:
-                    logger.warning("Falha para append no learn_log após /ab ciclo C.", exc_info=True)
-
-                # 4) Formatação da resposta (NÃO reprocessa as apostas!)
-                linhas = []
-                linhas.append("🎯 Ciclo C — baseado no último resultado")
-                if len(anchors) >= 2:
-                    linhas.append(f"Âncoras: {anchors[0]:02d} e {anchors[1]:02d} | paridade=7–8 | max_seq=3")
-                else:
-                    linhas.append("Âncoras: — | paridade=7–8 | max_seq=3")
-
-                u_set = set(ultimo)
-                for i, a in enumerate(apostas, 1):
-                    pares = self._contar_pares(a)
-                    seq = self._max_seq(a)
-                    rep = sum(1 for n in a if n in u_set)
-                    alvo = CICLO_C_PLANOS[i - 1] if (i - 1) < len(CICLO_C_PLANOS) else rep
-                    linhas.append(
-                        f"\nAposta {i}: " + " ".join(f"{n:02d}" for n in a) + f"  [{rep}R; alvo={alvo}R]"
-                    )
-                    linhas.append(f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}")
-
-                # rodapé (hash/snapshot/carimbo)
-                try:
-                    hash_ult = hashlib.md5("".join(f"{n:02d}" for n in ultimo).encode()).hexdigest()[:8]
-                except Exception:
-                    hash_ult = "--"
-                try:
-                    snap_id = getattr(snap, "snapshot_id", "--")
-                except Exception:
-                    snap_id = "--"
-                carimbo = datetime.now(tz=ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %z")
-
-                linhas_str = "\n".join(linhas)
-
-                # envia pro usuário
-                await update.message.reply_text(linhas_str, parse_mode="HTML")
-
-                # aprendizado pós-envio (não travar bot se falhar)
-                try:
-                    await self.auto_aprender(update, context)
-                except Exception:
-                    logger.warning("auto_aprender falhou pós-/ab ciclo C; prosseguindo normalmente.", exc_info=True)
-
-                return
-
-            except Exception as e:
-                logger.error("Erro no /ab ciclo C:\n" + traceback.format_exc())
-                return await update.message.reply_text(f"Erro ao executar Ciclo C: {e}")
-
-        # ---------------------------------------------------------
-        # MODO A/B TÉCNICO (padrão quando NÃO é ciclo)
-        # ---------------------------------------------------------
-        try:
-            qtd = int(context.args[0]) if len(context.args) >= 1 else QTD_BILHETES_PADRAO
-            janela = int(context.args[1]) if len(context.args) >= 2 else 60
-            alphaA = float(context.args[2].replace(",", ".")) if len(context.args) >= 3 else ALPHA_PADRAO
-            alphaB = float(context.args[3].replace(",", ".")) if len(context.args) >= 4 else ALPHA_TEST_B
-        except Exception:
-            qtd, janela, alphaA, alphaB = QTD_BILHETES_PADRAO, 60, ALPHA_PADRAO, ALPHA_TEST_B
-
-        # saneamento de parâmetros
-        qtd, janela, alphaA = self._clamp_params(qtd, janela, alphaA)
-        _, _, alphaB = self._clamp_params(qtd, janela, alphaB)
-
-        # geração dos dois lotes
-        try:
-            apostasA = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaA)
-            apostasB = self._gerar_apostas_inteligentes(qtd=qtd, janela=janela, alpha=alphaB)
-        except Exception:
-            logger.error("Erro no /ab:\n" + traceback.format_exc())
-            return await update.message.reply_text("Erro ao gerar A/B. Tente novamente.")
-
-        # REGISTRO para aprendizado leve (/ab A/B técnico) + auditoria CSV + pending_batches
-        try:
-            # base oficial para o registro
-            historico = carregar_historico(HISTORY_PATH)
-            ultimo = self._ultimo_resultado(historico) if historico else []
-
-            apostas_all = list(apostasA) + list(apostasB)
-
-            # 1) Estado persistente (núcleo)
-            self._registrar_geracao(apostas_all, base_resultado=ultimo or [])
-
-            # --- NOVO: registrar o lote no estado (pending_batches) ---
-            from datetime import datetime
-            from zoneinfo import ZoneInfo
-
-            st = _normalize_state_defaults(_bolao_load_state() or {})
-            batches = st.get("pending_batches", [])
-            batches.append({
-                "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
-                "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
-                "alpha": float(st.get("alpha", ALPHA_PADRAO)),
-                "janela": int((st.get("learning") or {}).get("janela", JANELA_PADRAO)),
-                "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
-                "qtd": len(apostas_all),
-                "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_all],
-            })
-            st["pending_batches"] = batches[-100:]  # mantém histórico curto
-            _bolao_save_state(st)
-            # --- FIM NOVO ---
-
-            # 2) CSV de auditoria externa (aprendizado REAL)
-            snap = self._latest_snapshot()
-            _append_learn_log(snap.snapshot_id, ultimo or [], apostas_all)
-
-        except Exception:
-            logger.warning("Falha ao registrar geração e/ou append no learn_log após /ab técnico.", exc_info=True)
-
-        # formatação da saída
-        def _fmt(tag, aps):
-            linhas_locais = [f"🅰️🅱️ <b>LOTE {tag}</b>\n"]
-            for i, a in enumerate(aps, 1):
-                pares = self._contar_pares(a)
-                linhas_locais.append(
-                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
-                    f"🔢 Pares: {pares} | Ímpares: {15 - pares}\n"
-                )
-            return "\n".join(linhas_locais)
-
-        msg = (
-            f"🧪 <b>A/B Técnico</b> — janela={janela}\n"
-            f"• A: α={alphaA:.2f}\n"
-            f"• B: α={alphaB:.2f}\n\n"
-            f"{_fmt('A', apostasA)}\n\n{_fmt('B', apostasB)}"
-        )
-
-        # envia pro usuário
-        await update.message.reply_text(msg, parse_mode="HTML")
-
-        # aprendizado pós-envio (não travar bot se falhar)
-        try:
-            await self.auto_aprender(update, context)
-        except Exception:
-            logger.warning("auto_aprender falhou pós-/ab técnico; prosseguindo normalmente.", exc_info=True)
+    # (REMOVIDO) Comando /ab e variações (incluindo "/ab c" ou "/ab ciclo")
+    # Esta função foi removida por decisão de produto. Caso receba alguma chamada  
+    # acidental, a camada de unknown command responderá de forma neutra.
+    # Mantemos apenas este comentário de sentinela para facilitar auditorias futuras.
 
     # ------------- Handler do backtest -------------
     async def backtest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
