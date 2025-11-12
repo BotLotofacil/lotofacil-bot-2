@@ -1323,14 +1323,9 @@ class LotoFacilBot:
                 OVERLAP_MAX = 11
 
             def _shape_ok(a: list[int]) -> bool:
-                if len(a) != 15 or len(set(a)) != 15:
-                    return False
-                pares = sum(1 for n in a if n % 2 == 0)
-                if not (7 <= pares <= 8):
-                    return False
-                return self._max_seq(a) <= 3
+                return self._shape_ok_basico(a)
 
-            # 1) Funil único fecha o lote conforme as regras do Mestre
+            # 1) Funil Mestre (se falhar, cai no fallback básico)
             try:
                 apostas_ok = self._finalizar_lote_mestre(
                     apostas=apostas,
@@ -1342,7 +1337,6 @@ class LotoFacilBot:
                     aplicar_cap_par=True,
                 )
             except Exception:
-                # fallback: aplica shape+anti-overlap básico
                 logger.warning("_finalizar_lote_mestre falhou; aplicando fallback básico.", exc_info=True)
                 apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas]
                 try:
@@ -1350,34 +1344,10 @@ class LotoFacilBot:
                 except Exception:
                     pass
 
-            # 2) Reparos iterativos determinísticos (elimina seq>3/paridade fora e recontrola overlap)
-            MAX_CICLOS_FIX = 4
-            for _ in range(MAX_CICLOS_FIX):
-                # re-selar forma em todas
-                apostas_ok = [
-                    self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
-                    for a in apostas_ok
-                ]
-                # dedup estrito
-                uniq, seen = [], set()
-                for a in apostas_ok:
-                    t = tuple(a)
-                    if t not in seen:
-                        seen.add(t)
-                        uniq.append(a)
-                apostas_ok = uniq
+            # 2) FECHAMENTO STRICTO: força passar no TRIPLO CHECK (ou aproxima)
+            apostas_ok = self._fechar_lote_stricto(apostas_ok, ultimo=ultimo or [], overlap_max=OVERLAP_MAX, max_ciclos=6)
 
-                # anti-overlap global
-                try:
-                    apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
-                except Exception:
-                    pass
-
-                # checagem de forma
-                if all(_shape_ok(a) for a in apostas_ok):
-                    break
-
-            # 3) Garantia de quantidade exata (reposições válidas)
+            # 3) Garantia de quantidade exata (se necessário) + fechamento final curto
             if len(apostas_ok) < target_qtd:
                 rep_salt = call_salt
                 seen = {tuple(sorted(a)) for a in apostas_ok}
@@ -1397,34 +1367,26 @@ class LotoFacilBot:
                             apostas_ok.append(cand)
                             seen.add(t)
 
-            # 4) Selagem final por garantia (idempotente) + dedup final + anti-overlap final
+            # 4) Selagem final + dedup + anti-overlap final (idempotente)
             try:
-                apostas_ok = [
-                    self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
-                    for a in apostas_ok
-                ]
+                apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas_ok]
             except Exception:
-                apostas_ok = [
-                    self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                    for a in apostas_ok
-                ]
+                apostas_ok = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas_ok]
 
-            # dedup final
             uniq, seen = [], set()
             for a in apostas_ok:
                 t = tuple(a)
                 if t not in seen:
                     seen.add(t)
-                    uniq.append(a)
+                    uniq.append(a)  
             apostas_ok = uniq
 
-            # anti-overlap final (não relaxa forma)
             try:
                 apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
             except Exception:
                 pass
 
-            # valida forma novamente e corrige casos extremos
+            # valida forma novamente
             apostas_ok = [
                 (self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
                  if not _shape_ok(a) else a)
@@ -1435,6 +1397,7 @@ class LotoFacilBot:
             apostas = [sorted(a) for a in apostas_ok]
             # ------------------  FIM SELAGEM DE SAÍDA (NOVO)  --------------------
             # =====================================================================
+
 
             # --- persistência para o auto_aprender: last_generation ---
             try:
@@ -5152,6 +5115,177 @@ class LotoFacilBot:
         except Exception as e:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
+        
+        # ===================[ UTILITÁRIOS STRICTO ]===================
+
+    def _shape_ok_basico(self, a: list[int]) -> bool:
+        """15 únicos, paridade 7–8, seq<=3."""
+        if len(a) != 15 or len(set(a)) != 15:
+            return False
+        pares = sum(1 for n in a if n % 2 == 0)
+        if not (7 <= pares <= 8):
+            return False
+        return self._max_seq(a) <= 3
+
+    def _quebrar_seq_maior_3(self, a: list[int]) -> list[int]:
+        """
+        Quebra runs >3 trocando o elemento 'central' do run por um candidato seguro,
+        tentando preservar paridade 7–8. Determinístico pelo ordenamento.
+        """
+        a = sorted(set(a))
+        if len(a) != 15:
+            # normaliza tamanho se necessário (mantém determinismo simples)
+            universo = list(range(1, 26))
+            for n in universo:
+                if n not in a:
+                    a.append(n)
+                    if len(a) == 15:
+                        break
+            a = sorted(a)
+        # Detecta runs
+        runs = []
+        start = 0
+        for i in range(1, len(a)+1):
+            if i == len(a) or a[i] != a[i-1] + 1:
+                runs.append((start, i-1))
+                start = i
+        # Para cada run > 3, substitui o elemento central por um “safe”
+        universo = set(range(1, 26))
+        usados = set(a)
+        candidatos_base = [n for n in sorted(universo - usados)]
+        pares_alvo_min, pares_alvo_max = 7, 8
+        for (i0, i1) in runs:
+            tamanho = i1 - i0 + 1
+            if tamanho > 3:
+                idx = i0 + tamanho // 2  # posição central
+                rem = a[idx]
+                # tenta inserir candidato não adjacente ao vizinho do run
+                for add in candidatos_base:
+                    if (add-1 not in a) and (add+1 not in a):
+                        tmp = a[:]
+                        tmp[idx] = add
+                        tmp = sorted(set(tmp))
+                        # checa paridade e seq novamente
+                        pares = sum(1 for n in tmp if n % 2 == 0)
+                        if (pairs_ok := (pares_alvo_min <= pares <= pares_alvo_max)) and (self._max_seq(tmp) <= 3):
+                            a = tmp
+                            usados = set(a)
+                            candidatos_base = [n for n in sorted(universo - usados)]
+                            break
+                # fallback: se não achar não-adjacente, aceita o primeiro candidato válido que respeite forma
+                else:
+                    for add in candidatos_base:
+                        tmp = a[:]
+                        tmp[idx] = add
+                        tmp = sorted(set(tmp))
+                        pares = sum(1 for n in tmp if n % 2 == 0)
+                        if (pares_alvo_min <= pares <= pares_alvo_max) and (self._max_seq(tmp) <= 3):
+                            a = tmp
+                            usados = set(a)
+                            candidatos_base = [n for n in sorted(universo - usados)]
+                            break
+        # selagem final curta
+        try:
+            a = self._hard_lock_fast(a, ultimo=[], anchors=frozenset())
+        except Exception:
+            a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+        return sorted(set(a))
+
+    def _reduzir_overlap_global(self, apostas: list[list[int]], limite: int, ultimo: list[int]) -> list[list[int]]:
+        """
+        Reduz greedy o overlap global: para cada par (i<j) com overlap>limite,
+        altera apenas a aposta j usando trocas seguras (sem quebrar forma).
+        Determinístico: varre pares na ordem natural.
+        """
+        if not apostas:
+            return apostas
+        universo = set(range(1, 26))
+        u_set = set(ultimo or [])
+        out = [sorted(set(a)) for a in apostas]
+
+        def overlap(a, b) -> int:
+            return len(set(a) & set(b))
+
+        def _descolar(b: list[int], alvo: list[int]) -> list[int]:
+            """Troca itens de b que colidem com 'alvo' por complementares, preservando forma."""
+            b = sorted(set(b))
+            comp = sorted(universo - set(b))
+            colid = sorted((set(b) & set(alvo)), reverse=True)  # tira primeiro os mais altos
+            for rem in colid:
+                if len(set(b) & set(alvo)) <= limite:
+                    break
+                # busca candidato que não piore seq e preserve paridade alvo 7–8
+                for add in comp:
+                    if add in b:
+                        continue
+                    tmp = b[:]
+                    tmp.remove(rem)
+                    tmp.append(add)
+                    tmp = sorted(set(tmp))
+                    pares = sum(1 for n in tmp if n % 2 == 0)
+                    if (7 <= pares <= 8) and self._max_seq(tmp) <= 3:
+                        b = tmp
+                        comp = sorted(universo - set(b))
+                        break
+            # selagem curta
+            try:
+                b = self._hard_lock_fast(b, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3)
+            return sorted(set(b))
+
+        n = len(out)
+        mudou = True
+        # Limita iterações para evitar ciclos
+        for _ in range(6):
+            if not mudou:
+                break
+            mudou = False
+            for i in range(n):
+                for j in range(i+1, n):
+                    if overlap(out[i], out[j]) > limite:
+                        novo = _descolar(out[j], out[i])
+                        if novo != out[j]:
+                            out[j] = novo
+                            mudou = True
+        return [sorted(a) for a in out]
+
+    def _fechar_lote_stricto(self, apostas: list[list[int]], ultimo: list[int], overlap_max: int, max_ciclos: int = 6) -> list[list[int]]:
+        """
+        Fecha o lote até passar no TRIPLO CHECK (ou até max_ciclos).
+          1) quebra seq>3 por aposta
+          2) re-sela forma
+          3) dedup
+          4) reduz overlap global
+          5) TRIPLO CHECK; se reprovar, repete
+        """
+        out = [sorted(set(a)) for a in (apostas or [])]
+        for _ in range(max_ciclos):
+            # 1) quebrar seq>3 aposta a aposta
+            out = [self._quebrar_seq_maior_3(a) for a in out]
+            # 2) re-sela forma
+            try:
+                out = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in out]
+            except Exception:
+                out = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in out]
+            # 3) dedup estrito
+            uniq, seen = [], set()
+            for a in out:
+                t = tuple(a)
+                if t not in seen:
+                    seen.add(t)
+                    uniq.append(a)
+            out = uniq
+            # 4) overlap global
+            out = self._reduzir_overlap_global(out, overlap_max, ultimo or [])
+            # 5) triplo check
+            ok, _diag = self._triplo_check_stricto(out)
+            if ok:
+                break
+        return [sorted(a) for a in out]
+
+    # ===================[ FIM UTILITÁRIOS STRICTO ]===================
+
         
     # --- Auditoria do lote + preparo do /refinar_bolão e dica do /mestre ---
     async def _auditar_e_preparar_refino(self, update, context, oficial_15: list[int]):
