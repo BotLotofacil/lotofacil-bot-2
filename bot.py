@@ -1658,6 +1658,7 @@ class LotoFacilBot:
                 seen.add(t)
         return apostas_ok
 
+    # ===================[ FINALIZADOR MESTRE + HELPERS ]===================
     def _finalizar_lote_mestre(
         self,
         apostas: list[list[int]],
@@ -1667,7 +1668,7 @@ class LotoFacilBot:
         overlap_max: int = 11,
         max_ciclos: int = 6,
         aplicar_cap_par: bool = True,
-    ):
+    ) -> list[list[int]]:
         """
         Funil único de saída:
           1) dedup
@@ -1680,19 +1681,55 @@ class LotoFacilBot:
         """
         from math import ceil
 
-        # caps
+        ultimo = ultimo or []
+        # caps de diversidade
+        # cada dezena não deve aparecer "muito acima" da média teórica (15/25 do total por bilhete)
         cap_dezena = ceil(1.1 * target_qtd * 15 / 25)  # 1.1× média teórica
-        cap_pair   = self._cap_por_par(target_qtd)     # ~ metade do # de bilhetes
+        cap_pair   = self._cap_por_par(target_qtd)     # limite de coocorrência por par (def abaixo)
 
-        def _shape(a):
+        def _shape(a: list[int]) -> list[int]:
+            """Trava forma: paridade 7–8 e seq≤3, preservando inteligência quando possível."""
             try:
                 b = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
             except Exception:
                 b = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            # normaliza e garante 15
+            b = sorted(set(int(x) for x in b if 1 <= int(x) <= 25))
+            if len(b) != 15:
+                # completa/corta de forma estável
+                universo = list(range(1, 26))
+                if len(b) < 15:
+                    # tenta completar evitando vizinhos pra reduzir corridas
+                    comp = [n for n in universo if n not in b]
+                    for n in comp:
+                        if len(b) == 15:
+                            break
+                        if (n-1 not in b) and (n+1 not in b):
+                            b.append(n)
+                    if len(b) < 15:
+                        for n in comp:
+                            if len(b) == 15:
+                                break
+                            if n not in b:
+                                b.append(n)
+                    b = sorted(b)
+                else:
+                    # corta mantendo ~metade do 'ultimo'
+                    u_set = set(ultimo)
+                    keep, rest = [], []
+                    for n in b:
+                        (keep if n in u_set else rest).append(n)
+                    b = (keep[:8] + rest)[:15]
+                    b = sorted(b)
+            # reforço final de forma
+            try:
+                b = self._hard_lock_fast(b, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3)
             return sorted(set(b))
 
         # laço de refinamento
-        apostas_ok = [sorted(set(x)) for x in apostas]
+        apostas_ok = [sorted(set(x)) for x in (apostas or [])]
         for _ in range(max_ciclos):
             # 1) dedup
             apostas_ok = self._dedup_lote(apostas_ok)
@@ -1706,7 +1743,7 @@ class LotoFacilBot:
             except Exception:
                 pass
 
-            # 4) diversidade
+            # 4) diversidade (caps)
             apostas_ok = self._aplicar_cap_dezenas(apostas_ok, cap_dezena, ultimo)
             if aplicar_cap_par:
                 apostas_ok = self._aplicar_cap_par(apostas_ok, cap_pair, ultimo)
@@ -1733,7 +1770,237 @@ class LotoFacilBot:
         apostas_ok = [_shape(a) for a in apostas_ok]
 
         return [sorted(a) for a in apostas_ok]
-# ===================[ FIM FINALIZADOR MESTRE ]===================
+    # ===================[ FIM FINALIZADOR MESTRE ]===================
+
+
+    # ===================[ HELPERS DE DIVERSIDADE E SUPORTE ]===================
+    def _cap_por_par(self, target_qtd: int) -> int:
+        """
+        Limite de coocorrência por par (dupla de dezenas) em todo o lote.
+        Regra simples e segura: no máximo ~1/3 do total de bilhetes, arredondando pra cima.
+        """
+        from math import ceil
+        return max(1, ceil(target_qtd / 3))
+
+
+    def _dedup_lote(self, apostas: list[list[int]]) -> list[list[int]]:
+        """Remove duplicatas preservando a primeira ocorrência, mantendo ordenação canônica."""
+        seen = set()
+        res: list[list[int]] = []
+        for a in apostas or []:
+            t = tuple(sorted(set(a)))
+            if t not in seen:
+                seen.add(t)
+                res.append(list(t))
+        return res
+
+
+    def _aplicar_cap_dezenas(
+        self,
+        apostas: list[list[int]],
+        cap_dezena: int,
+        ultimo: list[int] | None = None,
+    ) -> list[list[int]]:
+        """
+        Limita a frequência de cada dezena a <= cap_dezena.
+        Tática: identifica dezenas excedentes e tenta trocá-las por dezenas subutilizadas,
+        preservando forma via _hard_lock_fast/_ajustar_paridade_e_seq.
+        """
+        from collections import Counter
+
+        ultimo = ultimo or []
+        universo = list(range(1, 26))
+        apostas = [sorted(set(a)) for a in (apostas or [])]
+
+        def _shape(a: list[int]) -> list[int]:
+            try:
+                b = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            return sorted(set(b))
+
+        for _ in range(3):  # até 3 passes leves
+            cnt = Counter(n for a in apostas for n in a)
+            excedentes = [n for n, c in cnt.items() if c > cap_dezena]
+            if not excedentes:
+                break
+            # escolhe candidatos subutilizados (menor frequência primeiro)
+            faltantes = [n for n in universo if cnt.get(n, 0) < cap_dezena]
+            faltantes.sort(key=lambda x: cnt.get(x, 0))
+            if not faltantes:
+                break
+
+            # para cada dezena excedente, percorre bilhetes contendo-a e tenta trocar
+            for n_ex in sorted(excedentes, key=lambda x: -cnt[x]):
+                if cnt[n_ex] <= cap_dezena:
+                    continue
+                for i, a in enumerate(apostas):
+                    if n_ex not in a:
+                        continue
+                    # tenta substituir por uma faltante que não estoure sequência
+                    for cand in faltantes:
+                        if cand in a:
+                            continue
+                        # evita vizinho direto para reduzir corridas
+                        if (cand - 1 in a) or (cand + 1 in a):
+                            continue
+                        a2 = sorted(set([x for x in a if x != n_ex] + [cand]))
+                        a2 = _shape(a2)
+                        if len(a2) == 15 and cand in a2 and n_ex not in a2:
+                            apostas[i] = a2
+                            cnt[n_ex] -= 1
+                            cnt[cand] += 1
+                            break
+                    if cnt[n_ex] <= cap_dezena:
+                        break
+
+        return [sorted(set(a)) for a in apostas]
+
+
+    def _aplicar_cap_par(
+        self,
+        apostas: list[list[int]],
+        cap_pair: int,
+        ultimo: list[int] | None = None,
+    ) -> list[list[int]]:
+        """
+        Limita coocorrência de QUALQUER par {x,y} a <= cap_pair.
+        Quando um par estoura o limite, quebramos a coocorrência em alguns bilhetes
+        trocando 1 dos 2 números por uma dezena subutilizada e re-selando a forma.
+        """
+        from collections import Counter
+        from itertools import combinations
+
+        ultimo = ultimo or []
+        universo = list(range(1, 26))
+        apostas = [sorted(set(a)) for a in (apostas or [])]
+
+        def _shape(a: list[int]) -> list[int]:
+            try:
+                b = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            return sorted(set(b))
+
+        # conta pares
+        def _pair_counts(lote: list[list[int]]) -> Counter:
+            c = Counter()
+            for a in lote:
+                for x, y in combinations(sorted(a), 2):
+                    c[(x, y)] += 1
+            return c
+
+        for _ in range(2):  # 2 passes leves
+            pc = _pair_counts(apostas)
+            ruins = [(p, c) for p, c in pc.items() if c > cap_pair]
+            if not ruins:
+                break
+            # ordena piores primeiro
+            ruins.sort(key=lambda t: -t[1])
+
+            # mapa de frequência de dezenas para achar substitutos
+            from collections import Counter as Cnt
+            dz = Cnt(n for a in apostas for n in a)
+
+            for (x, y), c in ruins:
+                # para cada bilhete que contém ambas, quebra o par
+                for i, a in enumerate(apostas):
+                    if x in a and y in a and c > cap_pair:
+                        # tenta substituir x OU y por dezena menos usada
+                        candidatos = sorted(
+                            (n for n in universo if n not in a),
+                            key=lambda n: dz.get(n, 0)
+                        )
+                        trocou = False
+                        for sub in candidatos:
+                            # escolhe trocar o que mais aparece globalmente para reduzir impacto
+                            troca = x if dz.get(x, 0) >= dz.get(y, 0) else y
+                            a2 = sorted(set([n for n in a if n != troca] + [sub]))
+                            a2 = _shape(a2)
+                            if len(a2) == 15 and sub in a2:
+                                # atualiza contadores aproximados
+                                dz[troca] -= 1
+                                dz[sub] += 1
+                                apostas[i] = a2
+                                c -= 1
+                                trocou = True
+                                break
+                        if not trocou:
+                            # fallback: pequena rotação simples
+                            fora = [n for n in universo if n not in a]
+                            if fora:
+                                a2 = sorted(set([n for n in a if n != (x if dz.get(x, 0) >= dz.get(y, 0) else y)] + [fora[0]]))
+                                a2 = _shape(a2)
+                                if len(a2) == 15:
+                                    apostas[i] = a2
+                                    c -= 1
+                    if c <= cap_pair:
+                        break
+
+        return [sorted(set(a)) for a in apostas]
+
+
+    def _garantir_qtd(
+        self,
+        apostas: list[list[int]],
+        target_qtd: int,
+        ultimo: list[int],
+        call_salt: int,
+        overlap_max: int = 11,
+    ) -> list[list[int]]:
+        """
+        Repõe até atingir target_qtd usando variações determinísticas,
+        respeitando anti-overlap e forma Mestre.
+        """
+        ultimo = ultimo or []
+        apostas = [sorted(set(a)) for a in (apostas or [])]
+        seen = {tuple(a) for a in apostas}
+        rep_salt = int(call_salt)
+
+        def _shape(a: list[int]) -> list[int]:
+            try:
+                b = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            return sorted(set(b))
+
+        # gerador determinístico (usa mesma lógica do _fallback do /gerar)
+        universo = list(range(1, 26))
+        L = list(ultimo) or universo[:15]
+        C = [n for n in universo if n not in L]
+
+        def _fallback_one(salt: int) -> list[int]:
+            offL = (salt) % len(L)
+            offC = ((salt // 7) % len(C)) if C else 0
+            a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
+            return _shape(a)
+
+        safety = 0
+        while len(apostas) < target_qtd and safety < 2000:
+            safety += 1
+            rep_salt += 1
+            cand = _fallback_one(rep_salt)
+            t = tuple(cand)
+            if t in seen:
+                continue
+            # respeita overlap com lote atual
+            if all(len(set(cand) & set(b)) <= overlap_max for b in apostas):
+                apostas.append(cand)
+                seen.add(t)
+
+        # idempotente: dedup + forma + anti-overlap
+        apostas = self._dedup_lote(apostas)
+        aposta_ok = []
+        for a in apostas:
+            aposta_ok.append(_shape(a))
+        try:
+            aposta_ok = self._forcar_anti_overlap(aposta_ok, ultimo=ultimo or [], limite=overlap_max)
+        except Exception:
+            pass
+        aposta_ok = [_shape(a) for a in aposta_ok]
+        return [sorted(a) for a in aposta_ok]
+    # ===================[ FIM HELPERS ]===================
+
 
     # ---------- Utilitários Mestre (baseado só no último resultado) ----------
     @staticmethod
