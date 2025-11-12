@@ -5315,7 +5315,14 @@ class LotoFacilBot:
         else:
             linhas.append("🔒 Lote reprovado: gere um novo lote conforme as regras e repita /confirmar.")
 
-        await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+        # ✅ Envio longo (evita o erro “Message is too long”)
+        texto = "\n".join(linhas)
+        try:
+            await self._send_long(update, texto, parse_mode="HTML")
+        except Exception:
+            logger.warning("Falha ao enviar com parse_mode HTML, tentando fallback...", exc_info=True)
+            await self._send_long(update, texto, parse_mode=None)
+
 
     # ===== Registrar a última geração (para o aprendizado leve / auto_aprender) =====
     def _registrar_geracao(self, apostas: list[list[int]], base_resultado: list[int] | None):
