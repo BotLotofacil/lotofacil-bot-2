@@ -1333,76 +1333,48 @@ class LotoFacilBot:
             except Exception:
                 OVERLAP_MAX = 11
 
-            # Normaliza forma
-            apostas = [sorted(set(a)) for a in apostas]
+            # 1) Funil único fecha o lote conforme as regras do Mestre
+            apostas_ok = self._finalizar_lote_mestre(
+                apostas=apostas,                 # vindo dos seus pós-filtros anteriores
+                ultimo=ultimo or [],
+                target_qtd=target_qtd,
+                call_salt=call_salt,
+                overlap_max=OVERLAP_MAX,
+                max_ciclos=6,
+                aplicar_cap_par=True,
+            )
 
-            # 1) Paridade e sequência (corrige/descarta inválidas)
-            apostas_ok = []
-            for a in apostas:
-                pares = sum(1 for n in a if n % 2 == 0)
-                if 7 <= pares <= 8 and self._max_seq(a) <= 3:
-                    apostas_ok.append(a)
-                else:
-                    # reparo rápido mantendo shape Mestre
-                    try:
-                        a_fix = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
-                    except Exception:
-                        a_fix = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                    apostas_ok.append(sorted(set(a_fix)))
-
-            # 2) Anti-overlap ≤ limite
-            try:
-                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
-            except Exception:
-                logger.warning("forcar_anti_overlap falhou; seguindo com lote atual.", exc_info=True)
-
-            # 3) Triplo check final; se reprovar por overlap → tenta reparo rápido
+            # 2) Sanity check opcional: se (por qualquer motivo) reprovar, repara
             ok_final, _diag_tc = self._triplo_check_stricto(apostas_ok)
             if not ok_final:
                 try:
-                    apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+                    apostas_ok = self._reparar_ate_passar_triplo_check(
+                        apostas=apostas_ok,
+                        ultimo=ultimo or [],
+                        limite_overlap=OVERLAP_MAX,
+                        max_tentativas=3,
+                    )
                 except Exception:
-                    pass
+                    logger.warning("reparar_ate_passar_triplo_check falhou; seguindo com lote atual.", exc_info=True)
 
-            # 4) Selagem final (garante 7–8 e seq≤3 após anti-overlap)
-            try:
-                apostas_ok = [
-                    self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
-                    for a in apostas_ok
-                ]
-            except Exception:
-                apostas_ok = [
-                    self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-                    for a in apostas_ok
-                ]
-
-            # 5) REPARO CONTROLADO: garante aprovação no TRIPLO CHECK
-            try:
-                limite_overlap = int(globals().get("BOLAO_MAX_OVERLAP", 11))
-            except Exception:
-                limite_overlap = 11
-            apostas_ok = self._reparar_ate_passar_triplo_check(
-                apostas=apostas_ok,
-                ultimo=ultimo or [],
-                limite_overlap=limite_overlap,
-                max_tentativas=3
-            )
-
-            # 6) GARANTIR QUANTIDADE EXATA (repor mantendo regras)
+            # 3) Garantia de quantidade exata (caso extremo)
             if len(apostas_ok) < target_qtd:
                 rep_salt = call_salt
                 seen = {tuple(a) for a in apostas_ok}
                 while len(apostas_ok) < target_qtd:
                     rep_salt += 1
                     cand = _fallback(1, rep_salt)[0]
-                    cand = _selar(cand)
+                    try:
+                        cand = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset())
+                    except Exception:
+                        cand = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
                     if all(len(set(cand) & set(b)) <= OVERLAP_MAX for b in apostas_ok):
-                        t = tuple(cand)
+                        t = tuple(sorted(set(cand)))
                         if t not in seen:
-                            apostas_ok.append(cand)
+                            apostas_ok.append(sorted(set(cand)))
                             seen.add(t)
 
-            # Selagem final por garantia
+            # 4) Selagem final por garantia (idempotente)
             try:
                 apostas_ok = [
                     self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
@@ -1456,6 +1428,7 @@ class LotoFacilBot:
             # --- Mensagem "Aprendizado leve atualizado" com média REAL do lote persistido ---
             try:
                 media_real = self._media_real_do_lote_persistido()
+
                 st_msg = _normalize_state_defaults(_bolao_load_state() or {})
                 st_msg = self._coagir_estado_lock_alpha(st_msg)
                 learn_msg = (st_msg.get("learning") or {})
@@ -1486,11 +1459,6 @@ class LotoFacilBot:
 
             # 4) Formatação + envio (usa α efetivo do /gerar)
             try:
-                st4 = _normalize_state_defaults(_bolao_load_state() or {})
-            except Exception:
-                st4 = None
-
-            try:
                 resposta = self._formatar_resposta(apostas_ok, janela, alpha_usado)
             except Exception:
                 # Fallback de formatação (mantém seu visual atual)
@@ -1505,15 +1473,7 @@ class LotoFacilBot:
                 if SHOW_TIMESTAMP:
                     now_sp = datetime.now(ZoneInfo(TIMEZONE))
                     carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    alpha_prop = (st.get("learning") or {}).get("alpha_proposto", None)
-                    if st["locks"].get("alpha_travado", True):
-                        if alpha_prop is None:
-                            alpha_info = f"α={alpha_usado:.2f} (travado)"
-                        else:
-                            alpha_info = f"α={alpha_usado:.2f} (travado) | α_proposto={float(alpha_prop):.2f} (pendente)"
-                    else:
-                        alpha_info = f"α={alpha_usado:.2f} (livre)"
-                    linhas.append(f"<i>janela={janela} | {alpha_info}</i>")
+                    linhas.append(f"<i>janela={janela} | α={alpha_usado:.2f}</i>")
                 resposta = "\n".join(linhas)
 
             # 5) Saída
@@ -1524,10 +1484,6 @@ class LotoFacilBot:
                 await self.auto_aprender(update, context)
             except Exception:
                 logger.warning("auto_aprender falhou; prosseguindo normalmente.", exc_info=True)
-
-        except Exception:
-            logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
-            await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
 
     def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
         """Formata a resposta com apostas + rodapé informativo."""
@@ -1543,6 +1499,237 @@ class LotoFacilBot:
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
             linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
         return "\n".join(linhas)
+    
+    
+    # =======================[ FINALIZADOR MESTRE ]=======================
+
+    def _dedup_lote(self, apostas: list[list[int]]) -> list[list[int]]:
+        seen = set()
+        out = []
+        for a in apostas:
+            t = tuple(sorted(set(a)))
+            if t not in seen:
+                out.append(list(t))
+                seen.add(t)
+        return out
+
+    def _freq_dezenas(self, apostas: list[list[int]]) -> dict[int, int]:
+        from collections import Counter
+        c = Counter()
+        for a in apostas:
+            c.update(a)
+        return dict(c)
+
+    def _aplicar_cap_dezenas(self, apostas: list[list[int]], cap_por_dezena: int, ultimo: list[int]) -> list[list[int]]:
+        """
+        Se alguma dezena exceder o cap, substitui nas apostas mais 'carregadas'
+        por dezenas menos frequentes, mantendo forma (7–8, seq≤3).
+        """
+        universo = list(range(1, 26))
+        freq = self._freq_dezenas(apostas)
+        # ordena por excesso (mais usados primeiro)
+        excesso = sorted([n for n, f in freq.items() if f > cap_por_dezena], key=lambda n: freq[n], reverse=True)
+        if not excesso:
+            return apostas
+
+        # candidatos menos usados
+        def _menos_usados_atual():
+            freq2 = self._freq_dezenas(apostas)
+            return sorted(universo, key=lambda n: freq2.get(n, 0))
+
+        # percorre apostas e substitui com cautela
+        for idx, a in enumerate(apostas):
+            a_set = set(a)
+            trocou = False
+            for n_ex in excesso:
+                if n_ex not in a_set:
+                    continue
+                # tenta trocar n_ex por um pouco usado que não quebre shape
+                for cand in _menos_usados_atual():
+                    if cand in a_set:
+                        continue
+                    # faz a troca temporária
+                    b = sorted(set((a_set - {n_ex}) | {cand}))
+                    # garante forma
+                    try:
+                        b = self._hard_lock_fast(b, ultimo=ultimo or [], anchors=frozenset())
+                    except Exception:
+                        b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3)
+                    # aceita se continuar com 15 e respeitar pares/seq
+                    pares = self._contar_pares(b) if hasattr(self, "_contar_pares") else sum(1 for x in b if x % 2 == 0)
+                    if len(b) == 15 and 7 <= pares <= 8 and self._max_seq(b) <= 3:
+                        apostas[idx] = b
+                        trocou = True
+                        break
+                if trocou:
+                    break
+        return apostas
+
+    def _cap_por_par(self, target_qtd: int) -> int:
+        # limite leve para coocorrência: metade do número de bilhetes (arredonda p/ cima)
+        from math import ceil
+        return max(1, ceil(target_qtd / 2))
+
+    def _aplicar_cap_par(self, apostas: list[list[int]], cap_por_par: int, ultimo: list[int]) -> list[list[int]]:
+        """
+        Se algum par ocorre acima do cap, tenta diluir trocando 1 número do par
+        nas apostas mais carregadas por um candidato pouco usado, mantendo a forma.
+        """
+        from collections import Counter
+        from itertools import combinations
+        universo = list(range(1, 26))
+
+        # conta pares
+        cnt = Counter()
+        for a in apostas:
+            for i, j in combinations(sorted(a), 2):
+                cnt[(i, j)] += 1
+        # quais pares estouraram
+        viol = [p for p, f in cnt.items() if f > cap_por_par]
+        if not viol:
+            return apostas
+
+        # tenta diluir
+        def _menos_usados_local():
+            freq = self._freq_dezenas(apostas)
+            return sorted(universo, key=lambda n: freq.get(n, 0))
+
+        for p in sorted(viol, key=lambda x: cnt[x], reverse=True):
+            i, j = p
+            for idx, a in enumerate(apostas):
+                if i in a and j in a:
+                    a_set = set(a)
+                    # remove um dos dois e insere um candidato menos usado
+                    for drop in (i, j):
+                        cand_list = _menos_usados_local()
+                        for cand in cand_list:
+                            if cand in a_set:
+                                continue
+                            b = sorted(set((a_set - {drop}) | {cand}))
+                            try:
+                                b = self._hard_lock_fast(b, ultimo=ultimo or [], anchors=frozenset())
+                            except Exception:
+                                b = self._ajustar_paridade_e_seq(b, alvo_par=(7, 8), max_seq=3)
+                            pares = self._contar_pares(b) if hasattr(self, "_contar_pares") else sum(1 for x in b if x % 2 == 0)
+                            if len(b) == 15 and 7 <= pares <= 8 and self._max_seq(b) <= 3:
+                                apostas[idx] = b
+                                break
+                        else:
+                            continue
+                        break
+        return apostas
+
+    def _garantir_qtd(self, apostas_ok: list[list[int]], target_qtd: int, ultimo: list[int], call_salt: int, overlap_max: int) -> list[list[int]]:
+        # repõe até atingir exatamente target_qtd, respeitando overlap e forma
+        from math import inf
+        seen = {tuple(sorted(a)) for a in apostas_ok}
+        rep_salt = call_salt
+        universo = list(range(1, 26))
+        while len(apostas_ok) < target_qtd:
+            rep_salt += 1
+            # usa seu fallback determinístico (já existente em /gerar)
+            try:
+                cand = self._hard_lock_fast(self._canon(self._fallback(1, rep_salt)[0]), ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                # fallback simples: mistura último + complemento
+                L = list(ultimo) or universo[:15]
+                C = [n for n in universo if n not in L]
+                a = (L[rep_salt % len(L):] + L[:rep_salt % len(L)])[:8] + (C[(rep_salt // 7) % len(C):] + C[:(rep_salt // 7) % len(C)])[:7]
+                cand = sorted(set(a))
+                try:
+                    cand = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset())
+                except Exception:
+                    cand = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
+            t = tuple(sorted(cand))
+            if t in seen:
+                continue
+            # checa overlap com o lote atual
+            ok = True
+            for b in apostas_ok:
+                if len(set(cand) & set(b)) > overlap_max:
+                    ok = False
+                    break
+            if ok:
+                apostas_ok.append(sorted(cand))
+                seen.add(t)
+        return apostas_ok
+
+    def _finalizar_lote_mestre(
+        self,
+        apostas: list[list[int]],
+        ultimo: list[int],
+        target_qtd: int,
+        call_salt: int,
+        overlap_max: int = 11,
+        max_ciclos: int = 6,
+        aplicar_cap_par: bool = True,
+    ):
+        """
+        Funil único de saída:
+          1) dedup
+          2) selagem de forma (7–8, seq≤3)
+          3) anti-overlap global ≤ overlap_max
+          4) cap de diversidade (por dezena e, opcionalmente, por par)
+          5) re-selagem
+          6) triplo check ; se reprovar, repara e repete (até max_ciclos)
+          7) garante quantidade exata (repreenche + re-finaliza rápido)
+        """
+        from math import ceil
+
+        # caps
+        cap_dezena = ceil(1.1 * target_qtd * 15 / 25)  # 1.1× média teórica
+        cap_pair   = self._cap_por_par(target_qtd)     # ~ metade do # de bilhetes
+
+        def _shape(a):
+            try:
+                b = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+            except Exception:
+                b = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            return sorted(set(b))
+
+        # laço de refinamento
+        apostas_ok = [sorted(set(x)) for x in apostas]
+        for _ in range(max_ciclos):
+            # 1) dedup
+            apostas_ok = self._dedup_lote(apostas_ok)
+
+            # 2) shape
+            apostas_ok = [_shape(a) for a in apostas_ok]
+
+            # 3) anti-overlap global
+            try:
+                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=overlap_max)
+            except Exception:
+                pass
+
+            # 4) diversidade
+            apostas_ok = self._aplicar_cap_dezenas(apostas_ok, cap_dezena, ultimo)
+            if aplicar_cap_par:
+                apostas_ok = self._aplicar_cap_par(apostas_ok, cap_pair, ultimo)
+
+            # 5) re-shape
+            apostas_ok = [_shape(a) for a in apostas_ok]
+
+            # 6) triplo check
+            ok, _diag = self._triplo_check_stricto(apostas_ok)
+            if ok:
+                break
+
+        # 7) garantir quantidade exata
+        if len(apostas_ok) < target_qtd:
+            apostas_ok = self._garantir_qtd(apostas_ok, target_qtd, ultimo, call_salt, overlap_max)
+
+        # rodada final idempotente
+        apostas_ok = self._dedup_lote(apostas_ok)
+        apostas_ok = [_shape(a) for a in apostas_ok]
+        try:
+            apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=overlap_max)
+        except Exception:
+            pass
+        apostas_ok = [_shape(a) for a in apostas_ok]
+
+        return [sorted(a) for a in apostas_ok]
+# ===================[ FIM FINALIZADOR MESTRE ]===================
 
     # ---------- Utilitários Mestre (baseado só no último resultado) ----------
     @staticmethod
