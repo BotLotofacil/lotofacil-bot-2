@@ -1485,6 +1485,10 @@ class LotoFacilBot:
             except Exception:
                 logger.warning("auto_aprender falhou; prosseguindo normalmente.", exc_info=True)
 
+        except Exception:
+            logger.error("Erro no pipeline de geração:\n" + traceback.format_exc())
+            await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
+
     def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
         """Formata a resposta com apostas + rodapé informativo."""
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
