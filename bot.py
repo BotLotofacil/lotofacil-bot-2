@@ -1322,34 +1322,65 @@ class LotoFacilBot:
             except Exception:
                 OVERLAP_MAX = 11
 
+            def _shape_ok(a: list[int]) -> bool:
+                if len(a) != 15 or len(set(a)) != 15:
+                    return False
+                pares = sum(1 for n in a if n % 2 == 0)
+                if not (7 <= pares <= 8):
+                    return False
+                return self._max_seq(a) <= 3
+
             # 1) Funil único fecha o lote conforme as regras do Mestre
-            apostas_ok = self._finalizar_lote_mestre(
-                apostas=apostas,                 # vindo dos seus pós-filtros anteriores
-                ultimo=ultimo or [],
-                target_qtd=target_qtd,
-                call_salt=call_salt,
-                overlap_max=OVERLAP_MAX,
-                max_ciclos=6,
-                aplicar_cap_par=True,
-            )
-
-            # 2) Sanity check opcional: se (por qualquer motivo) reprovar, repara
-            ok_final, _diag_tc = self._triplo_check_stricto(apostas_ok)
-            if not ok_final:
+            try:
+                apostas_ok = self._finalizar_lote_mestre(
+                    apostas=apostas,
+                    ultimo=ultimo or [],
+                    target_qtd=target_qtd,
+                    call_salt=call_salt,
+                    overlap_max=OVERLAP_MAX,
+                    max_ciclos=6,
+                    aplicar_cap_par=True,
+                )
+            except Exception:
+                # fallback: aplica shape+anti-overlap básico
+                logger.warning("_finalizar_lote_mestre falhou; aplicando fallback básico.", exc_info=True)
+                apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas]
                 try:
-                    apostas_ok = self._reparar_ate_passar_triplo_check(
-                        apostas=apostas_ok,
-                        ultimo=ultimo or [],
-                        limite_overlap=OVERLAP_MAX,
-                        max_tentativas=3,
-                    )
+                    apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
                 except Exception:
-                    logger.warning("reparar_ate_passar_triplo_check falhou; seguindo com lote atual.", exc_info=True)
+                    pass
 
-            # 3) Garantia de quantidade exata (caso extremo)
+            # 2) Reparos iterativos determinísticos (elimina seq>3/paridade fora e recontrola overlap)
+            MAX_CICLOS_FIX = 4
+            for _ in range(MAX_CICLOS_FIX):
+                # re-selar forma em todas
+                apostas_ok = [
+                    self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+                    for a in apostas_ok
+                ]
+                # dedup estrito
+                uniq, seen = [], set()
+                for a in apostas_ok:
+                    t = tuple(a)
+                    if t not in seen:
+                        seen.add(t)
+                        uniq.append(a)
+                apostas_ok = uniq
+
+                # anti-overlap global
+                try:
+                    apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+                except Exception:
+                    pass
+
+                # checagem de forma
+                if all(_shape_ok(a) for a in apostas_ok):
+                    break
+
+            # 3) Garantia de quantidade exata (reposições válidas)
             if len(apostas_ok) < target_qtd:
                 rep_salt = call_salt
-                seen = {tuple(a) for a in apostas_ok}
+                seen = {tuple(sorted(a)) for a in apostas_ok}
                 while len(apostas_ok) < target_qtd:
                     rep_salt += 1
                     cand = _fallback(1, rep_salt)[0]
@@ -1357,13 +1388,16 @@ class LotoFacilBot:
                         cand = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset())
                     except Exception:
                         cand = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
+                    cand = sorted(set(cand))
+                    if not _shape_ok(cand):
+                        continue
                     if all(len(set(cand) & set(b)) <= OVERLAP_MAX for b in apostas_ok):
-                        t = tuple(sorted(set(cand)))
+                        t = tuple(cand)
                         if t not in seen:
-                            apostas_ok.append(sorted(set(cand)))
+                            apostas_ok.append(cand)
                             seen.add(t)
 
-            # 4) Selagem final por garantia (idempotente)
+            # 4) Selagem final por garantia (idempotente) + dedup final + anti-overlap final
             try:
                 apostas_ok = [
                     self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
@@ -1374,6 +1408,28 @@ class LotoFacilBot:
                     self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
                     for a in apostas_ok
                 ]
+
+            # dedup final
+            uniq, seen = [], set()
+            for a in apostas_ok:
+                t = tuple(a)
+                if t not in seen:
+                    seen.add(t)
+                    uniq.append(a)
+            apostas_ok = uniq
+
+            # anti-overlap final (não relaxa forma)
+            try:
+                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+            except Exception:
+                pass
+
+            # valida forma novamente e corrige casos extremos
+            apostas_ok = [
+                (self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+                 if not _shape_ok(a) else a)
+                for a in apostas_ok
+            ]
 
             # Usa a versão selada e reparada
             apostas = [sorted(a) for a in apostas_ok]
@@ -1475,7 +1531,7 @@ class LotoFacilBot:
                 logger.warning("auto_aprender falhou; prosseguindo normalmente.", exc_info=True)
 
         except Exception:
-            logger.error("Erro no pipeline de geração:\n" + traceback.format_exc())
+            logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
 
     def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
