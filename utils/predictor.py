@@ -301,7 +301,7 @@ class Predictor:
             aprovadas.extend(restantes[:faltantes])
         return aprovadas[:qtd_final]
 
-        # ---------- Geração pública (MODO ELITE) ----------
+    # ---------- Geração pública (MODO ELITE) ----------
     def gerar_apostas(self, qtd: int = 5, seed: int | None = None) -> List[List[int]]:
         """
         Gera 'qtd' bilhetes (listas ordenadas de 15 dezenas).
@@ -352,8 +352,8 @@ class Predictor:
 
         # 3) Função interna de SCORE para cada aposta do pool (MODO ELITE)
         alvo_R_centro = 9.5   # queremos R ~9–10
-        largura_R      = 1.5   # 8..11 ainda são aceitáveis
-        bias_R         = float(getattr(self.cfg, "bias_R", 0.45))
+        largura_R = 1.5       # 8..11 ainda são aceitáveis
+        bias_R = float(getattr(self.cfg, "bias_R", 0.45))
 
         ultimo_set = self._ultimo or set()
 
@@ -375,7 +375,7 @@ class Predictor:
                 #   score_R = -((R - alvo)^2)  → máximo em R=alvo
                 # normalizado por largura_R para não matar 8 e 11
                 dist_norm = (repetidas - alvo_R_centro) / largura_R
-                score_R_shape = - (dist_norm ** 2)   # máximo ~0 em R≈alvo; cai pros extremos
+                score_R_shape = -(dist_norm ** 2)   # máximo ~0 em R≈alvo; cai pros extremos
 
                 # camada extra: penaliza R muito baixos (<=6) e muito altos (>=13)
                 if repetidas <= 6 or repetidas >= 13:
@@ -399,7 +399,3 @@ class Predictor:
             apostas = candidatas[: int(qtd)]
 
         return apostas
-
-        except Exception:
-            logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
-            await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
