@@ -45,6 +45,7 @@ class GeradorApostasConfig:
     - filtro: regras simples aplicadas após a geração (paridade/colunas).
     - pool_multiplier: tamanho inicial do pool para seleção ELITE.
     - bias_R: peso da repetição, reforçando bilhetes com R próximo de 9–10.
+      (Na V1 "desengessada", o uso desse bias é mais suave.)
     """
 
     janela: int = 50
@@ -61,7 +62,7 @@ class GeradorApostasConfig:
     # pool inicial (modo elite ajusta automaticamente para qtd>=30)
     pool_multiplier: int = 3
 
-    # força do R para o modo elite (9R–10R = alvo central)
+    # força do R para o modo elite (9R–10R = alvo central) – uso suavizado
     bias_R: float = 0.45
 
 
@@ -74,10 +75,14 @@ class Predictor:
     Treina a partir de uma janela do histórico (lista de sets de 15 dezenas) e
     gera bilhetes por amostragem sem reposição, aplicando penalizações suaves.
 
-    Agora:
-    - continua usando frequências + lift (coocorrência),
-    - aplica um viés leve de repetição (R) em relação ao último concurso,
-    - e ainda pode usar um filtro pós-geração (paridade/colunas) se configurado.
+    V1 DESENGESSADA:
+    - Mantém frequências + lift (coocorrência).
+    - Mantém um viés de repetição (R), mas com uso mais suave:
+        • no nível de dezenas: reforço leve para dezenas do último resultado,
+          sem penalizar forte as “novas”.
+        • no nível de bilhete: bônus suave para R em torno de 8–11,
+          sem matar outras combinações.
+    - Filtro pós-geração continua opcional (paridade/colunas).
     """
 
     def __init__(self, config: GeradorApostasConfig | None = None) -> None:
@@ -176,7 +181,7 @@ class Predictor:
         """
         Score do candidato baseado em:
           - log-probabilidade estimada (estável numericamente)
-          - leve reforço de repetição (R) em relação ao último concurso
+          - reforço LEVE de repetição (R) em relação ao último concurso (sem castigar demais as “novas”)
           - penalização por coocorrência excessiva via lift
           - balanceamentos leves de paridade e faixa (1..12 vs 13..25)
         """
@@ -184,13 +189,12 @@ class Predictor:
         base = math.log(max(p, 1e-12))
 
         # Reforço leve para dezenas que se repetem em relação ao último sorteio
+        # V1 desengessada: apenas +boost para dezenas do último; não penaliza forte as novas.
         if self._ultimo:
             if cand in self._ultimo:
-                # empurra o modelo a colocar mais dezenas repetidas (R alto)
-                base += float(self.cfg.bias_R)
-            else:
-                # leve penalização para completamente "novas"
-                base -= float(self.cfg.bias_R) * 0.40
+                # reforço suave: usa apenas uma fração do bias_R
+                base += float(self.cfg.bias_R) * 0.25  # ex.: 0.45 * 0.25 ≈ +0.11
+            # se não estiver no último, não mexe em nada (sem "porrada" negativa)
 
         # Penalização por pares com lift>1 (aparecem juntos acima do esperado)
         rep = 0.0
@@ -200,7 +204,7 @@ class Predictor:
                 if lij > 1.0:
                     rep -= float(self.cfg.repulsao_lift) * math.log(lij + 1e-12)
 
-        # Balanceamento leve de paridade (evitar extremos)
+        # Balanceamento leve de paridade (evitar extremos) – idem original
         impares_sel = sum(1 for x in selecionados if x % 2 == 1)
         pares_sel = len(selecionados) - impares_sel
         impar = (cand % 2 == 1)
@@ -306,19 +310,20 @@ class Predictor:
         """
         Gera 'qtd' bilhetes (listas ordenadas de 15 dezenas).
 
-        Estratégia ELITE:
+        Estratégia ELITE (V1 desengessada):
         1) Gera um POOL grande de apostas (pool_multiplier * qtd).
            - se qtd >= 30, usa pool_multiplier “turbo”.
         2) Dá uma NOTA para cada aposta, baseada em:
            - probabilidades p[d] estimadas (força de cada dezena);
            - quantidade de dezenas repetidas em relação ao último concurso (R),
-             com alvo em 9R–10R (8 e 11 aceitos como variação).
+             com alvo suave em torno de 8–11 (sem matar outras faixas).
         3) Ordena da melhor para a pior.
         4) Aplica o filtro pós-geração (paridade/colunas) priorizando as melhores.
         5) Retorna apenas as TOP 'qtd'.
 
-        Objetivo: concentrar força em bilhetes potencialmente explosivos
-        (R alto + dezenas fortes), em vez de pulverizar força em bilhetes mornos.
+        Objetivo: concentrar força em bilhetes potencialmente fortes,
+        mas sem “engessar” demais o R. O shape final (9R–10R etc.) fica
+        a cargo do Mestre + triplo check.
         """
         if not self._treinado:
             raise RuntimeError("Chame fit() antes de gerar.")
@@ -351,8 +356,9 @@ class Predictor:
                 candidatas.append(sorted(rng.sample(range(1, 26), 15)))
 
         # 3) Função interna de SCORE para cada aposta do pool (MODO ELITE)
-        alvo_R_centro = 9.5   # queremos R ~9–10
-        largura_R = 1.5       # 8..11 ainda são aceitáveis
+        # V1 desengessada: alvo de R mais largo e sem punição brutal nos extremos.
+        alvo_R_centro = 9.0   # ainda queremos algo perto de 9–10
+        largura_R = 3.0       # 6..12 praticamente dentro da “zona boa”
         bias_R = float(getattr(self.cfg, "bias_R", 0.45))
 
         ultimo_set = self._ultimo or set()
@@ -365,23 +371,19 @@ class Predictor:
                     p = float(self._p[d - 1])
                     base += math.log(max(p, 1e-12))
 
-            # (b) reforço por repetição (R) com alvo 9R–10R
+            # (b) reforço por repetição (R) com alvo suave em torno de 9
             bonus_R = 0.0
             if ultimo_set:
                 repetidas = sum(1 for d in ap if d in ultimo_set)
 
-                # janela de interesse em torno de 9.5
-                # usamos um "chapéu" (parábola invertida):
-                #   score_R = -((R - alvo)^2)  → máximo em R=alvo
-                # normalizado por largura_R para não matar 8 e 11
+                # “chapéu” suave (parábola invertida) normalizado por largura_R
                 dist_norm = (repetidas - alvo_R_centro) / largura_R
-                score_R_shape = -(dist_norm ** 2)   # máximo ~0 em R≈alvo; cai pros extremos
+                score_R_shape = -(dist_norm ** 2)  # máximo ~0 perto do alvo; cai suavemente
 
-                # camada extra: penaliza R muito baixos (<=6) e muito altos (>=13)
-                if repetidas <= 6 or repetidas >= 13:
-                    score_R_shape -= 2.0
+                # Não vamos descer demais o score para extremos; limitamos o impacto
+                score_R_shape = max(score_R_shape, -1.5)
 
-                bonus_R = bias_R * score_R_shape
+                bonus_R = bias_R * score_R_shape * 0.8  # ainda mais suave (0.8)
 
             return base + bonus_R
 
