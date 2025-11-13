@@ -184,7 +184,7 @@ DESEMPENHO_BOM_R    = 12.0     # opcional: faixa "bom"
 # Parâmetros padrão do gerador
 # ========================
 # Quantidade: permitir até 50 no /gerar
-QTD_BILHETES_PADRAO = 5
+QTD_BILHETES_PADRAO = 30
 QTD_BILHETES_MIN = 1
 QTD_BILHETES_MAX = 200
 
@@ -203,7 +203,7 @@ WHITELIST_PATH = "whitelist.txt"
 
 # --- Alpha lock (apenas no /gerar) ---
 LOCK_ALPHA_GERAR = True      # deixe True para travar /gerar em 0.36
-ALPHA_LOCK_VALUE  = 0.36     # valor travado só para /gerar
+ALPHA_LOCK_VALUE  = 0.37     # valor travado só para /gerar
 
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
@@ -219,7 +219,7 @@ BUILD_TAG = getenv("BUILD_TAG", "unknown")
 # ========================
 BOLAO_JANELA = 60
 BOLAO_ALPHA  = 0.36
-BOLAO_QTD_APOSTAS = 5
+BOLAO_QTD_APOSTAS = 30
 BOLAO_ANCHORS = (9, 11)
 BOLAO_STATE_PATH = "data/bolao_state.json"
 
