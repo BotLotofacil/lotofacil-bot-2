@@ -688,37 +688,58 @@ class LotoFacilBot:
         alpha: float = ALPHA_PADRAO,
     ) -> List[List[int]]:
         """
-        Gera bilhetes usando o preditor configurado.
-        - Aplica pool (3x) e filtro pós-geração (pares 6–9; colunas 1–4; relaxamento).
-        Em caso de falha, aplica fallback uniforme.
+        Gera bilhetes usando o NOVO preditor unificado (utils.predictor.Predictor).
+
+        - Usa janela e alpha já clampados e alinhados com o restante do bot.
+        - Gera um pool maior (4x) e aplica um filtro pós-geração leve:
+            • paridade entre 6 e 9 pares (não trava em 7–8 aqui);
+            • 1 a 4 dezenas por coluna (matriz 5x5);
+            • relaxamento progressivo se necessário.
+        - A forma FINAL (paridade 7–8, seq≤3, anti-overlap≤11) continua sendo garantida
+          pelos funis de selagem/triplo check depois desse gerador.
         """
         try:
+            # garante parâmetros dentro dos limites globais
             qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
+
+            # carrega histórico e corta para a janela desejada
             historico = carregar_historico(HISTORY_PATH)
             janela_hist = ultimos_n_concursos(historico, janela)
 
+            # filtro leve de composição (não é o TRIPLO CHECK ainda)
             filtro = FilterConfig(
-                paridade_min=6,
+                paridade_min=6,   # deixa respirar: 6–9 pares aqui
                 paridade_max=9,
                 col_min=1,
                 col_max=4,
                 relax_steps=2,
             )
 
+            # configura o preditor:
+            # - alpha vindo do runtime (/gerar trava em 0.36)
+            # - pool maior para ter opções na hora de filtrar
             cfg = GeradorApostasConfig(
                 janela=janela,
                 alpha=alpha,
                 filtro=filtro,
-                pool_multiplier=3,
+                pool_multiplier=4,   # pool um pouco maior para aumentar diversidade
+                # bias_R já vem com default 0.35 no dataclass
             )
+
             modelo = Predictor(cfg)
             modelo.fit(janela_hist, janela=janela)
             return modelo.gerar_apostas(qtd=qtd)
+
         except Exception:
-            logger.error("Falha no gerador preditivo; aplicando fallback.\n" + traceback.format_exc())
+            # Fallback duro e bem explícito para não travar o bot
+            logger.error(
+                "Falha no gerador preditivo; aplicando fallback completamente aleatório.",
+                exc_info=True,
+            )
             import random
             rng = random.Random()
             return [sorted(rng.sample(range(1, 26), 15)) for _ in range(max(1, qtd))]
+
 
     # ========================
     # Aprendizado REAL (revisado c/ política ≥11)
