@@ -286,24 +286,35 @@ class Predictor:
             aprovadas.extend(restantes[:faltantes])
         return aprovadas[:qtd_final]
 
-    # ---------- Geração pública ----------
+        # ---------- Geração pública ----------
     def gerar_apostas(self, qtd: int = 5, seed: int | None = None) -> List[List[int]]:
         """
         Gera 'qtd' bilhetes (listas ordenadas de 15 dezenas).
-        - Usa pool de apostas (pool_multiplier * qtd) para aumentar diversidade.
-        - Aplica filtro pós-geração se self.cfg.filtro não for None.
-        - Mantém robustez (max_tentativas) e, em último caso, fallback uniforme.
+
+        Estratégia agora:
+        1) Gera um POOL grande de apostas (pool_multiplier * qtd).
+        2) Dá uma NOTA para cada aposta, baseada em:
+           - probabilidades p[d] estimadas;
+           - quantidade de dezenas repetidas em relação ao último concurso (R).
+        3) Ordena da melhor para a pior.
+        4) Aplica o filtro pós-geração (paridade/colunas) priorizando as melhores.
+        5) Retorna apenas as TOP 'qtd'.
+
+        Isso cria um "MODO ELITE": o lote final é composto pelas combinações
+        mais fortes segundo o modelo, aumentando a chance de ter bilhetes
+        muito acima da média (11–15), em vez de ficar espalhando força em
+        dezenas fracas.
         """
         if not self._treinado:
             raise RuntimeError("Chame fit() antes de gerar.")
 
         rng = random.Random(seed)
 
-        # Tamanho do pool
+        # 1) Define o tamanho do pool
         pool = max(1, int(self.cfg.pool_multiplier)) * max(1, int(qtd))
         candidatas: List[List[int]] = []
 
-        # Geração com checagem leve de plausibilidade (paridade ampla)
+        # 2) Geração com checagem leve de plausibilidade (paridade bem ampla)
         for _ in range(pool):
             ok = False
             for _t in range(int(self.cfg.max_tentativas)):
@@ -318,11 +329,35 @@ class Predictor:
                 # fallback seguro: uniforme sem reposição
                 candidatas.append(sorted(rng.sample(range(1, 26), 15)))
 
-        # Aplicar filtro pós-geração (se configurado)
+        # 3) Função interna de SCORE para cada aposta do pool
+        def _score_bilhete(ap: List[int]) -> float:
+            # base: força pelas probabilidades estimadas p[d]
+            base = 0.0
+            if self._p is not None:
+                for d in ap:
+                    p = float(self._p[d - 1])
+                    base += math.log(max(p, 1e-12))
+
+            # reforço por repetição (R): quantas dezenas vêm do último sorteio
+            bonus_R = 0.0
+            if self._ultimo:
+                repetidas = sum(1 for d in ap if d in self._ultimo)
+                # quanto maior o bias_R, mais o modelo força "R alto"
+                bonus_R = self.cfg.bias_R * float(repetidas)
+
+            return base + bonus_R
+
+        # 4) Ordena o pool pela nota (da melhor para a pior)
+        candidatas.sort(key=_score_bilhete, reverse=True)
+
+        # 5) Aplica filtro pós-geração, priorizando as melhores
         if self.cfg.filtro is not None:
-            apostas = self._aplicar_filtro_pos_geracao(candidatas, self.cfg.filtro, int(qtd))
+            apostas = self._aplicar_filtro_pos_geracao(
+                candidatas,
+                self.cfg.filtro,
+                int(qtd)
+            )
         else:
-            # Sem filtro: apenas corta para a quantidade final
             apostas = candidatas[: int(qtd)]
 
         return apostas
