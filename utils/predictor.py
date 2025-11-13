@@ -286,398 +286,104 @@ class Predictor:
             aprovadas.extend(restantes[:faltantes])
         return aprovadas[:qtd_final]
 
-    # --- /gerar: rápido, estável, sem cache e com diversidade entre chamadas ---
-    async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # ---------- Geração pública (MODO ELITE) ----------
+    def gerar_apostas(self, qtd: int = 5, seed: int | None = None) -> List[List[int]]:
         """
-        Comando /gerar – Estratégia Mestre, rápido e estável.
+        Gera 'qtd' bilhetes (listas ordenadas de 15 dezenas).
 
-        • Usa o NOVO PREDITOR ELITE (utils.predictor.Predictor):
-          - gera um pool grande;
-          - pontua cada bilhete (probabilidade + repetição R);
-          - escolhe apenas as TOP apostas do pool.
-        • α TRAVADO = 0.36 (LOCK_ALPHA_GERAR=True), independente do aprendizado.
-        • Paridade alvo FINAL: 7–8 | Máx. sequência FINAL: ≤3 | Anti-overlap FINAL: ≤11.
-        • Repetição R: foco em 9R–10R, com 1×8R e 1×11R de variação (garantido nos templates).
-        • Uso: /gerar [qtd] [janela] [alpha]  → (alpha é ignorado: lock=0.36)
-        • Padrão: 5 apostas | janela=60 | α=0.36 (travado no /gerar)
+        Estratégia ELITE:
+        1) Gera um POOL grande de apostas (pool_multiplier * qtd).
+           - se qtd >= 30, usa pool_multiplier “turbo”.
+        2) Dá uma NOTA para cada aposta, baseada em:
+           - probabilidades p[d] estimadas (força de cada dezena);
+           - quantidade de dezenas repetidas em relação ao último concurso (R),
+             com alvo em 9R–10R (8 e 11 aceitos como variação).
+        3) Ordena da melhor para a pior.
+        4) Aplica o filtro pós-geração (paridade/colunas) priorizando as melhores.
+        5) Retorna apenas as TOP 'qtd'.
+
+        Objetivo: concentrar força em bilhetes potencialmente explosivos
+        (R alto + dezenas fortes), em vez de pulverizar força em bilhetes mornos.
         """
+        if not self._treinado:
+            raise RuntimeError("Chame fit() antes de gerar.")
 
-        import asyncio, traceback
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
+        rng = random.Random(seed)
 
-        user_id = update.effective_user.id
-        if not self._usuario_autorizado(user_id):
-            return await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
+        # 1) Define o tamanho do pool (modo turbo para lotes grandes)
+        base_pool = max(1, int(self.cfg.pool_multiplier))
+        if qtd >= 30:
+            pool_multiplier = max(base_pool * 2, 8)  # ex.: se era 3 => vira 8
+        else:
+            pool_multiplier = base_pool
 
-        # >>> anti-abuso
-        if not self._is_admin(user_id):
-            if _is_temporarily_blocked(user_id):
-                return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
-            allowed, warn = _register_command_event(user_id, is_unknown=False)
-            if not allowed:
-                return await update.message.reply_text(warn)
-            if warn:
-                await update.message.reply_text(warn)
-        # <<< anti-abuso
+        pool = pool_multiplier * max(1, int(qtd))
+        candidatas: List[List[int]] = []
 
-        # Defaults
-        qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
+        # 2) Geração com checagem leve de plausibilidade (paridade bem ampla)
+        for _ in range(pool):
+            ok = False
+            for _t in range(int(self.cfg.max_tentativas)):
+                b = self._amostrar15(rng)
+                pares = self._contar_pares(b)
+                # filtro leve, amplo, para evitar extremos muito improváveis
+                if 2 <= pares <= 13:
+                    candidatas.append(b)
+                    ok = True
+                    break
+            if not ok:
+                # fallback seguro: uniforme sem reposição
+                candidatas.append(sorted(rng.sample(range(1, 26), 15)))
 
-        # Parse argumentos posicionais (opcionais)
-        try:
-            if context.args and len(context.args) >= 1:
-                qtd = int(context.args[0])
-            if context.args and len(context.args) >= 2:
-                janela = int(context.args[1])
-            if context.args and len(context.args) >= 3:
-                alpha = float(context.args[2].replace(",", "."))
-        except Exception:
-            # se der erro, mantém defaults
-            pass
+        # 3) Função interna de SCORE para cada aposta do pool (MODO ELITE)
+        alvo_R_centro = 9.5   # queremos R ~9–10
+        largura_R      = 1.5   # 8..11 ainda são aceitáveis
+        bias_R         = float(getattr(self.cfg, "bias_R", 0.45))
 
-        # Clamps defensivos
-        qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
-        target_qtd = max(1, int(qtd))  # garante respeitar /gerar 50, etc.
+        ultimo_set = self._ultimo or set()
 
-        # >>> trava α somente no /gerar (sem afetar demais comandos)
-        alpha = self._alpha_para_comando("/gerar", alpha_sugerido=alpha)
-        # <<< trava α somente no /gerar
+        def _score_bilhete(ap: List[int]) -> float:
+            # (a) base: força pelas probabilidades estimadas p[d]
+            base = 0.0
+            if self._p is not None:
+                for d in ap:
+                    p = float(self._p[d - 1])
+                    base += math.log(max(p, 1e-12))
 
-        # --- coerência de estado e alpha_usado ---
-        st = _normalize_state_defaults(_bolao_load_state() or {})
-        st = self._coagir_estado_lock_alpha(st)
-        alpha_usado = self._alpha_para_execucao(st)
-        try:
-            _bolao_save_state(st)
-        except Exception:
-            pass
+            # (b) reforço por repetição (R) com alvo 9R–10R
+            bonus_R = 0.0
+            if ultimo_set:
+                repetidas = sum(1 for d in ap if d in ultimo_set)
 
-        # Histórico/último seguro
-        try:
-            historico = carregar_historico(HISTORY_PATH)
-        except Exception:
-            historico = []
-        try:
-            ultimo = self._ultimo_resultado(historico) if historico else []
-        except Exception:
-            ultimo = []
+                # janela de interesse em torno de 9.5
+                # usamos um "chapéu" (parábola invertida):
+                #   score_R = -((R - alvo)^2)  → máximo em R=alvo
+                # normalizado por largura_R para não matar 8 e 11
+                dist_norm = (repetidas - alvo_R_centro) / largura_R
+                score_R_shape = - (dist_norm ** 2)   # máximo ~0 em R≈alvo; cai pros extremos
 
-        u_set = set(ultimo)
-        universo = list(range(1, 26))
+                # camada extra: penaliza R muito baixos (<=6) e muito altos (>=13)
+                if repetidas <= 6 or repetidas >= 13:
+                    score_R_shape -= 2.0
 
-        # --------- utilidades canônicas e selagem ----------
-        def _canon(a: list[int]) -> list[int]:
-            """Normaliza: 1..25, únicos, ordenados, exatamente 15."""
-            a = [int(x) for x in a if 1 <= int(x) <= 25]
-            a = sorted(set(a))
-            if len(a) > 15:
-                keep = []
-                for n in a:
-                    if len(keep) == 15:
-                        break
-                    # prioriza alternância entre números do último resultado e fora dele
-                    if (len(keep) % 2 == 0 and n in u_set) or (len(keep) % 2 == 1 and n not in u_set):
-                        keep.append(n)
-                if len(keep) < 15:
-                    for n in a:
-                        if n not in keep:
-                            keep.append(n)
-                            if len(keep) == 15:
-                                break
-                a = keep
-            elif len(a) < 15:
-                comp = [n for n in universo if n not in a]
-                # tenta completar sem criar sequências longas
-                for n in comp:
-                    if (n - 1 not in a) and (n + 1 not in a):
-                        a.append(n)
-                        if len(a) == 15:
-                            break
-                if len(a) < 15:
-                    for n in comp:
-                        if n not in a:
-                            a.append(n)
-                            if len(a) == 15:
-                                break
-                a = sorted(a)
-            return a
+                bonus_R = bias_R * score_R_shape
 
-        def _selar(a: list[int]) -> list[int]:
-            """
-            Canônico + lock forte (pares 7–8, seq≤3), preservando ao máximo
-            a inteligência vinda do preditor (não reembaralha à toa).
-            """
-            a = _canon(a)
-            try:
-                a = self._hard_lock_fast(a, ultimo, anchors=frozenset())
-            except Exception:
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-            return _canon(a)
+            return base + bonus_R
 
-        # --------- “sal” por chamada para variar offsets do fallback ----------
-        try:
-            snap = self._latest_snapshot()
-            snap_id = getattr(snap, "snapshot_id", "n/a")
-        except Exception:
-            snap_id = "n/a"
-        call_salt = self._next_draw_seed(str(snap_id))  # contador persistido por snapshot
+        # 4) Ordena o pool pela nota (da melhor para a pior)
+        candidatas.sort(key=_score_bilhete, reverse=True)
 
-        # --------- Fallback determinístico (rápido), mas salgado por chamada ----------
-        def _fallback(qty: int, salt: int) -> list[list[int]]:
-            base = []
-            L = list(ultimo) or universo[:15]
-            C = [n for n in universo if n not in L]
-            for i in range(max(1, qty)):
-                offL = (salt + i * 3) % len(L)
-                offC = (salt // 7 + i * 5) % len(C) if C else 0
-                a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
-                base.append(_selar(a))
-            return base
-
-        # --------- Preditor SEM cache (sempre gera lote novo) ----------
-        async def _run_preditor():
-            """
-            Chama o NOVO núcleo preditivo (_gerar_apostas_inteligentes),
-            que por sua vez usa o Predictor ELITE (pool + score + TOP apostas).
-            """
-            return await asyncio.to_thread(self._gerar_apostas_inteligentes, target_qtd, janela, alpha)
-
-        # --------- Pipeline principal ----------
-        try:
-            # 0) Preditor com timeout + fallback determinístico
-            try:
-                brutas = await asyncio.wait_for(_run_preditor(), timeout=2.5)
-            except asyncio.TimeoutError:
-                logger.warning("Predictor >2.5s: usando fallback determinístico.")
-                brutas = _fallback(target_qtd, call_salt)
-            except Exception:
-                logger.warning("Predictor falhou: usando fallback determinístico.", exc_info=True)
-                brutas = _fallback(target_qtd, call_salt)
-
-            # 1) Selagem por aposta (rápida)
-            apostas = [_selar(a) for a in brutas]
-
-            # 2) Reposição até atingir 'target_qtd' (variações determinísticas)
-            rep_salt = call_salt
-            seen = {tuple(x) for x in apostas}
-            while len(apostas) < target_qtd:
-                rep_salt += 1
-                extra = _fallback(1, rep_salt)[0]
-                t = tuple(extra)
-                if t not in seen:
-                    apostas.append(_selar(extra))
-                    seen.add(t)
-
-            # 3) Pós-filtro unificado (forma + dedup/overlap + bias + forma)
-            if ultimo:
-                try:
-                    apostas = self._pos_filtro_unificado(apostas, ultimo)
-                except Exception:
-                    logger.warning("pos_filtro_unificado falhou; aplicando hard_lock por aposta.", exc_info=True)
-                    apostas = [self._hard_lock_fast(a, ultimo, anchors=frozenset()) for a in apostas]
-            else:
-                # histórico indisponível: aplica ao menos o hard_lock
-                apostas = [self._hard_lock_fast(a, ultimo=[], anchors=frozenset()) for a in apostas]
-
-            # [NOVO] Pós-filtro determinístico (anti-overlap>11 e seq>3)
-            try:
-                apostas = self._pos_filtro_unificado_deterministico(apostas)
-            except Exception:
-                logger.warning("pos_filtro_unificado_deterministico falhou; seguindo sem ajuste adicional.", exc_info=True)
-
-            # 3.0b) Força anti-overlap ≤ limite (sem perder shape Mestre)
-            try:
-                limite_overlap_inicial = int(globals().get("BOLAO_MAX_OVERLAP", 11))
-            except Exception:
-                limite_overlap_inicial = 11
-            try:
-                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo or [], limite=limite_overlap_inicial)
-            except Exception:
-                logger.warning("forcar_anti_overlap falhou; seguindo sem ajuste adicional.", exc_info=True)
-
-            # =====================================================================
-            # --------------------  SELAGEM DE SAÍDA (NOVO)  ----------------------
-            # Garante: paridade 7–8, seq≤3 e anti-overlap≤11 ANTES de persistir/mostrar
-            try:
-                OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
-            except Exception:
-                OVERLAP_MAX = 11
-
-            def _shape_ok(a: list[int]) -> bool:
-                return self._shape_ok_basico(a)
-
-            # 1) Funil Mestre (se falhar, cai no fallback básico)
-            try:
-                apostas_ok = self._finalizar_lote_mestre(
-                    apostas=apostas,
-                    ultimo=ultimo or [],
-                    target_qtd=target_qtd,
-                    call_salt=call_salt,
-                    overlap_max=OVERLAP_MAX,
-                    max_ciclos=8,
-                    aplicar_cap_par=True,
-                )
-            except Exception:
-                logger.warning("_finalizar_lote_mestre falhou; aplicando fallback básico.", exc_info=True)
-                apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas]
-                try:
-                    apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
-                except Exception:
-                    pass
-
-            # 2) FECHAMENTO STRICTO: força passar no TRIPLO CHECK (ou aproxima)
-            apostas_ok = self._fechar_lote_stricto(
-                apostas_ok,
-                ultimo=ultimo or [],
-                overlap_max=OVERLAP_MAX,
-                max_ciclos=8
+        # 5) Aplica filtro pós-geração, priorizando as melhores
+        if self.cfg.filtro is not None:
+            apostas = self._aplicar_filtro_pos_geracao(
+                candidatas,
+                self.cfg.filtro,
+                int(qtd)
             )
+        else:
+            apostas = candidatas[: int(qtd)]
 
-            # 3) Garantia de quantidade exata (se necessário) + fechamento final curto
-            if len(apostas_ok) < target_qtd:
-                rep_salt = call_salt
-                seen = {tuple(sorted(a)) for a in apostas_ok}
-                while len(apostas_ok) < target_qtd:
-                    rep_salt += 1
-                    cand = _fallback(1, rep_salt)[0]
-                    try:
-                        cand = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset())
-                    except Exception:
-                        cand = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
-                    cand = sorted(set(cand))
-                    if not _shape_ok(cand):
-                        continue
-                    if all(len(set(cand) & set(b)) <= OVERLAP_MAX for b in apostas_ok):
-                        t = tuple(cand)
-                        if t not in seen:
-                            apostas_ok.append(cand)
-                            seen.add(t)
-
-            # 4) Selagem final + dedup + anti-overlap final (idempotente)
-            try:
-                apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas_ok]
-            except Exception:
-                apostas_ok = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas_ok]
-
-            uniq, seen = [], set()
-            for a in apostas_ok:
-                t = tuple(a)
-                if t not in seen:
-                    seen.add(t)
-                    uniq.append(a)
-            apostas_ok = uniq
-
-            try:
-                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
-            except Exception:
-                pass
-
-            # valida forma novamente
-            apostas_ok = [
-                (self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
-                 if not _shape_ok(a) else a)
-                for a in apostas_ok
-            ]
-
-            # Usa a versão selada e reparada
-            apostas = [sorted(a) for a in apostas_ok]
-            # ------------------  FIM SELAGEM DE SAÍDA (NOVO)  --------------------
-            # =====================================================================
-
-            # --- persistência para o auto_aprender: last_generation ---
-            try:
-                st2 = _normalize_state_defaults(_bolao_load_state() or {})
-                st2.setdefault("learning", {})["last_generation"] = {
-                    "apostas": apostas_ok  # lista de 15 números (ordenados) por aposta
-                }
-                _bolao_save_state(st2)
-            except Exception:
-                logger.warning("Falha ao persistir learning.last_generation.", exc_info=True)
-
-            # 3.2) REGISTRO para aprendizado leve
-            try:
-                self._registrar_geracao(apostas_ok, base_resultado=ultimo or [])
-            except Exception:
-                logger.warning("Falha ao registrar geração para aprendizado leve (/gerar).", exc_info=True)
-
-            # >>> registrar o lote no estado (pending_batches)
-            try:
-                st3 = _normalize_state_defaults(_bolao_load_state() or {})
-                batches = st3.get("pending_batches", [])
-                batches.append({
-                    "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
-                    "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
-                    "alpha": float(st3.get("alpha", ALPHA_PADRAO)),
-                    "janela": int((st3.get("learning") or {}).get("janela", JANELA_PADRAO)),
-                    "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
-                    "qtd": len(apostas_ok),
-                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_ok],
-                })
-                st3["pending_batches"] = batches[-100:]
-                _bolao_save_state(st3)
-            except Exception:
-                logger.warning("Falha ao registrar pending_batch.", exc_info=True)
-
-            # --- Mensagem "Aprendizado leve atualizado" com média REAL do lote persistido ---
-            try:
-                media_real = self._media_real_do_lote_persistido()
-
-                st_msg = _normalize_state_defaults(_bolao_load_state() or {})
-                st_msg = self._coagir_estado_lock_alpha(st_msg)
-                learn_msg = (st_msg.get("learning") or {})
-                bias_meta = learn_msg.get("bias_meta", {}) or {}
-                alpha_usado_msg = float(st_msg["runtime"].get("alpha_usado", ALPHA_LOCK_VALUE))
-                alpha_proposto = learn_msg.get("alpha_proposto", None)
-                lock_ativo = st_msg["locks"].get("alpha_travado", True)
-
-                if lock_ativo:
-                    alpha_info = f"α usado: {alpha_usado_msg:.2f} (travado)"
-                    if alpha_proposto is not None:
-                        alpha_info += f" | α proposto: {float(alpha_proposto):.2f} (pendente)"
-                else:
-                    alpha_info = f"α usado: {alpha_usado_msg:.2f} (livre)"
-
-                msg = (
-                    "📈 Aprendizado leve atualizado.\n"
-                    f"• Lote avaliado: {len(apostas_ok)} apostas\n"
-                    f"• Média de acertos: {media_real:.2f}\n"
-                    f"• {alpha_info}\n"
-                    f"• bias[R]={bias_meta.get('R', 0.0):+.3f}  "
-                    f"bias[par]={bias_meta.get('par', 0.0):+.3f}  "
-                    f"bias[seq]={bias_meta.get('seq', 0.0):+.3f}"
-                )
-                await update.message.reply_text(msg)
-            except Exception:
-                logger.warning("Falha ao compor/enviar mensagem de aprendizado leve.", exc_info=True)
-
-            # 4) Formatação + envio (usa α efetivo do /gerar)
-            try:
-                resposta = self._formatar_resposta(apostas_ok, janela, alpha_usado)
-            except Exception:
-                # Fallback de formatação (mantém seu visual atual)
-                linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
-                for i, a in enumerate(apostas_ok, 1):
-                    pares = self._contar_pares(a) if hasattr(self, "_contar_pares") else sum(1 for n in a if n % 2 == 0)
-                    seq = self._max_seq(a) if hasattr(self, "_max_seq") else 0
-                    linhas.append(
-                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
-                        f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
-                    )
-                if SHOW_TIMESTAMP:
-                    now_sp = datetime.now(ZoneInfo(TIMEZONE))
-                    carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    linhas.append(f"<i>janela={janela} | α={alpha_usado:.2f}</i>")
-                resposta = "\n".join(linhas)
-
-            # 5) Saída
-            await self._send_long(update, resposta, parse_mode="HTML")
-
-            # Opcional: auto_aprender (com gating ativo ele retorna sem mexer)
-            try:
-                await self.auto_aprender(update, context)
-            except Exception:
-                logger.warning("auto_aprender falhou; prosseguindo normalmente.", exc_info=True)
+        return apostas
 
         except Exception:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
