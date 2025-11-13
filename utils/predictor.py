@@ -1,4 +1,3 @@
-# utils/predictor.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Set, Tuple, Optional
@@ -7,6 +6,7 @@ import math
 import random
 
 UNIFORME = 1.0 / 25.0  # prob. uniforme para cada dezena (1..25)
+
 
 # =========================
 # Configurações
@@ -26,6 +26,7 @@ class FilterConfig:
     col_max: int = 4
     relax_steps: int = 2
 
+
 @dataclass
 class GeradorApostasConfig:
     """
@@ -33,15 +34,16 @@ class GeradorApostasConfig:
     - janela: quantos concursos recentes usar para treinar (>= 50 recomendado).
     - alpha: peso da estimativa vs uniforme (0..0.5 recomendado).
     - min_factor / max_factor: clipping relativo ao uniforme para limitar extremos.
-    - repulsao_lift: força de penalização de pares com lift>1 (aparecem juntos além do esperado).
+    - repulsao_lift: penalização de pares com lift>1 (aparecem juntos além do esperado).
     - balance_paridade / balance_faixa: penalizações leves para não desequilibrar composição.
     - temperatura: suaviza/acentua diferenças de score na escolha sequencial.
     - max_tentativas: robustez na geração de cada bilhete.
     - filtro: regras simples de qualidade aplicadas após a geração.
     - pool_multiplier: fator para gerar um pool maior e então filtrar (>=1).
+    - bias_R: reforço leve para dezenas do último concurso (repetição).
     """
     janela: int = 50
-    alpha: float = 0.55
+    alpha: float = 0.36
     min_factor: float = 0.60
     max_factor: float = 1.80
     repulsao_lift: float = 0.25
@@ -51,6 +53,7 @@ class GeradorApostasConfig:
     max_tentativas: int = 100
     filtro: Optional[FilterConfig] = None
     pool_multiplier: int = 3
+    bias_R: float = 0.35  # reforço para dezenas que se repetem do último concurso
 
 
 # =========================
@@ -61,13 +64,19 @@ class Predictor:
     """
     Treina a partir de uma janela do histórico (lista de sets de 15 dezenas) e
     gera bilhetes por amostragem sem reposição, aplicando penalizações suaves.
-    Agora suporta geração em pool + filtro pós-geração (opcional).
+
+    Agora:
+    - continua usando frequências + lift (coocorrência),
+    - aplica um viés leve de repetição (R) em relação ao último concurso,
+    - e ainda pode usar um filtro pós-geração (paridade/colunas) se configurado.
     """
+
     def __init__(self, config: GeradorApostasConfig | None = None) -> None:
         self.cfg = config or GeradorApostasConfig()
         self._p: Optional[np.ndarray] = None     # vetor (25,) com probabilidades para cada dezena 1..25
         self._lift: Optional[np.ndarray] = None  # matriz (25,25) com lift de coocorrência
         self._treinado: bool = False
+        self._ultimo: Optional[Set[int]] = None  # último resultado considerado na janela
 
     # ---------- Treino ----------
     @staticmethod
@@ -121,13 +130,19 @@ class Predictor:
 
         janelas = historico[-n:] if len(historico) > n else historico
 
+        # guarda o "último resultado" da janela (para viés de repetição)
+        try:
+            self._ultimo = set(janelas[-1]) if janelas else None
+        except Exception:
+            self._ultimo = None
+
         p_raw, lift = self._estimativas_basicas(janelas)
 
         # Normaliza marginais para distribuição relativa de escolha
         soma = float(p_raw.sum()) + 1e-12
         p_rel = p_raw / soma
 
-        # Mistura com uniforme para reduzir viés
+        # Mistura com uniforme para reduzir viés exagerado
         alpha = max(0.0, min(float(self.cfg.alpha), 0.5))
         p_mix = (1.0 - alpha) * (np.ones(25) * UNIFORME) + alpha * p_rel
 
@@ -146,15 +161,25 @@ class Predictor:
         """
         Score do candidato baseado em:
           - log-probabilidade estimada (estável numericamente)
+          - leve reforço de repetição (R) em relação ao último concurso
           - penalização por coocorrência excessiva via lift
           - balanceamentos leves de paridade e faixa (1..12 vs 13..25)
         """
         p = float(self._p[cand - 1])
         base = math.log(max(p, 1e-12))
 
+        # Reforço leve para dezenas que se repetem em relação ao último sorteio
+        if self._ultimo:
+            if cand in self._ultimo:
+                # empurra o modelo a colocar mais dezenas repetidas (R alto)
+                base += float(self.cfg.bias_R)
+            else:
+                # leve penalização para completamente "novas"
+                base -= float(self.cfg.bias_R) * 0.40
+
         # Penalização por pares com lift>1 (aparecem juntos acima do esperado)
         rep = 0.0
-        if selecionados:
+        if selecionados and self._lift is not None:
             for j in selecionados:
                 lij = float(self._lift[cand - 1, j - 1])
                 if lij > 1.0:
