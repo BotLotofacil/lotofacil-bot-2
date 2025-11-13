@@ -30,18 +30,23 @@ class FilterConfig:
 @dataclass
 class GeradorApostasConfig:
     """
-    Parâmetros do gerador. Ajuste com cautela.
+    Parâmetros do gerador ELITE.
+    Ajuste com cautela — esses parâmetros influenciam diretamente a
+    força preditiva do algoritmo e o comportamento do MODO ELITE.
+
     - janela: quantos concursos recentes usar para treinar (>= 50 recomendado).
     - alpha: peso da estimativa vs uniforme (0..0.5 recomendado).
     - min_factor / max_factor: clipping relativo ao uniforme para limitar extremos.
-    - repulsao_lift: penalização de pares com lift>1 (aparecem juntos além do esperado).
-    - balance_paridade / balance_faixa: penalizações leves para não desequilibrar composição.
-    - temperatura: suaviza/acentua diferenças de score na escolha sequencial.
-    - max_tentativas: robustez na geração de cada bilhete.
-    - filtro: regras simples de qualidade aplicadas após a geração.
-    - pool_multiplier: fator para gerar um pool maior e então filtrar (>=1).
-    - bias_R: reforço leve para dezenas do último concurso (repetição).
+    - repulsao_lift: penalização para pares com lift>1 (evita coocorrências tóxicas).
+    - balance_paridade / balance_faixa: penalizações leves para evitar
+      composições muito extremas durante a amostragem sequencial.
+    - temperatura: controla a aleatoriedade da softmax interna.
+    - max_tentativas: tentativas para gerar um bilhete plausível.
+    - filtro: regras simples aplicadas após a geração (paridade/colunas).
+    - pool_multiplier: tamanho inicial do pool para seleção ELITE.
+    - bias_R: peso da repetição, reforçando bilhetes com R próximo de 9–10.
     """
+
     janela: int = 50
     alpha: float = 0.36
     min_factor: float = 0.60
@@ -52,8 +57,12 @@ class GeradorApostasConfig:
     temperatura: float = 0.90
     max_tentativas: int = 100
     filtro: Optional[FilterConfig] = None
+
+    # pool inicial (modo elite ajusta automaticamente para qtd>=30)
     pool_multiplier: int = 3
-    bias_R: float = 0.35  # reforço para dezenas que se repetem do último concurso
+
+    # força do R para o modo elite (9R–10R = alvo central)
+    bias_R: float = 0.45
 
 
 # =========================
