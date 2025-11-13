@@ -128,14 +128,20 @@ class Predictor:
         if n > len(historico):
             n = len(historico)
 
+        # recorta a janela de interesse
         janelas = historico[-n:] if len(historico) > n else historico
 
-        # guarda o "último resultado" da janela (para viés de repetição)
+        # guarda o "último resultado" da janela (para viés de repetição R)
         try:
-            self._ultimo = set(janelas[-1]) if janelas else None
+            if janelas:
+                # garante estrutura estável: sorted(list(...)) dentro de um set
+                self._ultimo = set(sorted(list(janelas[-1])))
+            else:
+                self._ultimo = None
         except Exception:
             self._ultimo = None
 
+        # estimativas marginais e de coocorrência
         p_raw, lift = self._estimativas_basicas(janelas)
 
         # Normaliza marginais para distribuição relativa de escolha
