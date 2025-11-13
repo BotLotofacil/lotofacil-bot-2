@@ -183,7 +183,7 @@ DESEMPENHO_BOM_R    = 12.0     # opcional: faixa "bom"
 # ========================
 # Parâmetros padrão do gerador
 # ========================
-# Quantidade: permitir até 50 no /gerar
+# Quantidade: permitir até 200 no /gerar
 QTD_BILHETES_PADRAO = 30
 QTD_BILHETES_MIN = 1
 QTD_BILHETES_MAX = 200
@@ -203,7 +203,7 @@ WHITELIST_PATH = "whitelist.txt"
 
 # --- Alpha lock (apenas no /gerar) ---
 LOCK_ALPHA_GERAR = True      # deixe True para travar /gerar em 0.36
-ALPHA_LOCK_VALUE  = 0.37     # valor travado só para /gerar
+ALPHA_LOCK_VALUE  = 0.36     # valor travado só para /gerar
 
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
@@ -4844,7 +4844,7 @@ class LotoFacilBot:
     # --- /mestre: pacote Mestre determinístico selado e sem duplicata ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        Gera 10 apostas Mestre (foco repetição alta 9R–10R, +1 variação 8R e +1 variação 11R)
+        Gera 30 apostas Mestre (foco repetição alta 9R–10R, +1 variação 8R e +1 variação 11R)
         sempre obedecendo:
           - Paridade 7–8
           - SeqMax ≤ 3
@@ -4856,6 +4856,9 @@ class LotoFacilBot:
         Ele usa o mesmo pipeline de selagem que o Bolão (hard_lock + dedup + anti-overlap + bias),
         para impedir exatamente os problemas que vimos (paridade 4/11, SeqMax 5+, clones).
         """
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
 
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
@@ -4894,40 +4897,48 @@ class LotoFacilBot:
         mestre_seed = self._calc_mestre_seed(user_id, chat_id, ultimo)
 
         # ------------------------------------------------------------------
-        # 1. Construção bruta das 10 apostas Mestre com metas de repetição R
-        #    Alvo do Mestre segundo nossa regra salva em memória:
+        # 1. Construção bruta de um pool de apostas Mestre com metas de R
         #    - Prioriza 9R–10R
-        #    - Inclui 1 jogo ~8R e 1 jogo ~11R
+        #    - Inclui 1 jogo ~8R e 1 jogo ~11R por ciclo
+        #    - Gera um pool maior (até 60) e depois pega até 30 únicos
         # ------------------------------------------------------------------
-        planos_R_base = [10, 9, 9, 10, 10, 9, 10, 8, 11, 10]
-        # se mudar essa lista no futuro, manter tamanho 10
+        target_qtd = 30
+        planos_R_base = [10, 9, 9, 10, 10, 9, 10, 8, 11, 10]  # 10 padrões de R
+        CICLOS = 6  # 6 × 10 = 60 apostas brutas possíveis
 
-        brutas = []
+        brutas: list[list[int]] = []
         L = list(ultimo)
         C = comp[:]
 
-        # Geração determinística controlada por offsets fixos no seed
-        for idx, r_alvo in enumerate(planos_R_base):
-            off_last = (mestre_seed + idx * 3) % max(1, len(L))
-            off_comp = (mestre_seed // 7 + idx * 5) % max(1, len(C) if C else 1)
+        if not L:
+            # fallback extremo se algo bizarro acontecer com o histórico
+            L = list(range(1, 26))[:15]
+            C = [n for n in range(1, 26) if n not in L]
 
-            base_aposta = self._construir_aposta_por_repeticao(
-                last_sorted=L,
-                comp_sorted=C,
-                repeticoes=r_alvo,
-                offset_last=off_last,
-                offset_comp=off_comp,
-            )
+        for ciclo in range(CICLOS):
+            for idx, r_alvo in enumerate(planos_R_base):
+                # queremos montar um pool grande; não limitar pelo target aqui
+                off_base = mestre_seed + ciclo * 37 + idx * 3
+                off_last = off_base % max(1, len(L))
+                off_comp = (mestre_seed // 7 + ciclo * 11 + idx * 5) % max(1, len(C) if C else 1)
 
-            # força paridade 7–8 e seq≤3 logo cedo
-            base_aposta = self._hard_lock_fast(
-                base_aposta,
-                ultimo,
-                anchors=frozenset(),           # Mestre não tem âncora fixa obrigatória
-                alvo_par=(7, 8),
-                max_seq=3,
-            )
-            brutas.append(sorted(base_aposta))
+                base_aposta = self._construir_aposta_por_repeticao(
+                    last_sorted=L,
+                    comp_sorted=C,
+                    repeticoes=r_alvo,
+                    offset_last=off_last,
+                    offset_comp=off_comp,
+                )
+
+                # força paridade 7–8 e seq≤3 logo cedo
+                base_aposta = self._hard_lock_fast(
+                    base_aposta,
+                    ultimo,
+                    anchors=frozenset(),           # Mestre não tem âncora fixa obrigatória
+                    alvo_par=(7, 8),
+                    max_seq=3,
+                )
+                brutas.append(sorted(base_aposta))
 
         # ------------------------------------------------------------------
         # 2. Pós-filtro unificado EXACTO do bolão:
@@ -4941,35 +4952,33 @@ class LotoFacilBot:
             refinadas = self._pos_filtro_unificado(brutas, ultimo)
         except Exception:
             logger.warning("Falha em _pos_filtro_unificado dentro /mestre; aplicando fallback mínimo.", exc_info=True)
-            # fallback mínimo: aplica hard_lock individual + dedup básico
-            refinadas = [self._hard_lock_fast(a, ultimo, anchors=frozenset(), alvo_par=(7, 8), max_seq=3) for a in brutas]
-            # dedup básico (remove clones idênticos mantendo primeiros)
-            seen_local = set()
-            uniq_tmp = []
-            for a in refinadas:
-                t = tuple(sorted(a))
-                if t not in seen_local:
-                    seen_local.add(t)
-                    uniq_tmp.append(sorted(a))
-            refinadas = uniq_tmp
+            # fallback mínimo: aplica hard_lock individual
+            refinadas = [
+                self._hard_lock_fast(a, ultimo, anchors=frozenset(), alvo_par=(7, 8), max_seq=3)
+                for a in brutas
+            ]
 
         # ------------------------------------------------------------------
         # 3. Garantia final:
         #    - força novamente forma (7–8 pares, SeqMax ≤3)
         #    - corta/ordena e elimina duplicadas finais
+        #    - seleciona até 30 apostas únicas
         # ------------------------------------------------------------------
-        apostas_finais = []
-        seen_final = set()
+        apostas_finais: list[list[int]] = []
+        seen_final: set[tuple[int, ...]] = set()
         for a in refinadas:
             a2 = self._hard_lock_fast(a, ultimo, anchors=frozenset(), alvo_par=(7, 8), max_seq=3)
             t = tuple(sorted(a2))
-            if t not in seen_final:
-                seen_final.add(t)
-                apostas_finais.append(sorted(a2))
+            if t in seen_final:
+                continue
+            seen_final.add(t)
+            apostas_finais.append(sorted(a2))
+            if len(apostas_finais) >= target_qtd:
+                break
 
-        # se por algum motivo ficamos com menos que 10 depois da dedup agressiva,
-        # não inventamos aposta aleatória nova (mantemos determinístico).
-        # Apenas seguimos com o que sobrou.
+        # se por algum motivo extremo ficarmos com menos que target_qtd
+        # (por excesso de clones), apenas seguimos com o que sobrou.
+        # continua determinístico.
 
         # ------------------------------------------------------------------
         # 4. Telemetria pra cada aposta (pares, ímpares, SeqMax, R)
@@ -4978,12 +4987,13 @@ class LotoFacilBot:
 
         # ------------------------------------------------------------------
         # 5. Registrar geração para aprendizado leve (estado interno)
+        # ------------------------------------------------------------------
         try:
             self._registrar_geracao(apostas_finais, base_resultado=ultimo)
         except Exception:
             logger.warning("Falha ao registrar geração (mestre).", exc_info=True)
 
-        # 5.1) >>> NOVO: auditoria CSV (aprendizado REAL)
+        # 5.1) Auditoria CSV (aprendizado REAL)
         try:
             snap = self._latest_snapshot()
             _append_learn_log(snap.snapshot_id, ultimo or [], apostas_finais)
@@ -5024,6 +5034,7 @@ class LotoFacilBot:
             )
 
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+
 
     # --- /refinar_bolao: aplica bias, regenera 19→15 e sela o lote ---
     async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
