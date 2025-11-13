@@ -1404,7 +1404,7 @@ class LotoFacilBot:
                 t = tuple(a)
                 if t not in seen:
                     seen.add(t)
-                    uniq.append(a)  
+                    uniq.append(a)
             apostas_ok = uniq
 
             try:
@@ -1424,6 +1424,33 @@ class LotoFacilBot:
             # ------------------  FIM SELAGEM DE SAÍDA (NOVO)  --------------------
             # =====================================================================
 
+            # =====================================================================
+            # -------------- PASSADA FINAL: SeqMax ≤ 3 PARA TODO O LOTE -----------
+            # =====================================================================
+            try:
+                # Pequeno laço de estabilização:
+                # 1) força seq≤3 em todo o lote
+                # 2) re-aplica anti-overlap para não estourar o limite
+                for _ in range(2):
+                    try:
+                        apostas_ok = self._forcar_seq_max3_lote(apostas_ok)
+                    except Exception:
+                        logger.warning("_forcar_seq_max3_lote falhou; mantendo lote como está.", exc_info=True)
+
+                    try:
+                        apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+                    except Exception:
+                        logger.warning("forcar_anti_overlap (passada final) falhou; seguindo mesmo assim.", exc_info=True)
+
+                # versão final, já estabilizada, é a que será usada para tudo
+                apostas = [sorted(a) for a in apostas_ok]
+
+            except Exception:
+                logger.warning("Passada final de SeqMax<=3 falhou; usando lote selado anterior.", exc_info=True)
+                apostas = [sorted(a) for a in apostas_ok]
+            # =====================================================================
+            # ----------------------- FIM PASSADA FINAL ---------------------------
+            # =====================================================================
 
             # --- persistência para o auto_aprender: last_generation ---
             try:
@@ -1522,6 +1549,7 @@ class LotoFacilBot:
         except Exception:
             logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
+
 
     def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
         """Formata a resposta com apostas + rodapé informativo."""
@@ -3277,6 +3305,42 @@ class LotoFacilBot:
                 break
 
         return sorted(a)
+    
+    # ------------------------------------------------------------------
+    # Passada final: força SeqMax ≤ 3 em todo o lote (sem quebrar Mestre)
+    # ------------------------------------------------------------------
+    def _forcar_seq_max3_lote(self, apostas: list[list[int]]) -> list[list[int]]:
+        """
+        Varre o lote inteiro e, para cada aposta com sequência >3,
+        tenta corrigir usando o mesmo núcleo de forma (paridade 7–8, seq≤3).
+
+        Objetivo: garantir que NENHUMA aposta saia do /gerar com SeqMax>3,
+        evitando reprovação boba no TRIPLO CHECK.
+        """
+        ajustadas: list[list[int]] = []
+
+        for a in apostas:
+            try:
+                seq = self._max_seq(a)
+            except Exception:
+                # se der algum erro, assume seq aceitável
+                seq = 0
+
+            if seq <= 3:
+                # já está ok, só normaliza ordenação
+                ajustadas.append(sorted(a))
+                continue
+
+            # precisa ajustar: força voltar para o shape Mestre
+            try:
+                a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+            except Exception:
+                # fallback ultra defensivo: mantém a original se algo der errado
+                a2 = a
+
+            ajustadas.append(sorted(a2))
+
+        return ajustadas
 
     # --------- Anti-overlap robusto (NUNCA muda o tamanho das apostas) -------
     def _anti_overlap(self, apostas, ultimo, comp, max_overlap=BOLAO_MAX_OVERLAP, anchors=frozenset()):
