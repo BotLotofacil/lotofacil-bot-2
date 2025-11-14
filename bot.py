@@ -1158,7 +1158,7 @@ class LotoFacilBot:
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
 
-        # anti-abuso
+        # >>> anti-abuso
         if not self._is_admin(user_id):
             if _is_temporarily_blocked(user_id):
                 return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
@@ -1167,9 +1167,10 @@ class LotoFacilBot:
                 return await update.message.reply_text(warn)
             if warn:
                 await update.message.reply_text(warn)
+        # <<< anti-abuso
 
         # ------------------------------------------------------------------
-        # 0.1 BARRA DE CARREGAMENTO com animação gradual
+        # 0.1 BARRA DE CARREGAMENTO (animação gradual)
         # ------------------------------------------------------------------
         try:
             loading_msg = await update.message.reply_text(
@@ -1197,16 +1198,16 @@ class LotoFacilBot:
             try:
                 await loading_msg.edit_text(_progress_bar(pct, etapa))
             except Exception:
+                # falha na edição não pode quebrar o comando
                 pass
 
         async def _smooth_to(target: float, etapa: str, steps: int = 5, delay: float = 0.12):
             """
-            Anima a barra do progresso de current_pct até 'target' em pequenos passos.
+            Anima a barra de current_pct até 'target' em pequenos passos.
             """
             nonlocal current_pct
             target = max(0.0, min(1.0, float(target)))
 
-            # se o alvo for menor (ou igual), apenas ajusta direto
             if target <= current_pct:
                 current_pct = target
                 await _set_progress(current_pct, etapa)
@@ -1224,266 +1225,425 @@ class LotoFacilBot:
             current_pct = target
             await _set_progress(current_pct, etapa)
 
-        # ------------------------------------------------------------------
-        # 1. Parse argumentos
-        # ------------------------------------------------------------------
-        await _smooth_to(0.10, "Lendo parâmetros...")
-
-        qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
         try:
-            if context.args and len(context.args) >= 1:
-                qtd = int(context.args[0])
-            if context.args and len(context.args) >= 2:
-                janela = int(context.args[1])
-            if context.args and len(context.args) >= 3:
-                alpha = float(context.args[2].replace(",", "."))
-        except Exception:
-            pass
+            # ------------------------------------------------------------------
+            # 1. Parse argumentos
+            # ------------------------------------------------------------------
+            await _smooth_to(0.10, "Lendo parâmetros...")
 
-        qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
-        target_qtd = max(1, int(qtd))
+            qtd, janela, alpha = QTD_BILHETES_PADRAO, JANELA_PADRAO, ALPHA_PADRAO
 
-        alpha = self._alpha_para_comando("/gerar", alpha_sugerido=alpha)
+            try:
+                if context.args and len(context.args) >= 1:
+                    qtd = int(context.args[0])
+                if context.args and len(context.args) >= 2:
+                    janela = int(context.args[1])
+                if context.args and len(context.args) >= 3:
+                    alpha = float(context.args[2].replace(",", "."))
+            except Exception:
+                pass  # mantém defaults
 
-        st = _normalize_state_defaults(_bolao_load_state() or {})
-        st = self._coagir_estado_lock_alpha(st)
-        alpha_usado = self._alpha_para_execucao(st)
-        try:
-            _bolao_save_state(st)
-        except Exception:
-            pass
+            # Clamps defensivos
+            qtd, janela, alpha = self._clamp_params(qtd, janela, alpha)
+            target_qtd = max(1, int(qtd))
 
-        # ------------------------------------------------------------------
-        # 2. Carregar histórico + último resultado
-        # ------------------------------------------------------------------
-        await _smooth_to(0.20, "Carregando histórico e último resultado...")
+            # trava α somente no /gerar (sem afetar demais comandos)
+            alpha = self._alpha_para_comando("/gerar", alpha_sugerido=alpha)
 
-        try:
-            historico = carregar_historico(HISTORY_PATH)
-        except Exception:
-            historico = []
+            # --- coerência de estado e alpha_usado ---
+            st = _normalize_state_defaults(_bolao_load_state() or {})
+            st = self._coagir_estado_lock_alpha(st)
+            alpha_usado = self._alpha_para_execucao(st)
+            try:
+                _bolao_save_state(st)
+            except Exception:
+                pass
 
-        try:
-            ultimo = self._ultimo_resultado(historico) if historico else []
-        except Exception:
-            ultimo = []
+            # ------------------------------------------------------------------
+            # 2. Carregar histórico + último resultado
+            # ------------------------------------------------------------------
+            await _smooth_to(0.20, "Carregando histórico e último resultado...")
 
-        u_set = set(ultimo)
-        universo = list(range(1, 26))
+            try:
+                historico = carregar_historico(HISTORY_PATH)
+            except Exception:
+                historico = []
+            try:
+                ultimo = self._ultimo_resultado(historico) if historico else []
+            except Exception:
+                ultimo = []
 
-        # ------------------------------------------------------------------
-        # 3. Utilidades internas de selagem
-        # ------------------------------------------------------------------
-        await _smooth_to(0.30, "Preparando selagem das apostas...")
+            u_set = set(ultimo)
+            universo = list(range(1, 26))
 
-        def _canon(a: list[int]) -> list[int]:
-            a = [int(x) for x in a if 1 <= int(x) <= 25]
-            a = sorted(set(a))
-            if len(a) > 15:
-                keep = []
-                for n in a:
-                    if len(keep) == 15:
-                        break
-                    if (len(keep) % 2 == 0 and n in u_set) or (len(keep) % 2 == 1 and n not in u_set):
-                        keep.append(n)
-                if len(keep) < 15:
+            # ------------------------------------------------------------------
+            # 3. Utilidades canônicas e selagem
+            # ------------------------------------------------------------------
+            await _smooth_to(0.30, "Preparando selagem das apostas...")
+
+            def _canon(a: list[int]) -> list[int]:
+                """Normaliza: 1..25, únicos, ordenados, exatamente 15."""
+                a = [int(x) for x in a if 1 <= int(x) <= 25]
+                a = sorted(set(a))
+                if len(a) > 15:
+                    keep = []
                     for n in a:
-                        if n not in keep:
-                            keep.append(n)
-                            if len(keep) == 15:
-                                break
-                a = keep
-            elif len(a) < 15:
-                comp = [n for n in universo if n not in a]
-                for n in comp:
-                    if (n - 1 not in a) and (n + 1 not in a):
-                        a.append(n)
-                        if len(a) == 15:
+                        if len(keep) == 15:
                             break
-                if len(a) < 15:
+                        if (len(keep) % 2 == 0 and n in u_set) or (len(keep) % 2 == 1 and n not in u_set):
+                            keep.append(n)
+                    if len(keep) < 15:
+                        for n in a:
+                            if n not in keep:
+                                keep.append(n)
+                                if len(keep) == 15:
+                                    break
+                    a = keep
+                elif len(a) < 15:
+                    comp = [n for n in universo if n not in a]
                     for n in comp:
-                        if n not in a:
+                        if (n - 1 not in a) and (n + 1 not in a):
                             a.append(n)
                             if len(a) == 15:
                                 break
-                a = sorted(a)
-            return a
+                    if len(a) < 15:
+                        for n in comp:
+                            if n not in a:
+                                a.append(n)
+                                if len(a) == 15:
+                                    break
+                    a = sorted(a)
+                return a
 
-        def _selar(a: list[int]) -> list[int]:
-            a = _canon(a)
-            try:
-                a = self._hard_lock_fast(a, ultimo, anchors=frozenset())
-            except Exception:
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
-            return _canon(a)
-
-        # ------------------------------------------------------------------
-        # 4. Seeds / fallback
-        # ------------------------------------------------------------------
-        await _smooth_to(0.40, "Preparando fallback determinístico...")
-
-        try:
-            snap = self._latest_snapshot()
-            snap_id = getattr(snap, "snapshot_id", "n/a")
-        except Exception:
-            snap_id = "n/a"
-
-        call_salt = self._next_draw_seed(str(snap_id))
-
-        def _fallback(qty: int, salt: int) -> list[list[int]]:
-            base = []
-            L = list(ultimo) or universo[:15]
-            C = [n for n in universo if n not in L]
-            for i in range(max(1, qty)):
-                offL = (salt + i * 3) % len(L)
-                offC = (salt // 7 + i * 5) % len(C) if C else 0
-                a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
-                base.append(_selar(a))
-            return base
-
-        async def _run_preditor():
-            return await asyncio.to_thread(self._gerar_apostas_inteligentes, target_qtd, janela, alpha)
-
-        # ------------------------------------------------------------------
-        # 5. Preditor + fallback
-        # ------------------------------------------------------------------
-        await _smooth_to(0.55, "Executando preditor (inteligência)...")
-
-        try:
-            brutas = await asyncio.wait_for(_run_preditor(), timeout=2.5)
-        except asyncio.TimeoutError:
-            logger.warning("Predictor >2.5s: fallback.")
-            brutas = _fallback(target_qtd, call_salt)
-        except Exception:
-            logger.warning("Predictor falhou: fallback.", exc_info=True)
-            brutas = _fallback(target_qtd, call_salt)
-
-        # ------------------------------------------------------------------
-        # 6. Selagem + pós-filtros
-        # ------------------------------------------------------------------
-        await _smooth_to(0.70, "Selando e aplicando pós-filtros...")
-
-        apostas = [_selar(a) for a in brutas]
-
-        rep_salt = call_salt
-        seen = {tuple(x) for x in apostas}
-        while len(apostas) < target_qtd:
-            rep_salt += 1
-            extra = _fallback(1, rep_salt)[0]
-            t = tuple(extra)
-            if t not in seen:
-                apostas.append(_selar(extra))
-                seen.add(t)
-
-        if ultimo:
-            try:
-                apostas = self._pos_filtro_unificado(apostas, ultimo)
-            except Exception:
-                logger.warning("pos_filtro_unificado falhou; aplicando hard_lock.", exc_info=True)
-                apostas = [self._hard_lock_fast(a, ultimo, anchors=frozenset()) for a in apostas]
-        else:
-            apostas = [self._hard_lock_fast(a, ultimo=[], anchors=frozenset()) for a in apostas]
-
-        try:
-            apostas = self._pos_filtro_unificado_deterministico(apostas)
-        except Exception:
-            pass
-
-        try:
-            OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
-        except Exception:
-            OVERLAP_MAX = 11
-
-        try:
-            apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo or [], limite=OVERLAP_MAX)
-        except Exception:
-            pass
-
-        # ------------------------------------------------------------------
-        # 7. Selagem final + strict / TRIPLO CHECK
-        # ------------------------------------------------------------------
-        await _smooth_to(0.85, "Fechamento final (TRIPLO CHECK)...")
-
-        apostas_ok = apostas
-        try:
-            apostas_ok = self._finalizar_lote_mestre(
-                apostas=apostas_ok,
-                ultimo=ultimo or [],
-                target_qtd=target_qtd,
-                call_salt=call_salt,
-                overlap_max=OVERLAP_MAX,
-                max_ciclos=8,
-                aplicar_cap_par=True,
-            )
-        except Exception:
-            logger.warning("finalizar_lote_mestre falhou (fallback).", exc_info=True)
-
-        apostas_ok = self._fechar_lote_stricto(
-            apostas_ok,
-            ultimo=ultimo or [],
-            overlap_max=OVERLAP_MAX,
-            max_ciclos=8
-        )
-
-        # 7.2 Passada seq≤3 + anti-overlap final
-        await _smooth_to(0.92, "Estabilizando (seq≤3 / overlap≤11)...")
-
-        try:
-            for _ in range(2):
+            def _selar(a: list[int]) -> list[int]:
+                """Canônico + lock forte (pares 7–8, seq≤3) preservando inteligência."""
+                a = _canon(a)
                 try:
-                    apostas_ok = self._forcar_seq_max3_lote(apostas_ok)
+                    a = self._hard_lock_fast(a, ultimo, anchors=frozenset())
                 except Exception:
-                    pass
+                    a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                return _canon(a)
+
+            # ------------------------------------------------------------------
+            # 4. “Sal” por chamada + fallback determinístico
+            # ------------------------------------------------------------------
+            await _smooth_to(0.40, "Preparando fallback determinístico...")
+
+            try:
+                snap = self._latest_snapshot()
+                snap_id = getattr(snap, "snapshot_id", "n/a")
+            except Exception:
+                snap_id = "n/a"
+
+            call_salt = self._next_draw_seed(str(snap_id))  # contador persistido por snapshot
+
+            def _fallback(qty: int, salt: int) -> list[list[int]]:
+                base = []
+                L = list(ultimo) or universo[:15]
+                C = [n for n in universo if n not in L]
+                for i in range(max(1, qty)):
+                    offL = (salt + i * 3) % len(L)
+                    offC = (salt // 7 + i * 5) % len(C) if C else 0
+                    a = (L[offL:] + L[:offL])[:8] + (C[offC:] + C[:offC])[:7]
+                    base.append(_selar(a))
+                return base
+
+            async def _run_preditor():
+                # Usa 'alpha' já travado via _alpha_para_comando; alpha_usado é o efetivo do runtime
+                return await asyncio.to_thread(self._gerar_apostas_inteligentes, target_qtd, janela, alpha)
+
+            # ------------------------------------------------------------------
+            # 5. Preditor + fallback
+            # ------------------------------------------------------------------
+            await _smooth_to(0.55, "Executando preditor (inteligência)...")
+
+            try:
+                brutas = await asyncio.wait_for(_run_preditor(), timeout=2.5)
+            except asyncio.TimeoutError:
+                logger.warning("Predictor >2.5s: usando fallback determinístico.")
+                brutas = _fallback(target_qtd, call_salt)
+            except Exception:
+                logger.warning("Predictor falhou: usando fallback determinístico.", exc_info=True)
+                brutas = _fallback(target_qtd, call_salt)
+
+            # ------------------------------------------------------------------
+            # 6. Selagem por aposta + reposição até target_qtd
+            # ------------------------------------------------------------------
+            await _smooth_to(0.65, "Selando apostas e completando quantidade...")
+
+            apostas = [_selar(a) for a in brutas]
+
+            rep_salt = call_salt
+            seen = {tuple(x) for x in apostas}
+            while len(apostas) < target_qtd:
+                rep_salt += 1
+                extra = _fallback(1, rep_salt)[0]
+                t = tuple(extra)
+                if t not in seen:
+                    apostas.append(_selar(extra))
+                    seen.add(t)
+
+            # ------------------------------------------------------------------
+            # 7. Pós-filtro unificado + determinístico + anti-overlap inicial
+            # ------------------------------------------------------------------
+            await _smooth_to(0.75, "Aplicando pós-filtros e anti-overlap...")
+
+            if ultimo:
+                try:
+                    apostas = self._pos_filtro_unificado(apostas, ultimo)
+                except Exception:
+                    logger.warning("pos_filtro_unificado falhou; aplicando hard_lock por aposta.", exc_info=True)
+                    apostas = [self._hard_lock_fast(a, ultimo, anchors=frozenset()) for a in apostas]
+            else:
+                # histórico indisponível: aplica ao menos o hard_lock
+                apostas = [self._hard_lock_fast(a, ultimo=[], anchors=frozenset()) for a in apostas]
+
+            try:
+                apostas = self._pos_filtro_unificado_deterministico(apostas)
+            except Exception:
+                logger.warning("pos_filtro_unificado_deterministico falhou; seguindo sem ajuste adicional.", exc_info=True)
+
+            try:
+                limite_overlap_inicial = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+            except Exception:
+                limite_overlap_inicial = 11
+            try:
+                apostas = self._forcar_anti_overlap(apostas, ultimo=ultimo or [], limite=limite_overlap_inicial)
+            except Exception:
+                logger.warning("forcar_anti_overlap falhou; seguindo sem ajuste adicional.", exc_info=True)
+
+            # =====================================================================
+            # 8. SELAGEM DE SAÍDA (FUNIL MESTRE + TRIPLO CHECK)
+            # =====================================================================
+            await _smooth_to(0.85, "Funil Mestre (TRIPLO CHECK)...")
+
+            try:
+                OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+            except Exception:
+                OVERLAP_MAX = 11
+
+            def _shape_ok(a: list[int]) -> bool:
+                return self._shape_ok_basico(a)
+
+            # 8.1 Funil Mestre
+            try:
+                apostas_ok = self._finalizar_lote_mestre(
+                    apostas=apostas,
+                    ultimo=ultimo or [],
+                    target_qtd=target_qtd,
+                    call_salt=call_salt,
+                    overlap_max=OVERLAP_MAX,
+                    max_ciclos=8,
+                    aplicar_cap_par=True,
+                )
+            except Exception:
+                logger.warning("_finalizar_lote_mestre falhou; aplicando fallback básico.", exc_info=True)
+                apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas]
                 try:
                     apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
                 except Exception:
                     pass
-        except Exception:
-            pass
 
-        apostas = [sorted(a) for a in apostas_ok]
+            # 8.2 Fechamento strict (TRIPLO CHECK em modo construtivo)
+            apostas_ok = self._fechar_lote_stricto(
+                apostas_ok,
+                ultimo=ultimo or [],
+                overlap_max=OVERLAP_MAX,
+                max_ciclos=8
+            )
 
-        # ------------------------------------------------------------------
-        # 8. Preparar resposta
-        # ------------------------------------------------------------------
-        await _smooth_to(0.97, "Formatando resposta final...")
+            # 8.3 Garantia de quantidade exata, se necessário
+            if len(apostas_ok) < target_qtd:
+                rep_salt = call_salt
+                seen = {tuple(sorted(a)) for a in apostas_ok}
+                while len(apostas_ok) < target_qtd:
+                    rep_salt += 1
+                    cand = _fallback(1, rep_salt)[0]
+                    try:
+                        cand = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset())
+                    except Exception:
+                        cand = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
+                    cand = sorted(set(cand))
+                    if not _shape_ok(cand):
+                        continue
+                    if all(len(set(cand) & set(b)) <= OVERLAP_MAX for b in apostas_ok):
+                        t = tuple(cand)
+                        if t not in seen:
+                            apostas_ok.append(cand)
+                            seen.add(t)
 
-        try:
-            resposta = self._formatar_resposta(apostas_ok, janela, alpha_usado)
-        except Exception:
-            linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
-            for i, a in enumerate(apostas_ok, 1):
-                pares = sum(1 for n in a if n % 2 == 0)
-                seq = self._max_seq(a)
-                linhas.append(
-                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
-                    f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
+            # 8.4 Selagem final + dedup + anti-overlap final
+            try:
+                apostas_ok = [self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset()) for a in apostas_ok]
+            except Exception:
+                apostas_ok = [self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3) for a in apostas_ok]
+
+            uniq, seen = [], set()
+            for a in apostas_ok:
+                t = tuple(a)
+                if t not in seen:
+                    seen.add(t)
+                    uniq.append(a)
+            apostas_ok = uniq
+
+            try:
+                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+            except Exception:
+                pass
+
+            # valida forma novamente
+            apostas_ok = [
+                (self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset())
+                 if not _shape_ok(a) else a)
+                for a in apostas_ok
+            ]
+
+            apostas = [sorted(a) for a in apostas_ok]
+
+            # =====================================================================
+            # 9. PASSADA FINAL: SeqMax ≤ 3 PARA TODO O LOTE
+            # =====================================================================
+            await _smooth_to(0.90, "Estabilizando seq≤3 / overlap≤11...")
+
+            try:
+                for _ in range(2):
+                    try:
+                        apostas_ok = self._forcar_seq_max3_lote(apostas_ok)
+                    except Exception:
+                        logger.warning("_forcar_seq_max3_lote falhou; mantendo lote como está.", exc_info=True)
+
+                    try:
+                        apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
+                    except Exception:
+                        logger.warning("forcar_anti_overlap (passada final) falhou; seguindo mesmo assim.", exc_info=True)
+
+                apostas = [sorted(a) for a in apostas_ok]
+            except Exception:
+                logger.warning("Passada final de SeqMax<=3 falhou; usando lote selado anterior.", exc_info=True)
+                apostas = [sorted(a) for a in apostas_ok]
+
+            # =====================================================================
+            # 10. REGISTROS PARA APRENDIZADO (learning.last_generation, pending_batches)
+            # =====================================================================
+            await _smooth_to(0.94, "Registrando lote para aprendizado...")
+
+            # 10.1 persistência para o auto_aprender: last_generation
+            try:
+                st2 = _normalize_state_defaults(_bolao_load_state() or {})
+                st2.setdefault("learning", {})["last_generation"] = {
+                    "apostas": apostas_ok  # lista de 15 números por aposta
+                }
+                _bolao_save_state(st2)
+            except Exception:
+                logger.warning("Falha ao persistir learning.last_generation.", exc_info=True)
+
+            # 10.2 registro para aprendizado leve (log próprio)
+            try:
+                self._registrar_geracao(apostas_ok, base_resultado=ultimo or [])
+            except Exception:
+                logger.warning("Falha ao registrar geração para aprendizado leve (/gerar).", exc_info=True)
+
+            # 10.3 registrar o lote no estado (pending_batches)
+            try:
+                st3 = _normalize_state_defaults(_bolao_load_state() or {})
+                batches = st3.get("pending_batches", [])
+                batches.append({
+                    "ts": datetime.now(ZoneInfo(TIMEZONE)).isoformat(),
+                    "snapshot": getattr(self._latest_snapshot(), "snapshot_id", "--"),
+                    "alpha": float(st3.get("alpha", ALPHA_PADRAO)),
+                    "janela": int((st3.get("learning") or {}).get("janela", JANELA_PADRAO)),
+                    "oficial_base": " ".join(f"{n:02d}" for n in (ultimo or [])),
+                    "qtd": len(apostas_ok),
+                    "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas_ok],
+                })
+                st3["pending_batches"] = batches[-100:]
+                _bolao_save_state(st3)
+            except Exception:
+                logger.warning("Falha ao registrar pending_batch.", exc_info=True)
+
+            # 10.4 mensagem "Aprendizado leve atualizado"
+            try:
+                media_real = self._media_real_do_lote_persistido()
+
+                st_msg = _normalize_state_defaults(_bolao_load_state() or {})
+                st_msg = self._coagir_estado_lock_alpha(st_msg)
+                learn_msg = (st_msg.get("learning") or {})
+                bias_meta = learn_msg.get("bias_meta", {}) or {}
+                alpha_usado_msg = float(st_msg["runtime"].get("alpha_usado", ALPHA_LOCK_VALUE))
+                alpha_proposto = learn_msg.get("alpha_proposto", None)
+                lock_ativo = st_msg["locks"].get("alpha_travado", True)
+
+                if lock_ativo:
+                    alpha_info = f"α usado: {alpha_usado_msg:.2f} (travado)"
+                    if alpha_proposto is not None:
+                        alpha_info += f" | α proposto: {float(alpha_proposto):.2f} (pendente)"
+                else:
+                    alpha_info = f"α usado: {alpha_usado_msg:.2f} (livre)"
+
+                msg = (
+                    "📈 Aprendizado leve atualizado.\n"
+                    f"• Lote avaliado: {len(apostas_ok)} apostas\n"
+                    f"• Média de acertos: {media_real:.2f}\n"
+                    f"• {alpha_info}\n"
+                    f"• bias[R]={bias_meta.get('R', 0.0):+.3f}  "
+                    f"bias[par]={bias_meta.get('par', 0.0):+.3f}  "
+                    f"bias[seq]={bias_meta.get('seq', 0.0):+.3f}"
                 )
-            if SHOW_TIMESTAMP:
-                now_sp = datetime.now(ZoneInfo(TIMEZONE))
-                linhas.append(f"<i>janela={janela} | α={alpha_usado:.2f}</i>")
-            resposta = "\n".join(linhas)
+                await update.message.reply_text(msg)
+            except Exception:
+                logger.warning("Falha ao compor/enviar mensagem de aprendizado leve.", exc_info=True)
 
-        # ------------------------------------------------------------------
-        # 9. Enviar resultado (barra em 100%)
-        # ------------------------------------------------------------------
-        await _smooth_to(1.0, "Concluído. Apostas prontas!")
+            # =====================================================================
+            # 11. Preparar resposta para o usuário
+            # =====================================================================
+            await _smooth_to(0.97, "Formatando resposta final...")
 
-        try:
-            if loading_msg:
-                await loading_msg.edit_text(resposta, parse_mode="HTML")
-            else:
+            try:
+                resposta = self._formatar_resposta(apostas_ok, janela, alpha_usado)
+            except Exception:
+                # Fallback de formatação (mantém seu visual atual)
+                linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
+                for i, a in enumerate(apostas_ok, 1):
+                    pares = self._contar_pares(a) if hasattr(self, "_contar_pares") else sum(1 for n in a if n % 2 == 0)
+                    seq = self._max_seq(a) if hasattr(self, "_max_seq") else 0
+                    linhas.append(
+                        f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}\n"
+                        f"🔢 Pares: {pares} | Ímpares: {15 - pares} | SeqMax: {seq}\n"
+                    )
+                if SHOW_TIMESTAMP:
+                    now_sp = datetime.now(ZoneInfo(TIMEZONE))
+                    carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    linhas.append(f"<i>janela={janela} | α={alpha_usado:.2f} | {carimbo}</i>")
+                resposta = "\n".join(linhas)
+
+            # =====================================================================
+            # 12. Enviar saída (barra 100%)
+            # =====================================================================
+            await _smooth_to(1.0, "Concluído. Apostas prontas!")
+
+            try:
+                if loading_msg is not None:
+                    await loading_msg.edit_text(resposta, parse_mode="HTML")
+                else:
+                    await update.message.reply_text(resposta, parse_mode="HTML")
+            except Exception:
                 await update.message.reply_text(resposta, parse_mode="HTML")
-        except Exception:
-            await update.message.reply_text(resposta, parse_mode="HTML")
 
-        # ------------------------------------------------------------------
-        # 10. auto_aprender (opcional)
-        # ------------------------------------------------------------------
-        try:
-            await self.auto_aprender(update, context)
+            # Opcional: auto_aprender (com gating ativo ele retorna sem mexer)
+            try:
+                await self.auto_aprender(update, context)
+            except Exception:
+                logger.warning("auto_aprender falhou; prosseguindo normalmente.", exc_info=True)
+
         except Exception:
-            logger.warning("auto_aprender falhou; prosseguindo normalmente.", exc_info=True)
+            logger.error("Erro ao gerar apostas:\n" + traceback.format_exc())
+            if loading_msg is not None:
+                try:
+                    await loading_msg.edit_text("Erro ao gerar apostas. Tente novamente.")
+                except Exception:
+                    pass
+            await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
+
 
 
 
