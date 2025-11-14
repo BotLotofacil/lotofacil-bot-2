@@ -4883,7 +4883,7 @@ class LotoFacilBot:
 
         # anti-abuso padrão
         if not self._is_admin(user_id):
-            if _is_temporarily_blocked(user_id):
+            if _is_temporariamente_blocked(user_id):
                 return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
             allowed, warn = _register_command_event(user_id, is_unknown=False)
             if not allowed:
@@ -5053,7 +5053,7 @@ class LotoFacilBot:
             logger.warning("_fechar_lote_stricto falhou em /mestre; seguindo com lote atual.", exc_info=True)
 
         # ------------------------------------------------------------------
-        # 6. Passada final de estabilização (seq/paridade/overlap) + top-up
+        # 6. Passada final de estabilização (seq/paridade/overlap) + helpers
         # ------------------------------------------------------------------
         def _shape_ok(a: list[int]) -> bool:
             try:
@@ -5064,7 +5064,6 @@ class LotoFacilBot:
                 seq = self._max_seq(a)
                 return (7 <= pares <= 8) and (seq <= 3)
 
-        # 6.1) estabilização leve com helpers existentes
         try:
             for _ in range(2):
                 try:
@@ -5079,7 +5078,9 @@ class LotoFacilBot:
         except Exception:
             logger.warning("Passada final de estabilização (seq/overlap) falhou.", exc_info=True)
 
-        # 6.2) Top-up determinístico (candidatos extras) — usa fallback Mestre
+        # ------------------------------------------------------------------
+        # 6.2) Gerador auxiliar para TOP-UP (fallback Mestre)
+        # ------------------------------------------------------------------
         def _fallback_mestre(extra_idx: int) -> list[int]:
             """
             Gera uma aposta extra determinística baseada em L/C e no call_salt.
@@ -5096,12 +5097,14 @@ class LotoFacilBot:
                 a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
             return sorted(set(int(x) for x in a2))
 
+        # ------------------------------------------------------------------
+        # 7. Funil FINAL ESTRITO: pool de candidatos + seleção dura
+        # ------------------------------------------------------------------
         try:
-            # vamos construir um pool de candidatos: atuais + extras
-            pool_candidatos = []
-            for a in apostas_ok:
-                pool_candidatos.append(sorted(set(int(x) for x in a)))
+            # pool inicial: lote atual
+            pool_candidatos = [sorted(set(int(x) for x in a)) for a in apostas_ok]
 
+            # adiciona candidatos extras (para top-up e diversidade)
             extra_idx = 0
             while len(pool_candidatos) < target_qtd * 2 and extra_idx < target_qtd * 6:
                 extra_idx += 1
@@ -5111,9 +5114,6 @@ class LotoFacilBot:
             logger.warning("Construção de pool de candidatos falhou; usando lote atual.", exc_info=True)
             pool_candidatos = [sorted(set(int(x) for x in a)) for a in apostas_ok]
 
-        # ------------------------------------------------------------------
-        # 7. Funil FINAL ESTRITO: só entra quem passa shape + overlap
-        # ------------------------------------------------------------------
         apostas_finais: list[list[int]] = []
         seen_final = set()
 
@@ -5121,18 +5121,24 @@ class LotoFacilBot:
             for cand in pool_candidatos:
                 # normaliza e sela de novo
                 try:
-                    cand2 = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset(), alvo_par=(7, 8), max_seq=3)
+                    cand2 = self._hard_lock_fast(
+                        cand,
+                        ultimo=ultimo or [],
+                        anchors=frozenset(),
+                        alvo_par=(7, 8),
+                        max_seq=3,
+                    )
                 except Exception:
                     cand2 = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
 
                 cand2 = sorted(set(int(x) for x in cand2))
 
-                # checagem de forma "hard"
+                # forma / shape
                 if not _shape_ok(cand2):
                     continue
 
-                # checagem direta de paridade e seq (redundante, mas garante)
-                pares, _imp = self._paridade(cand2)
+                # paridade + seq
+                pares, _ = self._paridade(cand2)
                 seq = self._max_seq(cand2)
                 if not (7 <= pares <= 8 and seq <= 3):
                     continue
@@ -5156,8 +5162,76 @@ class LotoFacilBot:
 
                 if len(apostas_finais) >= target_qtd:
                     break
+        except Exception:
+            logger.warning("Funil final estrito falhou; fallback para apostas_ok.", exc_info=True)
+            apostas_finais = [sorted(a) for a in apostas_ok]
 
-            # se por algum motivo ficou vazio, usa pelo menos algo do lote original
+        # ------------------------------------------------------------------
+        # 7.1 TOP-UP FORÇADO — tenta completar até 30 dentro das regras
+        # ------------------------------------------------------------------
+        try:
+            extra_idx = 0
+            while len(apostas_finais) < target_qtd and extra_idx < target_qtd * 10:
+                extra_idx += 1
+                cand = _fallback_mestre(extra_idx)
+
+                # normaliza
+                try:
+                    cand2 = self._hard_lock_fast(
+                        cand,
+                        ultimo=ultimo or [],
+                        anchors=frozenset(),
+                        alvo_par=(7, 8),
+                        max_seq=3,
+                    )
+                except Exception:
+                    cand2 = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
+
+                cand2 = sorted(set(int(x) for x in cand2))
+
+                # forma
+                if not _shape_ok(cand2):
+                    continue
+
+                # paridade e seq
+                pares, _ = self._paridade(cand2)
+                seq = self._max_seq(cand2)
+                if not (7 <= pares <= 8 and seq <= 3):
+                    continue
+
+                # overlap estrito
+                violou = False
+                for b in apostas_finais:
+                    if len(set(cand2) & set(b)) > OVERLAP_MAX:
+                        violou = True
+                        break
+                if violou:
+                    continue
+
+                # dedup
+                t = tuple(cand2)
+                if t in seen_final:
+                    continue
+
+                seen_final.add(t)
+                apostas_finais.append(cand2)
+        except Exception:
+            logger.warning("Top-up final falhou.", exc_info=True)
+
+        # ------------------------------------------------------------------
+        # 7.2 COMPLETUDE BRUTA — se ainda não chegou em 30, completa com apostas_ok
+        # ------------------------------------------------------------------
+        if len(apostas_finais) < target_qtd:
+            for a in apostas_ok:
+                t = tuple(sorted(a))
+                if t in seen_final:
+                    continue
+                seen_final.add(t)
+                apostas_finais.append(sorted(a))
+                if len(apostas_finais) >= target_qtd:
+                    break
+
+            # se por algum motivo ficou vazio (caso extremo), usa pelo menos 1 jogo válido
             if not apostas_finais:
                 for a in apostas_ok:
                     try:
@@ -5167,20 +5241,9 @@ class LotoFacilBot:
                     a2 = sorted(set(int(x) for x in a2))
                     pares, _imp = self._paridade(a2)
                     seq = self._max_seq(a2)
-                    if (7 <= pares <= 8 and seq <= 3):
+                    if 7 <= pares <= 8 and seq <= 3:
                         apostas_finais.append(a2)
                         break
-
-        except Exception:
-            logger.warning("Funil final estrito falhou; caindo para lote anterior.", exc_info=True)
-            # fallback: usa apostas_ok, mas pelo menos dedup
-            uniq_tmp, seen_tmp2 = [], set()
-            for a in apostas_ok:
-                t = tuple(sorted(a))
-                if t not in seen_tmp2:
-                    seen_tmp2.add(t)
-                    uniq_tmp.append(sorted(a))
-            apostas_finais = uniq_tmp
 
         # ----------------------------------------------------------------------
         # 8. Telemetria e registro para aprendizado REAL
