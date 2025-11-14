@@ -5377,6 +5377,7 @@ class LotoFacilBot:
             logger.warning("auto_aprender falhou pós-/mestre; prosseguindo normalmente.", exc_info=True)
 
 
+
     # --- /refinar_bolao: aplica bias, regenera 19→15 e sela o lote ---
     async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
