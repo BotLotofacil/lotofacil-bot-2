@@ -4896,26 +4896,75 @@ class LotoFacilBot:
             return await update.message.reply_text("⏳ Aguarde alguns segundos antes de usar /mestre novamente.")
 
         # ------------------------------------------------------------------
+        # 0.1 Mensagem inicial de carregamento + helpers da barra
+        # ------------------------------------------------------------------
+        try:
+            loading_msg = await update.message.reply_text(
+                "⏳ Gerando suas apostas Mestre...\n[░░░░░░░░░░] 0%"
+            )
+        except Exception:
+            loading_msg = None
+
+        def _progress_bar(pct: float, etapa: str) -> str:
+            pct = max(0.0, min(1.0, float(pct)))
+            total = 10
+            filled = int(round(total * pct))
+            bar = "▰" * filled + "▱" * (total - filled)
+            return (
+                "⏳ Gerando suas apostas Mestre…\n"
+                f"[{bar}] {int(pct * 100)}%\n\n"
+                f"Etapa: {etapa}"
+            )
+
+        async def _set_progress(pct: float, etapa: str) -> None:
+            if loading_msg is None:
+                return
+            try:
+                await loading_msg.edit_text(_progress_bar(pct, etapa))
+            except Exception:
+                # falha na edição não pode quebrar o comando
+                pass
+
+        # ------------------------------------------------------------------
         # 1. Carregar histórico e último resultado
         # ------------------------------------------------------------------
+        await _set_progress(0.10, "Carregando histórico...")
+
         try:
             historico = carregar_historico(HISTORY_PATH)
         except Exception:
             historico = []
 
         if not historico:
+            if loading_msg is not None:
+                try:
+                    await loading_msg.edit_text("Histórico indisponível.")
+                except Exception:
+                    pass
             return await update.message.reply_text("Histórico indisponível.")
 
         try:
             ultimo = list(sorted(int(x) for x in self._ultimo_resultado(historico)))
         except Exception:
+            if loading_msg is not None:
+                try:
+                    await loading_msg.edit_text("Erro ao obter o último resultado oficial.")
+                except Exception:
+                    pass
             return await update.message.reply_text("Erro ao obter o último resultado oficial.")
 
         if not ultimo or len(ultimo) != 15:
+            if loading_msg is not None:
+                try:
+                    await loading_msg.edit_text("Último resultado inválido para o preset Mestre.")
+                except Exception:
+                    pass
             return await update.message.reply_text("Último resultado inválido para o preset Mestre.")
 
         universo = list(range(1, 26))
         comp = [n for n in universo if n not in ultimo]
+
+        await _set_progress(0.20, "Base L/C preparada.")
 
         # ------------------------------------------------------------------
         # 2. Seeds determinísticas (base + “sal” por snapshot)
@@ -4943,8 +4992,7 @@ class LotoFacilBot:
 
         # ------------------------------------------------------------------
         # 2.1 Planos de repetição (R) — 30 apostas alvo
-        #     Nova curva: mais 10R e um pouco mais de 11R (~20% do lote),
-        #     mantendo 9R como base e poucos 8R.
+        #     Nova curva: mais 10R e ~20% de 11R.
         # ------------------------------------------------------------------
         planos_R_base = [10, 9, 9, 10, 10, 9, 10, 8, 11, 11]
         planos_R = (planos_R_base * 3)[:30]  # garante 30 entradas
@@ -4954,6 +5002,8 @@ class LotoFacilBot:
         # ------------------------------------------------------------------
         # 3. Construção bruta das apostas Mestre via repetição (L / C)
         # ------------------------------------------------------------------
+        await _set_progress(0.35, "Construindo apostas base por repetição...")
+
         brutas: list[list[int]] = []
         L = list(ultimo) or universo[:15]
         C = comp[:] or [n for n in universo if n not in L]
@@ -4988,6 +5038,8 @@ class LotoFacilBot:
         # ------------------------------------------------------------------
         # 4. Pós-filtro unificado (forma + dedup/overlap + bias)
         # ------------------------------------------------------------------
+        await _set_progress(0.50, "Aplicando pós-filtro unificado...")
+
         try:
             apostas = self._pos_filtro_unificado(brutas, ultimo)
         except Exception:
@@ -5011,6 +5063,8 @@ class LotoFacilBot:
             OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
         except Exception:
             OVERLAP_MAX = 11
+
+        await _set_progress(0.65, "Refinando lote (funil Mestre)...")
 
         # 5.1) “funilão” Mestre (refina forma + overlap + bias)
         try:
@@ -5056,6 +5110,8 @@ class LotoFacilBot:
         # ------------------------------------------------------------------
         # 6. Passada final de estabilização (seq/paridade/overlap) + top-up
         # ------------------------------------------------------------------
+        await _set_progress(0.78, "Estabilizando lote (seq≤3 / overlap)...")
+
         def _shape_ok(a: list[int]) -> bool:
             try:
                 return self._shape_ok_basico(a)
@@ -5115,6 +5171,8 @@ class LotoFacilBot:
         # ------------------------------------------------------------------
         # 7. Funil FINAL ESTRITO: só entra quem passa shape + overlap
         # ------------------------------------------------------------------
+        await _set_progress(0.88, "Funil final estrito / dedup...")
+
         apostas_finais: list[list[int]] = []
         seen_final = set()
 
@@ -5171,6 +5229,8 @@ class LotoFacilBot:
         # ------------------------------------------------------------------
         # 7.1 TOP-UP FORÇADO — GARANTE 30 APOSTAS SEM EXCEÇÃO
         # ------------------------------------------------------------------
+        await _set_progress(0.93, "Completando lote até 30 apostas...")
+
         try:
             extra_idx = 0
             while len(apostas_finais) < target_qtd and extra_idx < target_qtd * 10:
@@ -5245,6 +5305,8 @@ class LotoFacilBot:
                         apostas_finais.append(a2)
                         break
 
+        await _set_progress(0.97, "Calculando telemetria e preparando resposta...")
+
         # ----------------------------------------------------------------------
         # 8. Telemetria e registro para aprendizado REAL
         # ----------------------------------------------------------------------
@@ -5295,7 +5357,16 @@ class LotoFacilBot:
                 f"hash={hash_ult} | snapshot={snap_id} | tz={TIMEZONE} | {carimbo}</i>"
             )
 
-        await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+        resultado_texto = "\n".join(linhas)
+
+        # Em vez de mandar uma nova mensagem, usamos a própria de carregamento
+        if loading_msg is not None:
+            try:
+                await loading_msg.edit_text(resultado_texto, parse_mode="HTML")
+            except Exception:
+                await update.message.reply_text(resultado_texto, parse_mode="HTML")
+        else:
+            await update.message.reply_text(resultado_texto, parse_mode="HTML")
 
         # ----------------------------------------------------------------------
         # 10. auto_aprender (com gating: se TRIPLO CHECK reprovar, ele não move bias)
@@ -5304,7 +5375,6 @@ class LotoFacilBot:
             await self.auto_aprender(update, context)
         except Exception:
             logger.warning("auto_aprender falhou pós-/mestre; prosseguindo normalmente.", exc_info=True)
-
 
 
     # --- /refinar_bolao: aplica bias, regenera 19→15 e sela o lote ---
