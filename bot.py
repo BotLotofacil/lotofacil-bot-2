@@ -4871,11 +4871,13 @@ class LotoFacilBot:
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
 
-        # --- autorização ---
+        # ------------------------------------------------------------------
+        # 0. Autorização + anti-abuso + cooldown
+        # ------------------------------------------------------------------
         if not self._usuario_autorizado(user_id):
             return await update.message.reply_text("⛔ Você não está autorizado a gerar apostas.")
 
-        # --- anti-abuso / rate limit ---
+        # anti-abuso padrão
         if not self._is_admin(user_id):
             if _is_temporarily_blocked(user_id):
                 return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
@@ -4885,13 +4887,13 @@ class LotoFacilBot:
             if warn:
                 await update.message.reply_text(warn)
 
-        # --- cooldown por chat pra evitar spam humano apertando várias vezes seguidas ---
+        # cooldown por chat pra evitar spam
         if self._hit_cooldown(chat_id, "/mestre"):
-            return await update.message.reply_text("⏳ Aguarde alguns segundos antes de pedir novamente.")
+            return await update.message.reply_text("⏳ Aguarde alguns segundos antes de usar /mestre novamente.")
 
-        # ----------------------------------------------------------------------
-        # 0. Histórico + último resultado
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 1. Carregar histórico e último resultado
+        # ------------------------------------------------------------------
         try:
             historico = carregar_historico(HISTORY_PATH)
         except Exception:
@@ -4901,17 +4903,19 @@ class LotoFacilBot:
             return await update.message.reply_text("Histórico indisponível.")
 
         try:
-            ultimo = self._ultimo_resultado(historico)  # lista ordenada 15 dezenas
+            ultimo = list(sorted(int(x) for x in self._ultimo_resultado(historico)))
         except Exception:
-            ultimo = []
+            return await update.message.reply_text("Erro ao obter o último resultado oficial.")
 
-        u_set = set(ultimo)
+        if not ultimo or len(ultimo) != 15:
+            return await update.message.reply_text("Último resultado inválido para o preset Mestre.")
+
         universo = list(range(1, 26))
-        comp = [n for n in universo if n not in u_set]
+        comp = [n for n in universo if n not in ultimo]
 
-        # ----------------------------------------------------------------------
-        # 1. Seeds e “sal” determinístico
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 2. Seeds determinísticas (base + “sal” por snapshot)
+        # ------------------------------------------------------------------
         try:
             snap = self._latest_snapshot()
             snap_id = getattr(snap, "snapshot_id", "--")
@@ -4919,30 +4923,32 @@ class LotoFacilBot:
             snap = None
             snap_id = "--"
 
-        # seed Mestre estável por user+chat+último
         try:
-            mestre_seed_base = self._calc_mestre_seed(user_id, chat_id, ultimo)
+            mestre_seed_base = int(self._calc_mestre_seed(
+                user_id=user_id,
+                chat_id=chat_id,
+                ultimo_sorted=ultimo,
+            )) & 0xFFFFFFFF
         except Exception:
             mestre_seed_base = 0
 
-        # “sal” incremental por snapshot (como no /gerar)
         try:
-            call_salt = self._next_draw_seed(str(snap_id))
+            call_salt = int(self._next_draw_seed(snap_id)) & 0xFFFFFFFF
         except Exception:
             call_salt = 0
 
-        # ----------------------------------------------------------------------
-        # 2. Planos de repetição (R) — 30 apostas alvo
-        #    padrão: repetir o padrão [10,9,9,10,10,9,10,8,11,10] 3x
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # 2.1 Planos de repetição (R) — 30 apostas alvo
+        #     padrão: repetir o padrão [10,9,9,10,10,9,10,8,11,10] 3x
+        # ------------------------------------------------------------------
         planos_R_base = [10, 9, 9, 10, 10, 9, 10, 8, 11, 10]
         planos_R = (planos_R_base * 3)[:30]  # garante 30 entradas
 
         target_qtd = 30
 
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # 3. Construção bruta das apostas Mestre via repetição (L / C)
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         brutas: list[list[int]] = []
         L = list(ultimo) or universo[:15]
         C = comp[:] or [n for n in universo if n not in L]
@@ -4974,9 +4980,9 @@ class LotoFacilBot:
 
             brutas.append(sorted(set(int(x) for x in base_aposta)))
 
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # 4. Pós-filtro unificado (forma + dedup/overlap + bias)
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         try:
             apostas = self._pos_filtro_unificado(brutas, ultimo)
         except Exception:
@@ -4993,9 +4999,9 @@ class LotoFacilBot:
                     seen_min.add(t)
                     apostas.append(sorted(a2))
 
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # 5. Funil Mestre (mesmo espírito do /gerar)
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         try:
             OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
         except Exception:
@@ -5037,14 +5043,14 @@ class LotoFacilBot:
                 apostas_ok,
                 ultimo=ultimo or [],
                 overlap_max=OVERLAP_MAX,
-                max_ciclos=8
+                max_ciclos=8,
             )
         except Exception:
             logger.warning("_fechar_lote_stricto falhou em /mestre; seguindo com lote atual.", exc_info=True)
 
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         # 6. Passada final: SeqMax ≤ 3 + anti-overlap + top-up até 30
-        # ----------------------------------------------------------------------
+        # ------------------------------------------------------------------
         def _shape_ok(a: list[int]) -> bool:
             try:
                 return self._shape_ok_basico(a)
@@ -5066,7 +5072,7 @@ class LotoFacilBot:
         except Exception:
             logger.warning("Passada final de estabilização (seq/overlap) falhou.", exc_info=True)
 
-        # 6.2) Top-up deterministic até target_qtd (se possível), com fallback
+        # 6.2) Top-up determinístico até target_qtd (se possível), com fallback
         def _fallback_mestre(extra_idx: int) -> list[int]:
             """
             Gera uma aposta extra determinística baseada em L/C e no call_salt.
@@ -5074,7 +5080,7 @@ class LotoFacilBot:
             """
             Lloc = list(ultimo) or universo[:15]
             Cloc = [n for n in universo if n not in Lloc]
-            offL = (mestre_seed_base + call_salt + extra_idx * 7) % max(1, len(Lloc))
+            offL = (mestre_seed_base + call_salt + extra_idx * 7) % max(1, len(Lloc) or 1)
             offC = (mestre_seed_base // 5 + call_salt + extra_idx * 11) % max(1, len(Cloc) or 1)
             a = (Lloc[offL:] + Lloc[:offL])[:8] + (Cloc[offC:] + Cloc[:offC])[:7]
             try:
@@ -5179,6 +5185,7 @@ class LotoFacilBot:
             await self.auto_aprender(update, context)
         except Exception:
             logger.warning("auto_aprender falhou pós-/mestre; prosseguindo normalmente.", exc_info=True)
+
 
 
     # --- /refinar_bolao: aplica bias, regenera 19→15 e sela o lote ---
