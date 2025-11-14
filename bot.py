@@ -4856,12 +4856,16 @@ class LotoFacilBot:
             • sem duplicatas
         - Ser determinístico para (último resultado + user + chat).
 
-        Estratégia:
+        Estratégia (camadas):
         1) Usa o último resultado como base (L) e o complemento (C).
         2) Constrói apostas via _construir_aposta_por_repeticao com R-alvo.
         3) Aplica hard_lock + pós-filtro unificado.
         4) Passa pelo funil Mestre (finalizar_lote_mestre + fechar_lote_stricto).
-        5) Passada final seq≤3 + anti-overlap + top-up até 30 se possível.
+        5) Passada final estrita:
+            - força novamente paridade 7–8 e SeqMax≤3;
+            - dedup;
+            - anti-overlap ≤ BOLAO_MAX_OVERLAP;
+            - top-up determinístico até 30, quando possível.
         """
 
         import traceback
@@ -5049,15 +5053,18 @@ class LotoFacilBot:
             logger.warning("_fechar_lote_stricto falhou em /mestre; seguindo com lote atual.", exc_info=True)
 
         # ------------------------------------------------------------------
-        # 6. Passada final: SeqMax ≤ 3 + anti-overlap + top-up até 30
+        # 6. Passada final de estabilização (seq/paridade/overlap) + top-up
         # ------------------------------------------------------------------
         def _shape_ok(a: list[int]) -> bool:
             try:
                 return self._shape_ok_basico(a)
             except Exception:
-                return True
+                # fallback: verifica diretamente paridade e seq
+                pares, _imp = self._paridade(a)
+                seq = self._max_seq(a)
+                return (7 <= pares <= 8) and (seq <= 3)
 
-        # 6.1) seq≤3 + anti-overlap (2 ciclos de estabilização)
+        # 6.1) estabilização leve com helpers existentes
         try:
             for _ in range(2):
                 try:
@@ -5072,7 +5079,7 @@ class LotoFacilBot:
         except Exception:
             logger.warning("Passada final de estabilização (seq/overlap) falhou.", exc_info=True)
 
-        # 6.2) Top-up determinístico até target_qtd (se possível), com fallback
+        # 6.2) Top-up determinístico (candidatos extras) — usa fallback Mestre
         def _fallback_mestre(extra_idx: int) -> list[int]:
             """
             Gera uma aposta extra determinística baseada em L/C e no call_salt.
@@ -5090,44 +5097,93 @@ class LotoFacilBot:
             return sorted(set(int(x) for x in a2))
 
         try:
-            seen = {tuple(sorted(a)) for a in apostas_ok}
+            # vamos construir um pool de candidatos: atuais + extras
+            pool_candidatos = []
+            for a in apostas_ok:
+                pool_candidatos.append(sorted(set(int(x) for x in a)))
+
             extra_idx = 0
-            while len(apostas_ok) < target_qtd and extra_idx < target_qtd * 4:
+            while len(pool_candidatos) < target_qtd * 2 and extra_idx < target_qtd * 6:
                 extra_idx += 1
                 cand = _fallback_mestre(extra_idx)
-                t = tuple(sorted(cand))
-                if t in seen:
-                    continue
-                if not _shape_ok(cand):
-                    continue
-                if any(len(set(cand) & set(b)) > OVERLAP_MAX for b in apostas_ok):
-                    continue
-                apostas_ok.append(cand)
-                seen.add(t)
-
-            # última passada de seq≤3 + anti-overlap depois do top-up
-            try:
-                apostas_ok = self._forcar_seq_max3_lote(apostas_ok)
-            except Exception:
-                pass
-            try:
-                apostas_ok = self._forcar_anti_overlap(apostas_ok, ultimo=ultimo or [], limite=OVERLAP_MAX)
-            except Exception:
-                pass
+                pool_candidatos.append(sorted(set(int(x) for x in cand)))
         except Exception:
-            logger.warning("Top-up determinístico até 30 falhou; usando lote parcial.", exc_info=True)
+            logger.warning("Construção de pool de candidatos falhou; usando lote atual.", exc_info=True)
+            pool_candidatos = [sorted(set(int(x) for x in a)) for a in apostas_ok]
 
-        # dedup final + ordenação
-        uniq, seen_final = [], set()
-        for a in apostas_ok:
-            t = tuple(sorted(a))
-            if t not in seen_final:
+        # ------------------------------------------------------------------
+        # 7. Funil FINAL ESTRITO: só entra quem passa shape + overlap
+        # ------------------------------------------------------------------
+        apostas_finais: list[list[int]] = []
+        seen_final = set()
+
+        try:
+            for cand in pool_candidatos:
+                # normaliza e sela de novo
+                try:
+                    cand2 = self._hard_lock_fast(cand, ultimo=ultimo or [], anchors=frozenset(), alvo_par=(7, 8), max_seq=3)
+                except Exception:
+                    cand2 = self._ajustar_paridade_e_seq(cand, alvo_par=(7, 8), max_seq=3)
+
+                cand2 = sorted(set(int(x) for x in cand2))
+
+                # checagem de forma "hard"
+                if not _shape_ok(cand2):
+                    continue
+
+                # checagem direta de paridade e seq (redundante, mas garante)
+                pares, _imp = self._paridade(cand2)
+                seq = self._max_seq(cand2)
+                if not (7 <= pares <= 8 and seq <= 3):
+                    continue
+
+                # anti-overlap estrito
+                violou = False
+                for b in apostas_finais:
+                    if len(set(cand2) & set(b)) > OVERLAP_MAX:
+                        violou = True
+                        break
+                if violou:
+                    continue
+
+                # dedup
+                t = tuple(cand2)
+                if t in seen_final:
+                    continue
+
                 seen_final.add(t)
-                uniq.append(sorted(a))
-        apostas_finais = uniq
+                apostas_finais.append(cand2)
+
+                if len(apostas_finais) >= target_qtd:
+                    break
+
+            # se por algum motivo ficou vazio, usa pelo menos algo do lote original
+            if not apostas_finais:
+                for a in apostas_ok:
+                    try:
+                        a2 = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset(), alvo_par=(7, 8), max_seq=3)
+                    except Exception:
+                        a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                    a2 = sorted(set(int(x) for x in a2))
+                    pares, _imp = self._paridade(a2)
+                    seq = self._max_seq(a2)
+                    if (7 <= pares <= 8 and seq <= 3):
+                        apostas_finais.append(a2)
+                        break
+
+        except Exception:
+            logger.warning("Funil final estrito falhou; caindo para lote anterior.", exc_info=True)
+            # fallback: usa apostas_ok, mas pelo menos dedup
+            uniq_tmp, seen_tmp2 = [], set()
+            for a in apostas_ok:
+                t = tuple(sorted(a))
+                if t not in seen_tmp2:
+                    seen_tmp2.add(t)
+                    uniq_tmp.append(sorted(a))
+            apostas_finais = uniq_tmp
 
         # ----------------------------------------------------------------------
-        # 7. Telemetria e registro para aprendizado REAL
+        # 8. Telemetria e registro para aprendizado REAL
         # ----------------------------------------------------------------------
         telems = [self._telemetria(a, ultimo or [], alvo_par=(7, 8), max_seq=3) for a in apostas_finais]
 
@@ -5144,7 +5200,7 @@ class LotoFacilBot:
             logger.warning("Falha para append no learn_log após /mestre.", exc_info=True)
 
         # ----------------------------------------------------------------------
-        # 8. Formatar resposta pro usuário
+        # 9. Formatar resposta pro usuário
         # ----------------------------------------------------------------------
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES — Preset Mestre</b> 🎰\n"]
         ok_count = 0
@@ -5179,12 +5235,13 @@ class LotoFacilBot:
         await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
         # ----------------------------------------------------------------------
-        # 9. auto_aprender (com gating: se TRIPLO CHECK reprovar, ele não move bias)
+        # 10. auto_aprender (com gating: se TRIPLO CHECK reprovar, ele não move bias)
         # ----------------------------------------------------------------------
         try:
             await self.auto_aprender(update, context)
         except Exception:
             logger.warning("auto_aprender falhou pós-/mestre; prosseguindo normalmente.", exc_info=True)
+
 
 
 
