@@ -195,15 +195,15 @@ TIMEZONE = "America/Sao_Paulo"
 JANELA_PADRAO = 60
 JANELA_MIN, JANELA_MAX = 50, 1000
 
-ALPHA_PADRAO = 0.36
+ALPHA_PADRAO = 0.37
 ALPHA_MIN,  ALPHA_MAX  = 0.05, 0.95
 
 HISTORY_PATH = "data/history.csv"
 WHITELIST_PATH = "whitelist.txt"
 
 # --- Alpha lock (apenas no /gerar) ---
-LOCK_ALPHA_GERAR = True      # deixe True para travar /gerar em 0.36
-ALPHA_LOCK_VALUE  = 0.36     # valor travado só para /gerar
+LOCK_ALPHA_GERAR = True      # deixe True para travar /gerar em 0.37
+ALPHA_LOCK_VALUE  = 0.37     # valor travado só para /gerar
 
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
@@ -218,7 +218,7 @@ BUILD_TAG = getenv("BUILD_TAG", "unknown")
 # Configurações do Bolão Inteligente v5 (19 → 15)
 # ========================
 BOLAO_JANELA = 60
-BOLAO_ALPHA  = 0.36
+BOLAO_ALPHA  = 0.37
 BOLAO_QTD_APOSTAS = 5
 BOLAO_ANCHORS = (9, 11)
 BOLAO_STATE_PATH = "data/bolao_state.json"
@@ -247,7 +247,7 @@ DATA_DIR = str(Path(HISTORY_PATH).parent)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 BOLAO20_JANELA = 60
-BOLAO20_ALPHA  = 0.30
+BOLAO20_ALPHA  = 0.34
 BOLAO20_PAR    = (7, 8)
 BOLAO20_MAXSEQ = 3
 BOLAO20_MAX_OVERLAP = 11
