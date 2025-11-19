@@ -5533,7 +5533,7 @@ class LotoFacilBot:
             st = dict(st) if isinstance(st, dict) else {}
             raw_bias = st.get("bias", {}) or {}
 
-            bias: dict[int, float] = {}
+            bias = {}
             for k, v in raw_bias.items():
                 try:
                     ki = int(k)
@@ -5541,14 +5541,14 @@ class LotoFacilBot:
                 except Exception:
                     continue
 
-            hits_map: dict[int, int] = {}
+            hits_map = {}
             for k, v in (st.get("hits", {}) or {}).items():
                 try:
                     hits_map[int(k)] = int(v)
                 except Exception:
                     continue
 
-            seen_map: dict[int, int] = {}
+            seen_map = {}
             for k, v in (st.get("seen", {}) or {}).items():
                 try:
                     seen_map[int(k)] = int(v)
@@ -5599,10 +5599,9 @@ class LotoFacilBot:
 
             apostas_brutas = self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
 
-            # 6) Selagem rápida por aposta (hard_lock_fast aplica forma Mestre)
-            anchors_fs = frozenset(int(x) for x in anchors_tuple)
+            # 6) Selagem rápida por aposta (hard_lock_fast aplica paridade 7–8, seq<=3, âncoras)
             apostas_seladas = [
-                self._hard_lock_fast(a, oficial, anchors=anchors_fs)
+                self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
                 for a in apostas_brutas
             ]
 
@@ -5612,68 +5611,111 @@ class LotoFacilBot:
             except Exception:
                 logger.warning("pos_filtro_unificado falhou no /refinar_bolao; aplicando hard_lock por aposta.", exc_info=True)
                 apostas_filtradas = [
-                    self._hard_lock_fast(a, oficial, anchors=anchors_fs)
+                    self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
                     for a in apostas_seladas
                 ]
 
-            # 7.1) FUNIL MESTRE-MINI: forma forte + anti-overlap + dedup stricto
-            def _canon_local(a: list[int]) -> list[int]:
-                a = [int(x) for x in a if 1 <= int(x) <= 25]
-                a = sorted(set(a))
-                if len(a) < 15:
-                    comp = [n for n in range(1, 26) if n not in a]
-                    for n in comp:
-                        if (n - 1 not in a) and (n + 1 not in a):
-                            a.append(n)
-                            if len(a) == 15:
+            # 7.1) Sanitização forte do mini-lote (TRIPLO CHECK interno)
+            def _sanitize_minilote(apostas_in: list[list[int]]) -> list[list[int]]:
+                """
+                Garante que o mini-lote usado pelo /refinar_bolao esteja alinhado ao núcleo:
+                  - 15 dezenas válidas (1..25)
+                  - paridade 7–8
+                  - seq≤3
+                  - anti-overlap≤BOLAO_MAX_OVERLAP
+                  - sem apostas duplicadas
+
+                Pode reduzir a quantidade de apostas se necessário para respeitar as regras.
+                """
+                # normaliza e sela cada aposta individualmente
+                lot: list[list[int]] = []
+                for item in apostas_in:
+                    try:
+                        nums = [int(x) for x in item]
+                    except Exception:
+                        continue
+                    nums = [n for n in nums if 1 <= n <= 25]
+                    nums = sorted(set(nums))
+                    if len(nums) < 15:
+                        pool = [n for n in range(1, 26) if n not in nums]
+                        for n in pool:
+                            nums.append(n)
+                            if len(nums) == 15:
                                 break
-                    if len(a) < 15:
-                        for n in comp:
-                            if n not in a:
-                                a.append(n)
-                                if len(a) == 15:
-                                    break
-                    a = sorted(a)
-                elif len(a) > 15:
-                    a = sorted(a)[:15]
-                return a
+                    nums = sorted(nums[:15])
+                    nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
+                    lot.append(sorted(nums))
 
-            # (a) forma por aposta (paridade 7–8, seq≤3, len=15)
-            apostas_work: list[list[int]] = []
-            for a in apostas_filtradas[:5]:
-                a = _canon_local(a)
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_fs)
-                apostas_work.append(sorted(a))
+                # laço de correção usando o mesmo TRIPLO CHECK do núcleo
+                for _ in range(10):
+                    if not lot:
+                        break
+                    ok_local, diag_local = self._triplo_check_stricto(lot)
+                    if ok_local:
+                        break
 
-            # (b) anti-overlap ≤ BOLAO_MAX_OVERLAP usando complemento do oficial
-            comp_overlap = [n for n in range(1, 26) if n not in oficial]
-            apostas_work = self._anti_overlap(
-                apostas_work,
-                ultimo=oficial,
-                comp=comp_overlap,
-                max_overlap=BOLAO_MAX_OVERLAP,
-                anchors=anchors_fs,
-            )
+                    changed = False
+                    if isinstance(diag_local, dict):
+                        seq_falhas = diag_local.get("seq_falhas") or []
+                        overlap_falhas = diag_local.get("overlap_falhas") or []
+                        dups = diag_local.get("duplicatas") or []
+                    else:
+                        seq_falhas = []
+                        overlap_falhas = []
+                        dups = []
 
-            # (c) deduplicação teimosa: usa _rebuild_candidate se sobrar clone
-            seen_lote: dict[tuple[int, ...], int] = {}
-            for idx, a in enumerate(apostas_work):
-                a = _canon_local(a)
-                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_fs)
-                key = tuple(sorted(a))
-                if key in seen_lote:
-                    guard = 0
-                    novo = a
-                    while tuple(sorted(novo)) in seen_lote and guard < 3:
-                        novo = self._rebuild_candidate(novo, ultimo=oficial)
-                        novo = self._ajustar_paridade_e_seq(novo, alvo_par=(7, 8), max_seq=3, anchors=anchors_fs)
-                        guard += 1
-                    a = sorted(novo)
-                    key = tuple(a)
-                seen_lote[key] = idx
-                apostas_work[idx] = a
+                    # 1) tenta consertar sequências >3; se não resolver, remove a aposta problemática
+                    if seq_falhas:
+                        idx = max(1, int(seq_falhas[0])) - 1
+                        if idx < len(lot):
+                            cand = self._hard_lock_fast(lot[idx], oficial, anchors=frozenset(anchors_tuple))
+                            lot[idx] = sorted(cand)
+                            if self._max_seq(lot[idx]) > 3:
+                                lot.pop(idx)
+                        changed = True
+                    # 2) remove duplicatas extras
+                    elif dups:
+                        grupo = dups[0]
+                        for pos in sorted(grupo[1:], reverse=True):
+                            if 1 <= pos <= len(lot):
+                                lot.pop(pos - 1)
+                        changed = True
+                    # 3) reduz overlaps acima do limite removendo a segunda aposta do pior par
+                    elif overlap_falhas:
+                        pior = sorted(overlap_falhas, key=lambda t: -t[2])[0]
+                        idx_rm = int(pior[1])
+                        if 1 <= idx_rm <= len(lot):
+                            lot.pop(idx_rm - 1)
+                        changed = True
 
-            apostas = [sorted(a) for a in apostas_work]
+                    if not changed:
+                        break
+
+                # dedup final por conteúdo e limite de 5 apostas
+                seen = set()
+                final: list[list[int]] = []
+                for a in lot:
+                    key = tuple(sorted(a))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    final.append(sorted(a))
+
+                return final[:5]
+
+            apostas = _sanitize_minilote(apostas_filtradas)
+            if not apostas:
+                # fallback extremamente defensivo: usa até 3 apostas canônicas do pós-filtro
+                apostas = []
+                for a in apostas_filtradas[:3]:
+                    try:
+                        nums = [int(x) for x in a]
+                    except Exception:
+                        continue
+                    nums = [n for n in nums if 1 <= n <= 25]
+                    nums = sorted(set(nums))[:15]
+                    nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
+                    apostas.append(sorted(nums))
 
             # 7.2) REGISTRO (núcleo + CSV) + NOVO: pending_batches
             try:
@@ -5713,7 +5755,7 @@ class LotoFacilBot:
 
             placar = [_hits(a) for a in apostas]
             melhor = max(placar) if placar else 0
-            media = (sum(placar) / len(placar)) if placar else 0.0
+            media  = (sum(placar) / len(placar)) if placar else 0.0
 
             ok_count = 0
             telems = []
@@ -5726,7 +5768,7 @@ class LotoFacilBot:
             uniq = {tuple(a) for a in apostas}
             dup_count = len(apostas) - len(uniq)
 
-            linhas: list[str] = []
+            linhas = []
             linhas.append("🧠 <b>Refino aplicado ao Modo Bolão v5</b>\n")
             linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial))
             linhas.append("<b>Matriz 19 (antes):</b> " + " ".join(f"{n:02d}" for n in matriz19_antes))
@@ -5765,6 +5807,7 @@ class LotoFacilBot:
 
             linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
 
+            # envia resposta final ao usuário
             texto_final = "\n".join(linhas)
             await update.message.reply_text(texto_final, parse_mode="HTML")
 
@@ -5779,6 +5822,7 @@ class LotoFacilBot:
         except Exception as e:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
+
 
         
    # ===================[ UTILITÁRIOS STRICTO ]===================
