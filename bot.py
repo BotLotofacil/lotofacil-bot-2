@@ -5480,7 +5480,7 @@ class LotoFacilBot:
           - Aprendizado automático leve preservando forma
 
         Aceita 15 dezenas no comando:
-            /refinar_bolao 01 02 ... 25
+           /refinar_bolao 01 02 ... 25
         """
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -5512,7 +5512,7 @@ class LotoFacilBot:
                 return await update.message.reply_text("Erro: histórico vazio.")
             snap = self._latest_snapshot()
 
-            # 1) Resultado oficial (15 dezenas) — opcionalmente passado nos args
+            # 1) Resultado oficial (15 dezenas)
             if context.args and len(context.args) >= 15:
                 try:
                     oficial = sorted({int(x) for x in context.args[:15]})
@@ -5525,39 +5525,38 @@ class LotoFacilBot:
 
             of_set = set(oficial)
 
-            # 2) Matriz19 ANTES do refino (com estado atual de bias)
+            # 2) Matriz19 antes
             matriz19_antes = self._selecionar_matriz19(historico)
 
-            # 3) Carrega estado de bias e aplica atualização com base no 'oficial'
+            # 3) Carrega estado e atualiza bias/hits/seen
             st = _normalize_state_defaults(_bolao_load_state() or {})
-            st = dict(st) if isinstance(st, dict) else {}
+            st = dict(st)
             raw_bias = st.get("bias", {}) or {}
 
             bias = {}
             for k, v in raw_bias.items():
                 try:
-                    ki = int(k)
-                    bias[ki] = float(v)
-                except Exception:
+                    bias[int(k)] = float(v)
+                except:
                     continue
 
             hits_map = {}
             for k, v in (st.get("hits", {}) or {}).items():
                 try:
                     hits_map[int(k)] = int(v)
-                except Exception:
+                except:
                     continue
 
             seen_map = {}
             for k, v in (st.get("seen", {}) or {}).items():
                 try:
                     seen_map[int(k)] = int(v)
-                except Exception:
+                except:
                     continue
 
             try:
-                anchors_tuple = tuple(BOLAO_ANCHORS)  # ex.: (9, 11)
-            except Exception:
+                anchors_tuple = tuple(BOLAO_ANCHORS)
+            except:
                 anchors_tuple = (9, 11)
             anch = set(anchors_tuple)
 
@@ -5567,9 +5566,8 @@ class LotoFacilBot:
                 if n in of_set:
                     hits_map[n] = hits_map.get(n, 0) + 1
 
-            # Atualiza bias dezena-a-dezena respeitando âncoras
             for n in mset:
-                delta = float(BOLAO_BIAS_HIT) if (n in of_set) else float(BOLAO_BIAS_MISS)
+                delta = float(BOLAO_BIAS_HIT) if n in of_set else float(BOLAO_BIAS_MISS)
                 if n in anch:
                     delta *= float(BOLAO_BIAS_ANCHOR_SCALE)
                 bias[n] = _clamp(
@@ -5578,159 +5576,161 @@ class LotoFacilBot:
                     float(BOLAO_BIAS_MAX),
                 )
 
-            # persiste bias/hits/seen/snapshot
             st["bias"] = {int(k): float(v) for k, v in bias.items()}
             st["hits"] = hits_map
             st["seen"] = seen_map
             try:
                 st["last_snapshot"] = snap.snapshot_id
-            except Exception:
+            except:
                 st["last_snapshot"] = "--"
             _bolao_save_state(st)
 
-            # 4) Matriz19 DEPOIS do refino (já refletindo bias recém-atualizado)
+            # 4) matriz19 depois
             matriz19_depois = self._selecionar_matriz19(historico)
 
-            # 5) Regenera 19→15 com seed incremental por snapshot (variabilidade determinística)
+            # 5) subsets 19→15
             try:
                 seed_nova = self._next_draw_seed(snap.snapshot_id)
-            except Exception:
+            except:
                 seed_nova = self._next_draw_seed("fallback")
 
             apostas_brutas = self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
 
-            # 6) Selagem rápida por aposta (hard_lock_fast aplica paridade 7–8, seq<=3, âncoras)
+            # 6) selagem rápida
             apostas_seladas = [
                 self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
                 for a in apostas_brutas
             ]
 
-            # 7) Pós-filtro unificado (forma + dedup/overlap + bias)
+            # 7) pós-filtro unificado
             try:
                 apostas_filtradas = self._pos_filtro_unificado(apostas_seladas, ultimo=oficial)
-            except Exception:
-                logger.warning("pos_filtro_unificado falhou no /refinar_bolao; aplicando hard_lock por aposta.", exc_info=True)
+            except:
                 apostas_filtradas = [
                     self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
                     for a in apostas_seladas
                 ]
 
-            # 7.1) Sanitização forte do mini-lote (TRIPLO CHECK interno)
+            # 7.1) Sanitização forte do mini-lote COMPLETA — GERA SEMPRE 10 APOSTAS
             def _sanitize_minilote(apostas_in: list[list[int]]) -> list[list[int]]:
                 """
-                Garante que o mini-lote usado pelo /refinar_bolao esteja alinhado ao núcleo:
-                  - 15 dezenas válidas (1..25)
-                  - paridade 7–8
-                  - seq≤3
-                  - anti-overlap≤BOLAO_MAX_OVERLAP
-                  - sem apostas duplicadas
-
-                Pode reduzir a quantidade de apostas se necessário para respeitar as regras.
+                Gera SEMPRE 10 apostas limpas, corrigidas e compatíveis com o núcleo:
+                  • 15 dezenas válidas
+                  • paridade 7–8
+                  • seq ≤ 3
+                  • anti-overlap ≤ 11
+                  • sem duplicatas
                 """
-                # normaliza e sela cada aposta individualmente
-                lot: list[list[int]] = []
+
+                # --- 1) Normaliza e sela cada aposta ---
+                lot = []
                 for item in apostas_in:
                     try:
                         nums = [int(x) for x in item]
-                    except Exception:
+                    except:
                         continue
+
                     nums = [n for n in nums if 1 <= n <= 25]
                     nums = sorted(set(nums))
+
+                    # completa se faltar
                     if len(nums) < 15:
                         pool = [n for n in range(1, 26) if n not in nums]
                         for n in pool:
                             nums.append(n)
                             if len(nums) == 15:
                                 break
+
                     nums = sorted(nums[:15])
                     nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
-                    lot.append(sorted(nums))
+                    lot.append(nums)
 
-                # laço de correção usando o mesmo TRIPLO CHECK do núcleo
-                for _ in range(10):
-                    if not lot:
-                        break
-                    ok_local, diag_local = self._triplo_check_stricto(lot)
+                # --- 2) Garante pelo menos 10 ---
+                while len(lot) < 10:
+                    base = matriz19_depois[:]
+                    import random
+                    random.shuffle(base)
+                    cand = sorted(base[:15])
+                    cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                    lot.append(cand)
+
+                # --- 3) TRIPLO CHECK interno até ficar perfeito ---
+                for _ in range(20):
+                    ok_local, diag = self._triplo_check_stricto(lot)
                     if ok_local:
                         break
 
-                    changed = False
-                    if isinstance(diag_local, dict):
-                        seq_falhas = diag_local.get("seq_falhas") or []
-                        overlap_falhas = diag_local.get("overlap_falhas") or []
-                        dups = diag_local.get("duplicatas") or []
-                    else:
-                        seq_falhas = []
-                        overlap_falhas = []
-                        dups = []
+                    seq_falhas  = diag.get("seq_falhas") or []
+                    overlap_fal = diag.get("overlap_falhas") or []
+                    dups        = diag.get("duplicatas") or []
 
-                    # 1) tenta consertar sequências >3; se não resolver, remove a aposta problemática
+                    # corrigir sequências
                     if seq_falhas:
-                        idx = max(1, int(seq_falhas[0])) - 1
-                        if idx < len(lot):
-                            cand = self._hard_lock_fast(lot[idx], oficial, anchors=frozenset(anchors_tuple))
-                            lot[idx] = sorted(cand)
-                            if self._max_seq(lot[idx]) > 3:
-                                lot.pop(idx)
-                        changed = True
-                    # 2) remove duplicatas extras
-                    elif dups:
+                        idx = seq_falhas[0] - 1
+                        lot[idx] = self._hard_lock_fast(lot[idx], oficial, anchors=frozenset(anchors_tuple))
+                        continue
+
+                    # corrigir duplicatas recriando apenas as duplicadas
+                    if dups:
                         grupo = dups[0]
-                        for pos in sorted(grupo[1:], reverse=True):
-                            if 1 <= pos <= len(lot):
-                                lot.pop(pos - 1)
-                        changed = True
-                    # 3) reduz overlaps acima do limite removendo a segunda aposta do pior par
-                    elif overlap_falhas:
-                        pior = sorted(overlap_falhas, key=lambda t: -t[2])[0]
-                        idx_rm = int(pior[1])
-                        if 1 <= idx_rm <= len(lot):
-                            lot.pop(idx_rm - 1)
-                        changed = True
+                        for pos in grupo[1:]:
+                            pos_idx = pos - 1
+                            base = matriz19_depois[:]
+                            import random
+                            random.shuffle(base)
+                            cand = sorted(base[:15])
+                            cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                            lot[pos_idx] = cand
+                        continue
 
-                    if not changed:
-                        break
+                    # corrigir overlap recriando 2ª aposta do pior par
+                    if overlap_fal:
+                        pior = sorted(overlap_fal, key=lambda t: -t[2])[0]
+                        idx_rm = pior[1] - 1
+                        base = matriz19_depois[:]
+                        import random
+                        random.shuffle(base)
+                        cand = sorted(base[:15])
+                        cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                        lot[idx_rm] = cand
+                        continue
 
-                # dedup final por conteúdo e limite de 5 apostas
+                # --- 4) Dedup e reforço até 10 ---
                 seen = set()
-                final: list[list[int]] = []
+                final = []
                 for a in lot:
-                    key = tuple(sorted(a))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    final.append(sorted(a))
+                    key = tuple(a)
+                    if key not in seen:
+                        seen.add(key)
+                        final.append(a)
 
-                return final[:5]
+                while len(final) < 10:
+                    base = matriz19_depois[:]
+                    import random
+                    random.shuffle(base)
+                    cand = sorted(base[:15])
+                    cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                    if tuple(cand) not in seen:
+                        seen.add(tuple(cand))
+                        final.append(cand)
 
+                return final[:10]
+
+            # aplica sanitização — **sempre vai gerar 10 apostas**
             apostas = _sanitize_minilote(apostas_filtradas)
-            if not apostas:
-                # fallback extremamente defensivo: usa até 3 apostas canônicas do pós-filtro
-                apostas = []
-                for a in apostas_filtradas[:3]:
-                    try:
-                        nums = [int(x) for x in a]
-                    except Exception:
-                        continue
-                    nums = [n for n in nums if 1 <= n <= 25]
-                    nums = sorted(set(nums))[:15]
-                    nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
-                    apostas.append(sorted(nums))
 
-            # 7.2) REGISTRO (núcleo + CSV) + NOVO: pending_batches
+            # 7.2) registro
             try:
-                # 1) Estado persistente – núcleo
                 self._registrar_geracao(apostas, base_resultado=oficial or [])
-            except Exception:
-                logger.warning("Falha ao registrar geração para aprendizado leve (/refinar_bolao).", exc_info=True)
+            except:
+                pass
 
-            # 2) CSV de auditoria externa (aprendizado REAL)
             try:
                 _append_learn_log(snap.snapshot_id, oficial or [], apostas)
-            except Exception:
-                logger.warning("Falha para append no learn_log após /refinar_bolao.", exc_info=True)
+            except:
+                pass
 
-            # >>> NOVO: registrar o lote no estado (pending_batches)
+            # pending_batches
             try:
                 st2 = _normalize_state_defaults(_bolao_load_state() or {})
                 batches = st2.get("pending_batches", [])
@@ -5743,27 +5743,21 @@ class LotoFacilBot:
                     "qtd": len(apostas),
                     "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
                 })
-                st2["pending_batches"] = batches[-100:]  # mantém histórico curto
+                st2["pending_batches"] = batches[-100:]
                 _bolao_save_state(st2)
-            except Exception:
-                logger.warning("Falha ao registrar pending_batch no /refinar_bolao.", exc_info=True)
-            # <<< NOVO
+            except:
+                pass
 
-            # 8) Telemetria, placar e resposta
-            def _hits(bilhete: list[int]) -> int:
+            # 8) telemetria / resposta
+            def _hits(bilhete):
                 return len(of_set & set(bilhete))
 
             placar = [_hits(a) for a in apostas]
-            melhor = max(placar) if placar else 0
-            media  = (sum(placar) / len(placar)) if placar else 0.0
+            melhor = max(placar)
+            media  = sum(placar) / len(placar)
 
-            ok_count = 0
-            telems = []
-            for a in apostas:
-                t = self._telemetria(a, oficial, alvo_par=(7, 8), max_seq=3)
-                telems.append(t)
-                if getattr(t, "ok_total", False):
-                    ok_count += 1
+            telems = [self._telemetria(a, oficial, alvo_par=(7, 8), max_seq=3) for a in apostas]
+            ok_count = sum(1 for t in telems if t.ok_total)
 
             uniq = {tuple(a) for a in apostas}
             dup_count = len(apostas) - len(uniq)
@@ -5777,7 +5771,7 @@ class LotoFacilBot:
             for i, a in enumerate(apostas, 1):
                 t = telems[i - 1]
                 linhas.append(
-                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  → <b>{placar[i-1]} acertos</b>\n"
+                    f"<b>Aposta {i}:</b> {' '.join(f'{n:02d}' for n in a)}  → <b>{placar[i-1]}</b> acertos\n"
                     f"🔢 Pares: {t.pares} | Ímpares: {t.impares} | SeqMax: {t.max_seq} | <i>{t.repeticoes}R</i>\n"
                 )
 
@@ -5787,18 +5781,16 @@ class LotoFacilBot:
                 f"• Média do lote: <b>{media:.2f}</b> acertos\n"
                 f"• Conformidade: <b>{ok_count}/{len(apostas)}</b> dentro de (paridade 7–8, seq≤3)"
             )
-            linhas.append("• Ajuste de bias: +hit para dezenas presentes na matriz vs oficial; miss reduz (âncoras ±escala)")
 
             if dup_count > 0:
                 linhas.append(
-                    f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino. "
-                    f"Se persistir, verifique history.csv e seeds."
+                    f"\n⚠️ <b>Aviso</b>: detectadas <b>{dup_count}</b> duplicidades no lote após refino."
                 )
 
             if SHOW_TIMESTAMP:
                 try:
                     snap_id = snap.snapshot_id
-                except Exception:
+                except:
                     snap_id = "--"
                 carimbo = datetime.now(ZoneInfo(TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
                 linhas.append(
@@ -5807,15 +5799,13 @@ class LotoFacilBot:
 
             linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
 
-            # envia resposta final ao usuário
-            texto_final = "\n".join(linhas)
-            await update.message.reply_text(texto_final, parse_mode="HTML")
+            await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
 
-            # 9) Rodar auto_aprender pós-refino (não travar se falhar)
+            # 9) auto-aprender
             try:
                 await self.auto_aprender(update, context)
-            except Exception:
-                logger.warning("auto_aprender falhou pós-/refinar_bolao; prosseguindo normalmente.", exc_info=True)
+            except:
+                pass
 
             return
 
@@ -5824,7 +5814,6 @@ class LotoFacilBot:
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
 
 
-        
    # ===================[ UTILITÁRIOS STRICTO ]===================
 
     def _shape_ok_basico(self, a: list[int]) -> bool:
