@@ -4975,7 +4975,7 @@ class LotoFacilBot:
 
         # anti-abuso padrão
         if not self._is_admin(user_id):
-            if _is_temporariamente_blocked(user_id):
+            if _is_temporarily_blocked(user_id):
                 return await update.message.reply_text("🚫 Você está temporariamente bloqueado por excesso de tentativas.")
             allowed, warn = _register_command_event(user_id, is_unknown=False)
             if not allowed:
