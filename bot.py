@@ -5476,10 +5476,15 @@ class LotoFacilBot:
 
         Aceita 15 dezenas no comando:
             /refinar_bolao 01 02 ... 25
+
+        E AGORA também aceita modo administrativo (sem dezenas), por exemplo:
+            /refinar_bolao alpha=0.37 janela=60 bias_delta="01:+5.000 02:+4.000 ..."
+        para aplicar ajustes manuais de alpha/janela/bias_delta.
         """
         from datetime import datetime
         from zoneinfo import ZoneInfo
         import traceback
+        import re as _re_admin
 
         try:
             user_id = update.effective_user.id
@@ -5501,6 +5506,103 @@ class LotoFacilBot:
             if self._hit_cooldown(chat_id, "refinar_bolao"):
                 return await update.message.reply_text(f"⏳ Aguarde {COOLDOWN_SECONDS}s para usar /refinar_bolao novamente.")
 
+            # ==================================================================
+            # 0-A) MODO ADMINISTRATIVO — alpha / janela / bias_delta
+            # ==================================================================
+            full_text = (getattr(update.message, "text", "") or "").strip()
+            if ("alpha=" in full_text) or ("bias_delta" in full_text) or ("janela=" in full_text):
+                try:
+                    # carrega estado atual
+                    st = _normalize_state_defaults(_bolao_load_state() or {})
+                    st = dict(st) if isinstance(st, dict) else {}
+
+                    alpha_match = _re_admin.search(r"alpha\s*=\s*([0-9]+(?:\.[0-9]+)?)", full_text)
+                    janela_match = _re_admin.search(r"janela\s*=\s*([0-9]+)", full_text)
+                    bias_match = _re_admin.search(r'bias_delta\s*=\s*"([^"]*)"', full_text)
+
+                    alpha_aplicado = None
+                    janela_aplicada = None
+                    bias_count = 0
+
+                    # --- alpha ---
+                    if alpha_match:
+                        try:
+                            alpha_val = float(alpha_match.group(1))
+                            st["alpha"] = float(alpha_val)
+                            alpha_aplicado = alpha_val
+                        except Exception:
+                            pass
+
+                    # --- janela ---
+                    if janela_match:
+                        try:
+                            janela_val = int(janela_match.group(1))
+                            learning_cfg = dict(st.get("learning") or {})
+                            learning_cfg["janela"] = int(janela_val)
+                            st["learning"] = learning_cfg
+                            janela_aplicada = janela_val
+                        except Exception:
+                            pass
+
+                    # --- bias_delta ---
+                    if bias_match:
+                        raw = (bias_match.group(1) or "").strip()
+                        if raw and raw != "(sem ajustes)":
+                            raw_bias = st.get("bias", {}) or {}
+                            bias_tmp = {}
+                            # normaliza chaves para int -> float
+                            for k, v in raw_bias.items():
+                                try:
+                                    kk = int(k)
+                                    bias_tmp[kk] = float(v)
+                                except Exception:
+                                    continue
+
+                            parts = [p for p in raw.split() if ":" in p]
+                            for part in parts:
+                                try:
+                                    dez_str, delta_str = part.split(":", 1)
+                                    dez = int(dez_str)
+                                    delta = float(delta_str.replace(",", "."))
+                                except Exception:
+                                    continue
+                                old = float(bias_tmp.get(dez, 0.0))
+                                new = _clamp(
+                                    old + delta,
+                                    float(BOLAO_BIAS_MIN),
+                                    float(BOLAO_BIAS_MAX),
+                                )
+                                bias_tmp[dez] = new
+                                bias_count += 1
+
+                            st["bias"] = {int(k): float(v) for k, v in bias_tmp.items()}
+
+                    _bolao_save_state(st)
+
+                    linhas_admin = ["🧠 <b>Ajuste manual aplicado ao núcleo Bolão v5</b>\n"]
+                    if alpha_aplicado is not None:
+                        linhas_admin.append(f"• alpha atualizado para <b>{alpha_aplicado:.2f}</b>")
+                    if janela_aplicada is not None:
+                        linhas_admin.append(f"• janela de aprendizado ajustada para <b>{janela_aplicada}</b> concursos")
+                    if bias_count > 0:
+                        linhas_admin.append(f"• {bias_count} ajustes de bias aplicados via bias_delta")
+                    else:
+                        linhas_admin.append("• bias_delta: nenhum ajuste relevante aplicado.")
+
+                    linhas_admin.append(
+                        "\n<i>Dica: após ajustar, use /mestre ou /gerar para produzir novas apostas.</i>"
+                    )
+
+                    return await update.message.reply_text("\n".join(linhas_admin), parse_mode="HTML")
+
+                except Exception as _e_admin:
+                    logger.error("Erro no modo administrativo do /refinar_bolao:\n%s", traceback.format_exc())
+                    return await update.message.reply_text(f"Erro ao aplicar ajuste manual no /refinar_bolao: {_e_admin}")
+
+            # ==================================================================
+            # 0-B) FLUXO NORMAL — refino com 15 dezenas (como já era)
+            # ==================================================================
+
             # 0) histórico + snapshot
             historico = carregar_historico(HISTORY_PATH)
             if not historico:
@@ -5508,7 +5610,9 @@ class LotoFacilBot:
             snap = self._latest_snapshot()
 
             # 1) Resultado oficial (15 dezenas) — opcionalmente passado nos args
-            if context.args and len(context.args) >= 15:
+            if context.args and len(context.args) >= 15 and all(
+                _re_admin.fullmatch(r"\d{1,2}", x) for x in context.args[:15]
+            ):
                 try:
                     oficial = sorted({int(x) for x in context.args[:15]})
                     if len(oficial) != 15 or any(n < 1 or n > 25 for n in oficial):
@@ -5610,49 +5714,137 @@ class LotoFacilBot:
                     for a in apostas_seladas
                 ]
 
-            # 7.1) Validação final teimosa ("belt and suspenders")
-            def _canon_local(a: list[int]) -> list[int]:
-                a = [int(x) for x in a if 1 <= int(x) <= 25]
-                a = sorted(set(a))
-                if len(a) < 15:
-                    comp = [n for n in range(1, 26) if n not in a]
-                    for n in comp:
-                        if (n - 1 not in a) and (n + 1 not in a):
-                            a.append(n)
-                            if len(a) == 15:
+            # 7.1) Sanitização forte do mini-lote (TRIPLO CHECK interno) — 10 apostas
+            def _sanitize_minilote(apostas_in: list[list[int]]) -> list[list[int]]:
+                """
+                Gera SEMPRE 10 apostas limpas, corrigidas e compatíveis com o núcleo:
+                  • 15 dezenas válidas
+                  • paridade 7–8
+                  • seq ≤ 3
+                  • anti-overlap ≤ BOLAO_MAX_OVERLAP
+                  • sem duplicatas
+                """
+                # --- 1) Normaliza cada aposta individualmente ---
+                lot: list[list[int]] = []
+                for item in apostas_in:
+                    try:
+                        nums = [int(x) for x in item]
+                    except Exception:
+                        continue
+
+                    nums = [n for n in nums if 1 <= n <= 25]
+                    nums = sorted(set(nums))
+
+                    if len(nums) < 15:
+                        pool = [n for n in range(1, 26) if n not in nums]
+                        for n in pool:
+                            nums.append(n)
+                            if len(nums) == 15:
                                 break
-                    if len(a) < 15:
-                        for n in comp:
-                           if n not in a:
-                                a.append(n)
-                                if len(a) == 15:
-                                    break
-                    a = sorted(a)
-                elif len(a) > 15:
-                    a = sorted(a)[:15]
-                return a
 
-            apostas_ok = []
-            for a in apostas_filtradas[:5]:
-                a = _canon_local(a)
-                a = self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
-                apostas_ok.append(a)
-            apostas = apostas_ok
+                    nums = sorted(nums[:15])
+                    nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
+                    lot.append(nums)
 
-            # 7.2) REGISTRO (núcleo + CSV) + NOVO: pending_batches
+                # --- 2) Garante quantidade mínima (gera extras via matriz19_depois) ---
+                try:
+                    base19 = list(matriz19_depois)
+                except Exception:
+                    base19 = list(range(1, 26))
+
+                import random
+                while len(lot) < 10:
+                    base = base19[:]
+                    random.shuffle(base)
+                    cand = sorted(base[:15])
+                    cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                    lot.append(cand)
+
+                # --- 3) Roda TRIPLO CHECK stricto tentando consertar em vez de excluir ---
+                for _ in range(20):
+                    ok_local, diag_local = self._triplo_check_stricto(lot)
+                    if ok_local:
+                        break
+
+                    if isinstance(diag_local, dict):
+                        seq_falhas = diag_local.get("seq_falhas") or []
+                        overlap_falhas = diag_local.get("overlap_falhas") or []
+                        dups = diag_local.get("duplicatas") or []
+                    else:
+                        seq_falhas = []
+                        overlap_falhas = []
+                        dups = []
+
+                    # 3a) Corrige sequência
+                    if seq_falhas:
+                        idx = int(seq_falhas[0]) - 1
+                        if 0 <= idx < len(lot):
+                            lot[idx] = self._hard_lock_fast(lot[idx], oficial, anchors=frozenset(anchors_tuple))
+                        continue
+
+                    # 3b) Corrige duplicatas recriando só as cópias
+                    if dups:
+                        grupo = dups[0]
+                        for pos in grupo[1:]:
+                            pos_idx = pos - 1
+                            if 0 <= pos_idx < len(lot):
+                                base = base19[:]
+                                random.shuffle(base)
+                                cand = sorted(base[:15])
+                                cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                                lot[pos_idx] = cand
+                        continue
+
+                    # 3c) Corrige overlap recriando a segunda aposta do pior par
+                    if overlap_falhas:
+                        pior = sorted(overlap_falhas, key=lambda t: -t[2])[0]
+                        idx_rm = pior[1] - 1
+                        if 0 <= idx_rm < len(lot):
+                            base = base19[:]
+                            random.shuffle(base)
+                            cand = sorted(base[:15])
+                            cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                            lot[idx_rm] = cand
+                        continue
+
+                    # se não tem mais nada pra corrigir, sai
+                    break
+
+                # --- 4) Dedup final + reforço até 10 ---
+                seen = set()
+                final: list[list[int]] = []
+                for a in lot:
+                    key = tuple(a)
+                    if key not in seen:
+                        seen.add(key)
+                        final.append(a)
+
+                # reforça até 10 apostas únicas
+                while len(final) < 10:
+                    base = base19[:]
+                    random.shuffle(base)
+                    cand = sorted(base[:15])
+                    cand = self._hard_lock_fast(cand, oficial, anchors=frozenset(anchors_tuple))
+                    if tuple(cand) not in seen:
+                        seen.add(tuple(cand))
+                        final.append(cand)
+
+                return final[:10]
+
+            apostas = _sanitize_minilote(apostas_filtradas)
+
+            # 7.2) REGISTRO (núcleo + CSV) + pending_batches
             try:
-                # 1) Estado persistente – núcleo
                 self._registrar_geracao(apostas, base_resultado=oficial or [])
             except Exception:
                 logger.warning("Falha ao registrar geração para aprendizado leve (/refinar_bolao).", exc_info=True)
 
-            # 2) CSV de auditoria externa (aprendizado REAL)
             try:
                 _append_learn_log(snap.snapshot_id, oficial or [], apostas)
             except Exception:
                 logger.warning("Falha para append no learn_log após /refinar_bolao.", exc_info=True)
 
-            # >>> NOVO: registrar o lote no estado (pending_batches)
+            # pending_batches
             try:
                 st2 = _normalize_state_defaults(_bolao_load_state() or {})
                 batches = st2.get("pending_batches", [])
@@ -5665,11 +5857,10 @@ class LotoFacilBot:
                     "qtd": len(apostas),
                     "apostas": [" ".join(f"{x:02d}" for x in a) for a in apostas],
                 })
-                st2["pending_batches"] = batches[-100:]  # mantém histórico curto
+                st2["pending_batches"] = batches[-100:]
                 _bolao_save_state(st2)
             except Exception:
                 logger.warning("Falha ao registrar pending_batch no /refinar_bolao.", exc_info=True)
-            # <<< NOVO
 
             # 8) Telemetria, placar e resposta
             def _hits(bilhete: list[int]) -> int:
@@ -5677,7 +5868,7 @@ class LotoFacilBot:
 
             placar = [_hits(a) for a in apostas]
             melhor = max(placar) if placar else 0
-            media  = (sum(placar) / len(placar)) if placar else 0.0
+            media = (sum(placar) / len(placar)) if placar else 0.0
 
             ok_count = 0
             telems = []
@@ -5729,11 +5920,10 @@ class LotoFacilBot:
 
             linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
 
-            # envia resposta final ao usuário
             texto_final = "\n".join(linhas)
             await update.message.reply_text(texto_final, parse_mode="HTML")
 
-            # 9) Rodar auto_aprender pós-refino (não travar se falhar)
+            # 9) auto_aprender pós-refino (se falhar, ignora)
             try:
                 await self.auto_aprender(update, context)
             except Exception:
@@ -5744,6 +5934,7 @@ class LotoFacilBot:
         except Exception as e:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
+
         
    # ===================[ UTILITÁRIOS STRICTO ]===================
 
