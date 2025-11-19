@@ -5469,7 +5469,6 @@ class LotoFacilBot:
             logger.warning("auto_aprender falhou pós-/mestre; prosseguindo normalmente.", exc_info=True)
 
 
-
     # --- /refinar_bolao: aplica bias, regenera 19→15 e sela o lote ---
     async def refinar_bolao(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -5534,7 +5533,7 @@ class LotoFacilBot:
             st = dict(st) if isinstance(st, dict) else {}
             raw_bias = st.get("bias", {}) or {}
 
-            bias = {}
+            bias: dict[int, float] = {}
             for k, v in raw_bias.items():
                 try:
                     ki = int(k)
@@ -5542,14 +5541,14 @@ class LotoFacilBot:
                 except Exception:
                     continue
 
-            hits_map = {}
+            hits_map: dict[int, int] = {}
             for k, v in (st.get("hits", {}) or {}).items():
                 try:
                     hits_map[int(k)] = int(v)
                 except Exception:
                     continue
 
-            seen_map = {}
+            seen_map: dict[int, int] = {}
             for k, v in (st.get("seen", {}) or {}).items():
                 try:
                     seen_map[int(k)] = int(v)
@@ -5600,9 +5599,10 @@ class LotoFacilBot:
 
             apostas_brutas = self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
 
-            # 6) Selagem rápida por aposta (hard_lock_fast aplica paridade 7–8, seq<=3, âncoras)
+            # 6) Selagem rápida por aposta (hard_lock_fast aplica forma Mestre)
+            anchors_fs = frozenset(int(x) for x in anchors_tuple)
             apostas_seladas = [
-                self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
+                self._hard_lock_fast(a, oficial, anchors=anchors_fs)
                 for a in apostas_brutas
             ]
 
@@ -5612,11 +5612,11 @@ class LotoFacilBot:
             except Exception:
                 logger.warning("pos_filtro_unificado falhou no /refinar_bolao; aplicando hard_lock por aposta.", exc_info=True)
                 apostas_filtradas = [
-                    self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
+                    self._hard_lock_fast(a, oficial, anchors=anchors_fs)
                     for a in apostas_seladas
                 ]
 
-            # 7.1) Validação final teimosa ("belt and suspenders")
+            # 7.1) FUNIL MESTRE-MINI: forma forte + anti-overlap + dedup stricto
             def _canon_local(a: list[int]) -> list[int]:
                 a = [int(x) for x in a if 1 <= int(x) <= 25]
                 a = sorted(set(a))
@@ -5629,7 +5629,7 @@ class LotoFacilBot:
                                 break
                     if len(a) < 15:
                         for n in comp:
-                           if n not in a:
+                            if n not in a:
                                 a.append(n)
                                 if len(a) == 15:
                                     break
@@ -5638,12 +5638,42 @@ class LotoFacilBot:
                     a = sorted(a)[:15]
                 return a
 
-            apostas_ok = []
+            # (a) forma por aposta (paridade 7–8, seq≤3, len=15)
+            apostas_work: list[list[int]] = []
             for a in apostas_filtradas[:5]:
                 a = _canon_local(a)
-                a = self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
-                apostas_ok.append(a)
-            apostas = apostas_ok
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_fs)
+                apostas_work.append(sorted(a))
+
+            # (b) anti-overlap ≤ BOLAO_MAX_OVERLAP usando complemento do oficial
+            comp_overlap = [n for n in range(1, 26) if n not in oficial]
+            apostas_work = self._anti_overlap(
+                apostas_work,
+                ultimo=oficial,
+                comp=comp_overlap,
+                max_overlap=BOLAO_MAX_OVERLAP,
+                anchors=anchors_fs,
+            )
+
+            # (c) deduplicação teimosa: usa _rebuild_candidate se sobrar clone
+            seen_lote: dict[tuple[int, ...], int] = {}
+            for idx, a in enumerate(apostas_work):
+                a = _canon_local(a)
+                a = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3, anchors=anchors_fs)
+                key = tuple(sorted(a))
+                if key in seen_lote:
+                    guard = 0
+                    novo = a
+                    while tuple(sorted(novo)) in seen_lote and guard < 3:
+                        novo = self._rebuild_candidate(novo, ultimo=oficial)
+                        novo = self._ajustar_paridade_e_seq(novo, alvo_par=(7, 8), max_seq=3, anchors=anchors_fs)
+                        guard += 1
+                    a = sorted(novo)
+                    key = tuple(a)
+                seen_lote[key] = idx
+                apostas_work[idx] = a
+
+            apostas = [sorted(a) for a in apostas_work]
 
             # 7.2) REGISTRO (núcleo + CSV) + NOVO: pending_batches
             try:
@@ -5683,7 +5713,7 @@ class LotoFacilBot:
 
             placar = [_hits(a) for a in apostas]
             melhor = max(placar) if placar else 0
-            media  = (sum(placar) / len(placar)) if placar else 0.0
+            media = (sum(placar) / len(placar)) if placar else 0.0
 
             ok_count = 0
             telems = []
@@ -5696,7 +5726,7 @@ class LotoFacilBot:
             uniq = {tuple(a) for a in apostas}
             dup_count = len(apostas) - len(uniq)
 
-            linhas = []
+            linhas: list[str] = []
             linhas.append("🧠 <b>Refino aplicado ao Modo Bolão v5</b>\n")
             linhas.append("<b>Oficial:</b> " + " ".join(f"{n:02d}" for n in oficial))
             linhas.append("<b>Matriz 19 (antes):</b> " + " ".join(f"{n:02d}" for n in matriz19_antes))
@@ -5735,7 +5765,6 @@ class LotoFacilBot:
 
             linhas.append(f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>")
 
-            # envia resposta final ao usuário
             texto_final = "\n".join(linhas)
             await update.message.reply_text(texto_final, parse_mode="HTML")
 
@@ -5750,6 +5779,7 @@ class LotoFacilBot:
         except Exception as e:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
+
         
    # ===================[ UTILITÁRIOS STRICTO ]===================
 
