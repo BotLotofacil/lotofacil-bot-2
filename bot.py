@@ -1644,6 +1644,9 @@ class LotoFacilBot:
                     pass
             await update.message.reply_text("Erro ao gerar apostas. Tente novamente.")
 
+
+
+
     def _formatar_resposta(self, apostas: List[List[int]], janela: int, alpha: float) -> str:
         """Formata a resposta com apostas + rodapé informativo."""
         linhas = ["🎰 <b>SUAS APOSTAS INTELIGENTES</b> 🎰\n"]
@@ -1658,6 +1661,7 @@ class LotoFacilBot:
             carimbo = now_sp.strftime("%Y-%m-%d %H:%M:%S %Z")
             linhas.append(f"<i>janela={janela} | α={alpha:.2f} | {carimbo}</i>")
         return "\n".join(linhas)
+    
     
     # =======================[ FINALIZADOR MESTRE ]=======================
 
@@ -4933,13 +4937,13 @@ class LotoFacilBot:
             linhas = ["Não há sessões para conferir."]
         await self._send_long(update, "\n".join(linhas), parse_mode="HTML")
 
-    # --- /mestre: Preset Mestre — 30 apostas seladas para TRIPLO CHECK ---
+    # --- /mestre: Preset Mestre — 15 apostas seladas para TRIPLO CHECK ---
     async def mestre(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Preset Mestre — gerador principal.
 
         Objetivo:
-        - Gerar até 30 apostas Mestre, com foco em repetição alta (9R–10R),
+        - Gerar até 15 apostas Mestre, com foco em repetição alta (9R–10R),
           incluindo variações ~8R e ~11R;
         - Respeitar a filosofia Mestre:
             • paridade 7–8
@@ -4957,7 +4961,7 @@ class LotoFacilBot:
             - força novamente paridade 7–8 e SeqMax≤3;
             - dedup;
             - anti-overlap ≤ BOLAO_MAX_OVERLAP;
-            - top-up determinístico até 30, quando possível.
+            - top-up determinístico até 15, quando possível.
         """
 
         import traceback
@@ -4984,7 +4988,7 @@ class LotoFacilBot:
                 await update.message.reply_text(warn)
 
         # cooldown por chat pra evitar spam
-        if self._hit_cooldown(chat_id, "/mestre"):
+        if self._hit_cooldown(chat_id, "mestre"):
             return await update.message.reply_text("⏳ Aguarde alguns segundos antes de usar /mestre novamente.")
 
         # ------------------------------------------------------------------
@@ -5083,13 +5087,12 @@ class LotoFacilBot:
             call_salt = 0
 
         # ------------------------------------------------------------------
-        # 2.1 Planos de repetição (R) — 30 apostas alvo
-        #     Nova curva: mais 10R e ~20% de 11R.
+        # 2.1 Planos de repetição (R) — 15 apostas alvo
+        #     Curva com foco em 10R e ~20% de 11R.
         # ------------------------------------------------------------------
-        planos_R_base = [10, 9, 9, 10, 10, 9, 10, 8, 11, 11]
-        planos_R = (planos_R_base * 3)[:30]  # garante 30 entradas
-
-        target_qtd = 30
+        target_qtd = 15
+        planos_R_base = [10, 9, 9, 10, 10, 9, 10, 8, 11, 11, 10, 9, 11, 8, 10]
+        planos_R = planos_R_base[:target_qtd]
 
         # ------------------------------------------------------------------
         # 3. Construção bruta das apostas Mestre via repetição (L / C)
@@ -5205,13 +5208,10 @@ class LotoFacilBot:
         await _set_progress(0.78, "Estabilizando lote (seq≤3 / overlap)...")
 
         def _shape_ok(a: list[int]) -> bool:
-            try:
-                return self._shape_ok_basico(a)
-            except Exception:
-                # fallback: verifica diretamente paridade e seq
-                pares, _imp = self._paridade(a)
-                seq = self._max_seq(a)
-                return (7 <= pares <= 8) and (seq <= 3)
+            # shape Mestre explícito: 7–8 pares e SeqMax ≤ 3
+            pares, _imp = self._paridade(a)
+            seq = self._max_seq(a)
+            return (7 <= pares <= 8) and (seq <= 3)
 
         # 6.1) estabilização leve com helpers existentes
         try:
@@ -5284,14 +5284,8 @@ class LotoFacilBot:
 
                 cand2 = sorted(set(int(x) for x in cand2))
 
-                # forma / shape
+                # shape Mestre
                 if not _shape_ok(cand2):
-                    continue
-
-                # paridade + seq
-                pares, _ = self._paridade(cand2)
-                seq = self._max_seq(cand2)
-                if not (7 <= pares <= 8 and seq <= 3):
                     continue
 
                 # anti-overlap estrito
@@ -5319,15 +5313,15 @@ class LotoFacilBot:
             apostas_finais = [sorted(a) for a in apostas_ok]
 
         # ------------------------------------------------------------------
-        # 7.1 TOP-UP FORÇADO — GARANTE 30 APOSTAS SEM EXCEÇÃO
+        # 7.1 TOP-UP FORÇADO — GARANTE 15 APOSTAS SEM EXCEÇÃO
         # ------------------------------------------------------------------
-        await _set_progress(0.93, "Completando lote até 30 apostas...")
+        await _set_progress(0.93, "Completando lote até 15 apostas...")
 
         try:
             extra_idx = 0
             while len(apostas_finais) < target_qtd and extra_idx < target_qtd * 10:
                 extra_idx += 1
-                cand = _fallback_mestre(extra_idx)
+                cand = _fallback_mestre(extra_idx + 1000)
 
                 # normaliza
                 try:
@@ -5343,14 +5337,8 @@ class LotoFacilBot:
 
                 cand2 = sorted(set(int(x) for x in cand2))
 
-                # forma
+                # shape Mestre
                 if not _shape_ok(cand2):
-                    continue
-
-                # paridade e seq
-                pares, _ = self._paridade(cand2)
-                seq = self._max_seq(cand2)
-                if not (7 <= pares <= 8 and seq <= 3):
                     continue
 
                 # overlap estrito
@@ -5373,15 +5361,24 @@ class LotoFacilBot:
         except Exception:
             logger.warning("Top-up final falhou.", exc_info=True)
 
-        # Se **ainda** não conseguiu 30, força completude com últimos válidos
+        # Se **ainda** não conseguiu 15, força completude usando apostas_ok,
+        # mas AGORA sempre checando shape Mestre.
         if len(apostas_finais) < target_qtd:
             for a in apostas_ok:
-                t = tuple(sorted(a))
-                if t not in seen_final:
-                    seen_final.add(t)
-                    apostas_finais.append(sorted(a))
-                    if len(apostas_finais) >= target_qtd:
-                        break
+                try:
+                    a2 = self._hard_lock_fast(a, ultimo=ultimo or [], anchors=frozenset(), alvo_par=(7, 8), max_seq=3)
+                except Exception:
+                    a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
+                a2 = sorted(set(int(x) for x in a2))
+                if not _shape_ok(a2):
+                    continue
+                t = tuple(a2)
+                if t in seen_final:
+                    continue
+                seen_final.add(t)
+                apostas_finais.append(a2)
+                if len(apostas_finais) >= target_qtd:
+                    break
 
             # se por algum motivo ficou vazio, usa pelo menos algo do lote original
             if not apostas_finais:
@@ -5391,9 +5388,7 @@ class LotoFacilBot:
                     except Exception:
                         a2 = self._ajustar_paridade_e_seq(a, alvo_par=(7, 8), max_seq=3)
                     a2 = sorted(set(int(x) for x in a2))
-                    pares, _imp = self._paridade(a2)
-                    seq = self._max_seq(a2)
-                    if (7 <= pares <= 8 and seq <= 3):
+                    if _shape_ok(a2):
                         apostas_finais.append(a2)
                         break
 
@@ -5434,7 +5429,7 @@ class LotoFacilBot:
             f"\nConformidade: <b>{ok_count}/{len(apostas_finais)}</b> dentro de (paridade 7–8, seq≤3)"
         )
         linhas.append(
-            f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{BOLAO_MAX_OVERLAP}</i>"
+            f"<i>Regras: paridade 7–8, seq≤3, anti-overlap≤{OVERLAP_MAX}</i>"
         )
 
         if SHOW_TIMESTAMP:
@@ -5615,133 +5610,34 @@ class LotoFacilBot:
                     for a in apostas_seladas
                 ]
 
-            # 7.1) Sanitização forte do mini-lote (TRIPLO CHECK interno) — garante 10 apostas limpas
-            def _sanitize_minilote(apostas_in: list[list[int]]) -> list[list[int]]:
-                """
-                Gera SEMPRE até 10 apostas limpas, compatíveis com o núcleo:
-                  • 15 dezenas válidas (1..25)
-                  • paridade 7–8
-                  • seq ≤ 3
-                  • anti-overlap ≤ BOLAO_MAX_OVERLAP
-                  • sem duplicatas
-                """
-                # --- base: normaliza apostas vindas do pós-filtro ou, se vazio, da própria matriz19 ---
-                base_lot: list[list[int]] = []
-
-                origem = apostas_in if apostas_in else self._subsets_19_para_15(matriz19_depois, seed=seed_nova)
-                for item in origem:
-                    try:
-                        nums = [int(x) for x in item]
-                    except Exception:
-                        continue
-                    nums = [n for n in nums if 1 <= n <= 25]
-                    nums = sorted(set(nums))
-                    if len(nums) < 15:
-                        pool = [n for n in range(1, 26) if n not in nums]
-                        for n in pool:
-                            nums.append(n)
-                            if len(nums) == 15:
+            # 7.1) Validação final teimosa ("belt and suspenders")
+            def _canon_local(a: list[int]) -> list[int]:
+                a = [int(x) for x in a if 1 <= int(x) <= 25]
+                a = sorted(set(a))
+                if len(a) < 15:
+                    comp = [n for n in range(1, 26) if n not in a]
+                    for n in comp:
+                        if (n - 1 not in a) and (n + 1 not in a):
+                            a.append(n)
+                            if len(a) == 15:
                                 break
-                    nums = sorted(nums[:15])
-                    nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
-                    base_lot.append(sorted(nums))
+                    if len(a) < 15:
+                        for n in comp:
+                           if n not in a:
+                                a.append(n)
+                                if len(a) == 15:
+                                    break
+                    a = sorted(a)
+                elif len(a) > 15:
+                    a = sorted(a)[:15]
+                return a
 
-                # se ainda não temos nada, fallback duro usando matriz19
-                if not base_lot:
-                    try:
-                        cand_lote = self._subsets_19_para_15(matriz19_depois, seed=seed_nova + 1)
-                    except Exception:
-                        cand_lote = []
-                    for cand in cand_lote:
-                        try:
-                            nums = [int(x) for x in cand]
-                        except Exception:
-                            continue
-                        nums = [n for n in nums if 1 <= n <= 25]
-                        nums = sorted(set(nums))[:15]
-                        nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
-                        base_lot.append(sorted(nums))
-
-                # --- completa até ter pelo menos 10 apostas brutas ---
-                extra_seed = 1
-                while len(base_lot) < 10 and extra_seed <= 3:
-                    try:
-                        extras = self._subsets_19_para_15(matriz19_depois, seed=seed_nova + extra_seed)
-                    except Exception:
-                        break
-                    extra_seed += 1
-                    for cand in extras:
-                        try:
-                            nums = [int(x) for x in cand]
-                        except Exception:
-                            continue
-                        nums = [n for n in nums if 1 <= n <= 25]
-                        nums = sorted(set(nums))[:15]
-                        nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
-                        base_lot.append(sorted(nums))
-                        if len(base_lot) >= 10:
-                            break
-
-                lot = base_lot[:]
-
-                # --- aplica selagem global do núcleo (mesmo caminho do /mestre) ---
-                try:
-                    lot = self._forcar_seq_max3_lote(lot)
-                except Exception:
-                    logger.warning("_forcar_seq_max3_lote falhou no /refinar_bolao; seguindo mesmo assim.", exc_info=True)
-
-                try:
-                    lot = self._forcar_anti_overlap(lot, ultimo=oficial or [], limite=BOLAO_MAX_OVERLAP)
-                except Exception:
-                    logger.warning("_forcar_anti_overlap falhou no /refinar_bolao; seguindo mesmo assim.", exc_info=True)
-
-                # --- dedup + corte em 10 apostas ---
-                seen = set()
-                final: list[list[int]] = []
-                for a in lot:
-                    key = tuple(sorted(a))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    final.append(sorted(a))
-                    if len(final) >= 10:
-                        break
-
-                # se após dedup ainda tiver menos de 10, tenta completar respeitando as regras
-                extra_seed = 4
-                while len(final) < 10 and extra_seed <= 7:
-                    try:
-                        extras = self._subsets_19_para_15(matriz19_depois, seed=seed_nova + extra_seed)
-                    except Exception:
-                        break
-                    extra_seed += 1
-                    for cand in extras:
-                        try:
-                            nums = [int(x) for x in cand]
-                        except Exception:
-                            continue
-                        nums = [n for n in nums if 1 <= n <= 25]
-                        nums = sorted(set(nums))[:15]
-                        nums = self._hard_lock_fast(nums, oficial, anchors=frozenset(anchors_tuple))
-                        # tenta inserir respeitando selagem global
-                        try:
-                            tmp_lot = final + [nums]
-                            tmp_lot = self._forcar_seq_max3_lote(tmp_lot)
-                            tmp_lot = self._forcar_anti_overlap(tmp_lot, ultimo=oficial or [], limite=BOLAO_MAX_OVERLAP)
-                            cand_norm = sorted(tmp_lot[-1])
-                        except Exception:
-                            cand_norm = sorted(nums)
-                        key = tuple(cand_norm)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        final.append(cand_norm)
-                        if len(final) >= 10:
-                            break
-
-                return final[:10]
-
-            apostas = _sanitize_minilote(apostas_filtradas)
+            apostas_ok = []
+            for a in apostas_filtradas[:5]:
+                a = _canon_local(a)
+                a = self._hard_lock_fast(a, oficial, anchors=frozenset(anchors_tuple))
+                apostas_ok.append(a)
+            apostas = apostas_ok
 
             # 7.2) REGISTRO (núcleo + CSV) + NOVO: pending_batches
             try:
@@ -5848,9 +5744,7 @@ class LotoFacilBot:
         except Exception as e:
             logger.error("Erro no /refinar_bolao:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /refinar_bolao: {e}")
-
-
-
+        
    # ===================[ UTILITÁRIOS STRICTO ]===================
 
     def _shape_ok_basico(self, a: list[int]) -> bool:
@@ -6030,236 +5924,178 @@ class LotoFacilBot:
 
         return [sorted(a) for a in out]
 
-    # ===================[ FIM UTILITÁRIOS STRICTO ]===================
+# ===================[ FIM UTILITÁRIOS STRICTO ]===================
         
-    # ============================================================
-    # Auditoria do lote + preparação do comando real /refinar_bolao
-    # ============================================================
-    async def _auditar_e_preparar_refino(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        oficial_15: list[int],
-    ):
+    # --- Auditoria do lote + preparo do /refinar_bolão e dica do /mestre ---
+    async def _auditar_e_preparar_refino(self, update, context, oficial_15: list[int]):
         """
-        Audita o último lote gerado (Mestre/Bolão), aplica TRIPLO CHECK
-        e monta o relatório + comando REAL de refino:
-
-            /refinar_bolao D1 D2 ... D15
-
-        Obs.: aqui alpha/janela/bias_delta são apenas conceituais.
-        O comando que o bot entende é SOMENTE com as 15 dezenas.
+        Usa o último lote registrado (learning.last_generation.apostas) e o oficial fornecido para:
+          - TRIPLO CHECK-IN (regra inquebrável)
+          - Contar acertos reais por aposta, média, melhor
+          - Detectar coocorrências 'fortes'
+          - Calcular reward/penalty por dezena (âncoras com escala reduzida)
+          - Preparar bloco /refinar_bolão (α=0.36, janela=60) pronto para colar
+          - Preparar bloco Mestre otimizado p/ próximo concurso com 20–30% de R-alto
         """
-        from collections import Counter
-        import traceback
+        # --- carrega o último lote persistido ---
+        st = _normalize_state_defaults(_bolao_load_state() or {})
+        learn = st.get("learning") or {}
+        last_gen = learn.get("last_generation") or {}
+        apostas = last_gen.get("apostas") or []
 
-        try:
-            # ---------- 0) Normaliza oficial ----------
-            oficial_sorted = sorted({int(x) for x in oficial_15})
-            if len(oficial_sorted) != 15:
-                return await update.message.reply_text(
-                    "Erro interno: o resultado oficial precisa ter exatamente 15 dezenas."
-                )
-            oficial = oficial_sorted
-            of_set = set(oficial)
-
-            # ---------- 1) Recupera o último lote salvo ----------
-            st = _normalize_state_defaults(_bolao_load_state() or {})
-            learning = st.get("learning", {}) or {}
-            last_gen = learning.get("last_generation", {}) or {}
-
-            apostas_raw = last_gen.get("apostas") or []
-            if not apostas_raw:
-                return await update.message.reply_text(
-                    "Não há lote recente registrado para auditoria.\n"
-                    "Gere apostas com /mestre (ou modo bolão) antes de usar /confirmar."
-                )
-
-            # aceita tanto lista de inteiros quanto strings "01 02 ..."
-            apostas: list[list[int]] = []
-            for item in apostas_raw:
-                if isinstance(item, str):
-                    nums = [int(x) for x in item.replace(",", " ").split() if x.strip()]
-                else:
-                    nums = [int(x) for x in item]
-                nums = sorted({n for n in nums if 1 <= n <= 25})
-                if len(nums) == 15:
-                    apostas.append(nums)
-
-            if not apostas:
-                return await update.message.reply_text(
-                    "Não foi possível normalizar as apostas para auditoria (nenhuma aposta válida com 15 dezenas)."
-                )
-
-            # ---------- 2) TRIPLO CHECK-IN (paridade, seq, overlap, duplicatas) ----------
-            viol_seq: list[int] = []
-            for idx, a in enumerate(apostas, start=1):
-                if self._max_seq(a) > 3:
-                    viol_seq.append(idx)
-
-            # overlap máximo entre quaisquer duas apostas
-            max_overlap = 0
-            for i in range(len(apostas)):
-                s_i = set(apostas[i])
-                for j in range(i + 1, len(apostas)):
-                    ov = len(s_i & set(apostas[j]))
-                    if ov > max_overlap:
-                        max_overlap = ov
-
-            # duplicatas (apostas idênticas)
-            seen = {}
-            grupos_dup = []
-            for idx, a in enumerate(apostas, start=1):
-                key = tuple(a)
-                if key in seen:
-                    # agrupa índices duplicados
-                    found = False
-                    for g in grupos_dup:
-                        if g[0] == key:
-                            g[1].append(idx)
-                            found = True
-                            break
-                    if not found:
-                        grupos_dup.append([key, [seen[key], idx]])
-                else:
-                    seen[key] = idx
-
-            dup_indices_str = ""
-            if grupos_dup:
-                grupos = [g[1] for g in grupos_dup]
-                dup_indices_str = str(grupos)
-
-            triplo_ok = (
-                (not viol_seq)
-                and (max_overlap <= BOLAO_MAX_OVERLAP)
-                and (not grupos_dup)
-            )
-
-            # ---------- 3) Métricas de desempenho ----------
-            hits_por_aposta: list[int] = []
-            for a in apostas:
-                hits_por_aposta.append(len(of_set & set(a)))
-
-            melhor = max(hits_por_aposta)
-            media = sum(hits_por_aposta) / len(hits_por_aposta)
-
-            # coocorrências de pares
-            pair_counts = Counter()
-            for a in apostas:
-                s = sorted(set(a))
-                for i in range(len(s)):
-                    for j in range(i + 1, len(s)):
-                        pair_counts[(s[i], s[j])] += 1
-            top_pairs = pair_counts.most_common(10)
-
-            # recompensas = dezenas oficiais; penalizações = demais
-            recompensas = oficial
-            penalizacoes = [n for n in range(1, 26) if n not in of_set]
-
-            # ---------- 4) Monta relatório completo + comando REAL /refinar_bolao ----------
-            linhas: list[str] = []
-
-            # 4.1 – TRIPLO CHECK
-            if not triplo_ok:
-                linhas.append(
-                    "⛔ TRIPLO CHECK-IN FALHOU — bloqueando aprendizado/reforço.\n"
-                )
-                linhas.append("🔎 TRIPLO CHECK (stricto)")
-                linhas.append("• Paridade: ✅ todas em 7–8")  # já vem controlada pelo gerador
-                if viol_seq:
-                    linhas.append(f"• Sequência: ❌ >3 nas apostas: {viol_seq}")
-                else:
-                    linhas.append("• Sequência: ✅ nenhuma aposta com seq>3")
-                if max_overlap > BOLAO_MAX_OVERLAP:
-                    linhas.append(
-                        f"• Overlap máximo: ❌ {max_overlap} (> {BOLAO_MAX_OVERLAP})"
-                    )
-                else:
-                    linhas.append(
-                        f"• Overlap máximo: ✅ {max_overlap} (≤ {BOLAO_MAX_OVERLAP})"
-                    )
-                if grupos_dup:
-                    linhas.append(f"• Duplicatas: ❌ {dup_indices_str}")
-                else:
-                    linhas.append("• Duplicatas: ✅ nenhuma")
-                linhas.append("")
-
-            # 4.2 – tabela de acertos
-            linhas.append("🧮 Acertos por aposta")
-            for i, (a, h) in enumerate(zip(apostas, hits_por_aposta), start=1):
-                linhas.append(
-                    f"Aposta {i:02d}: "
-                    + " ".join(f"{n:02d}" for n in a)
-                    + f"  →  {h:2d} acertos"
-                )
-
-            # 4.3 – resumo do lote
-            linhas.append("\n📊 Resumo do Lote")
-            linhas.append(f"• Melhor aposta: {melhor} acertos")
-            linhas.append(f"• Média do lote: {media:.2f} acertos")
-            linhas.append(
-                "• Oficial: " + " ".join(f"{n:02d}" for n in oficial)
-            )
-            if triplo_ok:
-                linhas.append(
-                    "• TRIPLO CHECK-IN: OK (paridade 7–8, seq≤3, "
-                    f"anti-overlap≤{BOLAO_MAX_OVERLAP}, sem duplicatas)"
-                )
-            else:
-                linhas.append("• TRIPLO CHECK-IN: REPROVADO (sem reforço)")
-
-            # 4.4 – coocorrências
-            linhas.append("\n🤝 Coocorrências fortes (top 10):")
-            if top_pairs:
-                for (a, b), c in top_pairs:
-                    linhas.append(f"• ({a:02d},{b:02d}) → {c}x")
-            else:
-                linhas.append("• (sem pares relevantes)")
-
-            # 4.5 – recompensas / penalizações
-            linhas.append(
-                "\n⚖️ Recompensas: " + " ".join(f"{n:02d}" for n in recompensas)
-            )
-            linhas.append(
-                "🔻 Penalizações: " + " ".join(f"{n:02d}" for n in penalizacoes)
-            )
-
-            # 4.6 – comando REAL de refino (apenas se o lote passou no TRIPLO CHECK)
-            if triplo_ok:
-                cmd_refino_real = "/refinar_bolao " + " ".join(
-                    f"{n:02d}" for n in oficial
-                )
-                linhas.append(
-                    "\n🛠️ Bloco /refinar_bolao (comando REAL — copiar e colar exatamente assim):"
-                )
-                linhas.append(cmd_refino_real)
-                linhas.append(
-                    "\n📌 Nota: alpha=0.36 e janela=60 permanecem travados no núcleo; "
-                    "o ajuste fino de bias é feito internamente pelo /refinar_bolao "
-                    "com base nesse resultado oficial."
-                )
-            else:
-                linhas.append(
-                    "\n🔒 Lote reprovado: gere um novo lote conforme as regras e repita /confirmar."
-                )
-
-            texto = "\n".join(linhas)
-
-            # usa helper que você já tem para mensagens longas
-            try:
-                await self._send_long(update, texto, parse_mode=None)
-            except Exception:
-                await update.message.reply_text(texto)
-
-            return
-
-        except Exception:
-            logger.error(
-                "Erro em _auditar_e_preparar_refino:\n" + traceback.format_exc()
-            )
+        if not apostas:
             return await update.message.reply_text(
-                "Erro interno ao auditar o lote para refino."
+                "Não encontrei um lote recente em memória (learning.last_generation). Gere um lote e tente novamente."
             )
+
+        # --- TRIPLO CHECK (não interrompe mais o relatório) ---
+        ok_lote, diag = self._triplo_check_stricto(apostas)  # retorna (bool, str) ou (bool, dict)
+
+        # --- métricas sempre calculadas (mesmo com reprovação) ---
+        oficial_set = set(oficial_15)
+
+        def _hits_por_aposta(_aps: list[list[int]], _of: set[int]) -> list[int]:
+            return [sum(1 for n in a if n in _of) for a in _aps]
+
+        def _coocorrencias(_aps: list[list[int]]):
+            from collections import Counter
+            c = Counter()
+            for a in _aps:
+                s = sorted(a)
+                for i in range(len(s)):
+                    for j in range(i+1, len(s)):
+                        c[(s[i], s[j])] += 1
+            return c
+
+        def _reward_penalty(_aps: list[list[int]], _of: set[int]):
+            # âncoras recebem escala reduzida
+            ANCHORS = set(globals().get("BOLAO_ANCHORS", (9, 11)))
+            HIT = float(globals().get("BOLAO_BIAS_HIT", +0.5))
+            MISS = float(globals().get("BOLAO_BIAS_MISS", -0.2))
+            SCALE = float(globals().get("BOLAO_BIAS_ANCHOR_SCALE", 0.5))
+            d = {n: 0.0 for n in range(1, 26)}
+            for a in _aps:
+                for n in a:
+                    if n in _of:
+                        d[n] += (HIT * (SCALE if n in ANCHORS else 1.0))
+                    else:
+                        d[n] += (MISS * (SCALE if n in ANCHORS else 1.0))
+            return d
+
+        def _format_dez(lst: list[int]) -> str:
+            return " ".join(f"{n:02d}" for n in sorted(lst))
+
+        acertos = _hits_por_aposta(apostas, oficial_set)
+        media = sum(acertos) / float(len(acertos))
+        melhor = max(acertos) if acertos else 0
+        idx_melhores = [i+1 for i, v in enumerate(acertos) if v == melhor]
+
+        cooc = _coocorrencias(apostas)
+        top_pairs = sorted(cooc.items(), key=lambda kv: (-kv[1], kv[0]))[:10] if cooc else []
+
+        deltas = _reward_penalty(apostas, oficial_set)
+        recompensas = sorted([n for n, d in deltas.items() if d > 0], key=lambda n: (-deltas[n], n))
+        penalizacoes = sorted([n for n, d in deltas.items() if d < 0], key=lambda n: (deltas[n], n))
+
+        # ===== Bloco /refinar_bolão (α e janela preservados) =====
+        alpha_fix = st.get("runtime", {}).get("alpha_usado", 0.36)
+        janela_fix = int((st.get("learning") or {}).get("janela", 60))
+
+        bias_update_lines = []
+        for n in range(1, 26):
+            delta = deltas.get(n, 0.0)
+            if abs(delta) > 1e-9:
+                bias_update_lines.append(f"{n:02d}:{delta:+.3f}")
+        bias_blob = " ".join(bias_update_lines) if bias_update_lines else "(sem ajustes)"
+
+        OVERLAP_MAX = int(globals().get("BOLAO_MAX_OVERLAP", 11))
+        refinar_block = (
+            f"/refinar_bolao alpha={alpha_fix:.2f} janela={janela_fix} "
+            f"bias_delta=\"{bias_blob}\" "
+            f"regras=\"paridade 7–8 | seq≤3 | anti-overlap≤{OVERLAP_MAX}\""
+        )
+
+        # ===== meta do Mestre (não mexe em estado se o lote reprovou) =====
+        if ok_lote:
+            learn_meta = learn.get("meta", {}) if isinstance(learn.get("meta", {}), dict) else {}
+            learn_meta["R_alto_target"] = 0.25
+            learn["meta"] = learn_meta
+            st["learning"] = learn
+            _bolao_save_state(st)
+
+        mestre_hint = (
+            "/mestre r_alto_target=0.25 "
+            f"regras=\"paridade 7–8 | seq≤3 | anti-overlap≤{OVERLAP_MAX}\" ancoras=\"leves\""
+        )
+
+        # ===== Mensagem para o chat =====
+        linhas = []
+
+        if not ok_lote:
+            linhas.append("⛔ <b>TRIPLO CHECK-IN FALHOU</b> — bloqueando aprendizado/reforço.\n")
+            # diag pode ser str (relatório pronto) ou dict (estruturado)
+            if isinstance(diag, dict):
+                linhas.append("<b>🔎 TRIPLO CHECK (stricto)</b>")
+                pf = diag.get("paridade_falhas") or []
+                sf = diag.get("seq_falhas") or []
+                ovf = diag.get("overlap_falhas") or []
+                dups = diag.get("duplicatas") or []
+                linhas.append(f"• Paridade: {'✅ todas em 7–8' if not pf else '❌ fora em '+str(pf)}")
+                linhas.append(f"• Sequência: {'✅ OK' if not sf else '❌ >3 nas apostas: '+str(sf)}")
+                if ovf:
+                    worst = max(ovf, key=lambda t: t[2])
+                    linhas.append(f"• Overlap máximo: ❌ {worst[2]} (> {OVERLAP_MAX}) entre Aposta {worst[0]:02d} e {worst[1]:02d}")
+                else:
+                    linhas.append(f"• Overlap máximo: ✅ ≤ {OVERLAP_MAX}")
+                linhas.append(f"• Duplicatas: {'✅ nenhuma' if not dups else '❌ ' + str(dups)}")
+                linhas.append("")
+            else:
+                linhas.append(str(diag) + "\n")
+
+        # Sempre mostramos os resultados do lote (visibilidade total)
+        linhas.append("🧮 <b>Acertos por aposta</b>")
+        for i, ap in enumerate(apostas, 1):
+            linhas.append(f"<b>Aposta {i:02d}:</b> {_format_dez(ap)}  →  <b>{acertos[i-1]}</b> acertos")
+        linhas.append("")
+        linhas.append("📊 <b>Resumo do Lote</b>")
+        linhas.append(f"• Melhor aposta: <b>{melhor}</b> (IDs: {idx_melhores})")
+        linhas.append(f"• Média do lote: <b>{media:.2f}</b> acertos")
+        linhas.append(f"• Oficial: " + " ".join(f"{n:02d}" for n in sorted(oficial_15)))
+        if ok_lote:
+            linhas.append(f"• TRIPLO CHECK-IN: <b>OK</b> (paridade 7–8, seq≤3, anti-overlap≤{OVERLAP_MAX}, sem duplicatas)")
+        else:
+            linhas.append(f"• TRIPLO CHECK-IN: <b>REPROVADO</b> (sem reforço)")
+
+        linhas.append("")
+        linhas.append("🤝 <b>Coocorrências fortes</b> (top 10):")
+        if top_pairs:
+            linhas += [f"• ({a:02d},{b:02d}) → {c}x" for (a,b), c in top_pairs]
+        else:
+            linhas.append("• (n/d)")
+
+        linhas.append("")
+        linhas.append("⚖️ <b>Recompensas</b>: " + (_format_dez(recompensas) if recompensas else "(nenhuma)"))
+        linhas.append("🔻 <b>Penalizações</b>: " + (_format_dez(penalizacoes) if penalizacoes else "(nenhuma)"))
+        linhas.append("")
+
+        # Só mostra o bloco de refino e a dica do Mestre se o triplo check passar
+        if ok_lote:
+            linhas.append("🛠️ <b>Bloco /refinar_bolão (copiar e colar):</b>")
+            linhas.append(refinar_block)
+            linhas.append("")
+            linhas.append("🎯 <b>Próximo passo</b> (R-alto 20–30% habilitado):")
+            linhas.append(mestre_hint)
+        else:
+            linhas.append("🔒 Lote reprovado: gere um novo lote conforme as regras e repita /confirmar.")
+
+        # ✅ Envio longo (evita o erro “Message is too long”)
+        texto = "\n".join(linhas)
+        try:
+            await self._send_long(update, texto, parse_mode="HTML")
+        except Exception:
+            logger.warning("Falha ao enviar com parse_mode HTML, tentando fallback...", exc_info=True)
+            await self._send_long(update, texto, parse_mode=None)
+
 
     # ===== Registrar a última geração (para o aprendizado leve / auto_aprender) =====
     def _registrar_geracao(self, apostas: list[list[int]], base_resultado: list[int] | None):
