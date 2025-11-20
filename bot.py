@@ -1480,16 +1480,55 @@ class LotoFacilBot:
                 )
             return
 
-        # 3) TRIPLO CHECK-IN básico das apostas geradas
+        # ------------------------------------------------------------------
+        # 3) Função auxiliar para completar automaticamente até 15 dezenas
+        #    - Mantém determinismo (ordem fixa 1..25)
+        #    - Tenta preservar SeqMax <= 3 ao escolher as dezenas extras
+        # ------------------------------------------------------------------
+        def completar_para_15(dezenas_orig):
+            # remove duplicatas, garante ints e ordena
+            base = sorted({int(d) for d in dezenas_orig})
+            # se vier com mais de 15, corta nas 15 menores (para não explodir o preset)
+            if len(base) >= 15:
+                return base[:15]
+
+            # candidatos que ainda não estão na aposta
+            restantes = [d for d in range(1, 26) if d not in base]
+
+            # preenche até 15 dezenas
+            while len(base) < 15 and restantes:
+                escolhido = None
+
+                # tenta escolher um número que mantenha SeqMax <= 3
+                for d in restantes:
+                    temp = sorted(base + [d])
+                    if self._max_seq(temp) <= 3:
+                        escolhido = d
+                        break
+
+                # se nenhum candidato manter SeqMax<=3, pega o menor restante assim mesmo
+                if escolhido is None:
+                    escolhido = restantes[0]
+
+                base.append(escolhido)
+                restantes.remove(escolhido)
+                base = sorted(base)
+
+            return base
+
+        # 4) TRIPLO CHECK-IN básico das apostas geradas
         #    (15 dezenas, paridade 7–8, SeqMax<=3)
         apostas_norm = []
-        for idx, aposta in enumerate(apostas, start=1):
-            dezenas = sorted(int(d) for d in aposta)  # garante lista ordenada de int
+        apostas_corrigidas = []  # para informar, se quisermos, quais foram ajustadas
 
-            if len(dezenas) != 15:
-                raise ValueError(
-                    f"Aposta A{idx:02d} gerada com {len(dezenas)} dezenas (esperado: 15)."
-                )
+        for idx, aposta in enumerate(apostas, start=1):
+            dezenas_raw = list(aposta)
+
+            # completa automaticamente até 15 dezenas, se vier com menos
+            dezenas = completar_para_15(dezenas_raw)
+
+            if len(dezenas_raw) != 15:
+                apostas_corrigidas.append(f"A{idx:02d} ({len(dezenas_raw)}→15)")
 
             pares, impares = self._paridade(dezenas)
             seq_max = self._max_seq(dezenas)
@@ -1508,7 +1547,7 @@ class LotoFacilBot:
 
             apostas_norm.append(dezenas)
 
-        # 4) Registrar lote para auditoria (/confirmar)
+        # 5) Registrar lote para auditoria (/confirmar)
         try:
             lote_id = self._registrar_geracao(
                 user_id=user_id,
@@ -1537,7 +1576,7 @@ class LotoFacilBot:
 
             lote_id = None
 
-        # 5) Formatar resposta para o usuário
+        # 6) Formatar resposta para o usuário
         linhas = []
         linhas.append("🎯 *Preset Mestre (history.csv)*")
         linhas.append("Base: último resultado (linha 1 do `data/history.csv`)")
@@ -1550,6 +1589,13 @@ class LotoFacilBot:
             numeros_str = " ".join(f"{d:02d}" for d in dezenas)
             linhas.append(
                 f"A{i:02d}: {numeros_str}  | P:{pares}/{impares}  SeqMax:{seq_max}"
+            )
+
+        if apostas_corrigidas:
+            linhas.append(
+                "\nℹ️ Ajuste automático: algumas apostas vieram com menos de 15 dezenas "
+                "e foram completadas para 15 dentro das regras de SeqMax<=3:\n"
+                + ", ".join(apostas_corrigidas)
             )
 
         if lote_id is not None:
