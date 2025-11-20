@@ -1441,7 +1441,7 @@ class LotoFacilBot:
         - Gera 10 apostas determinísticas com base no último resultado (1ª linha)
         - Usa janela de 50 concursos para frequências e atrasos
         - Padrões 10R/9R/8R/11R
-        - Regras: 15 dezenas, paridade 7–8, seq<=3
+        - Regras: 15 dezenas, paridade 7–8, seq<=3 (paridade alvo; SeqMax hard)
         """
         chat = update.effective_chat
         user = update.effective_user
@@ -1481,14 +1481,12 @@ class LotoFacilBot:
             return
 
         # ------------------------------------------------------------------
-        # 3) Função auxiliar para completar automaticamente até 15 dezenas
-        #    - Mantém determinismo (ordem fixa 1..25)
-        #    - Tenta preservar SeqMax <= 3 ao escolher as dezenas extras
+        # 3) Completar automaticamente até 15 dezenas (determinístico)
         # ------------------------------------------------------------------
         def completar_para_15(dezenas_orig):
             # remove duplicatas, garante ints e ordena
             base = sorted({int(d) for d in dezenas_orig})
-            # se vier com mais de 15, corta nas 15 menores (para não explodir o preset)
+            # se vier com mais de 15, corta nas 15 menores
             if len(base) >= 15:
                 return base[:15]
 
@@ -1516,10 +1514,71 @@ class LotoFacilBot:
 
             return base
 
-        # 4) TRIPLO CHECK-IN básico das apostas geradas
-        #    (15 dezenas, paridade 7–8, SeqMax<=3)
+        # ------------------------------------------------------------------
+        # 4) Ajustar paridade para a faixa 7–8 (quando possível)
+        #    - Troca uma dezena da paridade excedente por outra da paridade oposta
+        #      que esteja fora da aposta, mantendo SeqMax <= 3.
+        # ------------------------------------------------------------------
+        def ajustar_paridade_78(dezenas_orig):
+            dezenas = sorted(dezenas_orig)
+            pares, impares = self._paridade(dezenas)
+
+            # Já está na faixa alvo
+            if 7 <= pares <= 8 and 7 <= impares <= 8:
+                return dezenas, False
+
+            # Decide qual paridade está "sobrando"
+            if pares > 8 and impares < 7:
+                maioria = "par"      # muitos pares, poucos ímpares
+            elif impares > 8 and pares < 7:
+                maioria = "impar"    # muitos ímpares, poucos pares
+            else:
+                # Casos tipo 9/6, 6/9, etc.
+                maioria = "par" if pares > impares else "impar"
+
+            conjunto = set(dezenas)
+
+            # Candidatos de saída: dezenas da paridade excedente
+            candidatos_saida = []
+            for d in dezenas:
+                if maioria == "par" and d % 2 == 0:
+                    candidatos_saida.append(d)
+                elif maioria == "impar" and d % 2 != 0:
+                    candidatos_saida.append(d)
+
+            # Para cada candidato de saída, tenta um candidato de entrada da paridade oposta
+            for d_saida in candidatos_saida:
+                tmp_base = [x for x in dezenas if x != d_saida]
+
+                candidatos_entrada = []
+                for n in range(1, 26):
+                    if n in conjunto:
+                        continue
+                    if maioria == "par" and n % 2 != 0:
+                        candidatos_entrada.append(n)  # preciso de ímpar
+                    elif maioria == "impar" and n % 2 == 0:
+                        candidatos_entrada.append(n)  # preciso de par
+
+                for n in candidatos_entrada:
+                    nova = sorted(tmp_base + [n])
+                    pares_n, impares_n = self._paridade(nova)
+                    seq_max_n = self._max_seq(nova)
+
+                    if (
+                        seq_max_n <= 3
+                        and 7 <= pares_n <= 8
+                        and 7 <= impares_n <= 8
+                    ):
+                        return nova, True
+
+            # Não conseguiu ajustar sem violar SeqMax ou a faixa 7–8
+            return dezenas, False
+
+        # 5) TRIPLO CHECK-IN (com paridade como alvo e SeqMax hard)
         apostas_norm = []
-        apostas_corrigidas = []  # para informar, se quisermos, quais foram ajustadas
+        apostas_corrigidas = []        # tamanho ajustado
+        apostas_paridade_ajustada = [] # paridade ajustada com sucesso
+        apostas_paridade_ruim = []     # não foi possível ajustar paridade
 
         for idx, aposta in enumerate(apostas, start=1):
             dezenas_raw = list(aposta)
@@ -1530,16 +1589,19 @@ class LotoFacilBot:
             if len(dezenas_raw) != 15:
                 apostas_corrigidas.append(f"A{idx:02d} ({len(dezenas_raw)}→15)")
 
+            # tenta ajustar paridade para 7–8
+            dezenas, ajustou_paridade = ajustar_paridade_78(dezenas)
+            if ajustou_paridade:
+                apostas_paridade_ajustada.append(f"A{idx:02d}")
+            else:
+                p_tmp, i_tmp = self._paridade(dezenas)
+                if not (7 <= p_tmp <= 8 and 7 <= i_tmp <= 8):
+                    apostas_paridade_ruim.append(f"A{idx:02d} (P:{p_tmp}/I:{i_tmp})")
+
             pares, impares = self._paridade(dezenas)
             seq_max = self._max_seq(dezenas)
 
-            # Paridade alvo ~7–8 (tanto pares quanto ímpares entre 7 e 8)
-            if not (7 <= pares <= 8 and 7 <= impares <= 8):
-                raise ValueError(
-                    f"Aposta A{idx:02d} fora da paridade alvo (P:{pares}/I:{impares})."
-                )
-
-            # Sequência máxima <= 3
+            # SeqMax continua sendo regra dura
             if seq_max > 3:
                 raise ValueError(
                     f"Aposta A{idx:02d} com SeqMax={seq_max} (limite: 3)."
@@ -1547,7 +1609,7 @@ class LotoFacilBot:
 
             apostas_norm.append(dezenas)
 
-        # 5) Registrar lote para auditoria (/confirmar)
+        # 6) Registrar lote para auditoria (/confirmar)
         try:
             lote_id = self._registrar_geracao(
                 user_id=user_id,
@@ -1562,8 +1624,6 @@ class LotoFacilBot:
                 },
             )
         except Exception as e:
-            # Se não conseguir registrar, ainda assim mostra as apostas,
-            # mas avisa que não será possível usar /confirmar
             logger.exception("Erro ao registrar geração do /mestre_history")
             aviso = (
                 "⚠️ As apostas foram geradas, mas não consegui registrar o lote para auditoria.\n"
@@ -1572,11 +1632,9 @@ class LotoFacilBot:
             )
             if chat_id is not None:
                 await context.bot.send_message(chat_id=chat_id, text=aviso)
-            # segue sem dar return: usuário pelo menos vê o bloco
-
             lote_id = None
 
-        # 6) Formatar resposta para o usuário
+        # 7) Formatar resposta para o usuário
         linhas = []
         linhas.append("🎯 *Preset Mestre (history.csv)*")
         linhas.append("Base: último resultado (linha 1 do `data/history.csv`)")
@@ -1593,9 +1651,21 @@ class LotoFacilBot:
 
         if apostas_corrigidas:
             linhas.append(
-                "\nℹ️ Ajuste automático: algumas apostas vieram com menos de 15 dezenas "
-                "e foram completadas para 15 dentro das regras de SeqMax<=3:\n"
+                "\nℹ️ Ajuste automático (tamanho): algumas apostas vieram com menos de 15 dezenas "
+                "e foram completadas para 15 mantendo, quando possível, SeqMax<=3:\n"
                 + ", ".join(apostas_corrigidas)
+            )
+
+        if apostas_paridade_ajustada:
+            linhas.append(
+                "\nℹ️ Ajuste automático (paridade): paridade ajustada para a faixa alvo 7–8 em:\n"
+                + ", ".join(apostas_paridade_ajustada)
+            )
+
+        if apostas_paridade_ruim:
+            linhas.append(
+                "\n⚠️ Aviso: não foi possível ajustar a paridade para 7–8 sem violar SeqMax<=3 nas apostas:\n"
+                + ", ".join(apostas_paridade_ruim)
             )
 
         if lote_id is not None:
@@ -1614,6 +1684,7 @@ class LotoFacilBot:
                 text=texto,
                 parse_mode="Markdown",
             )
+
 
     # --- /gerar: rápido, estável, sem cache e com diversidade entre chamadas ---
     async def gerar_apostas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7211,63 +7282,50 @@ class LotoFacilBot:
         u = set(ultimo)
         return sum(1 for n in aposta if n in u)
     
-    async def confirmar(self, update, context):
-        """
-        /confirmar <15 dezenas> — Auditoria + preparação do refinamento
-        Funciona para blocos gerados por:
-        - /mestre
-        - /mestre_history
-        - /mestre_bolao
-        - /bolao20
-        """
+    async def confirmar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
-            # =============================
-            # 1) Coletar dezenas informadas
-            # =============================
-            partes = update.message.text.split()
-            nums = [int(x) for x in partes[1:]]  # ignora "/confirmar"
+            texto = update.message.text or ""
+            partes = texto.split()
 
+            if len(partes) != 16:
+                return await update.message.reply_text(
+                    "Use: /confirmar <15 dezenas entre 1..25>\n"
+                    "Exemplo: /confirmar 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15"
+                )
+
+            nums = [int(x) for x in partes[1:]]
             if len(nums) != 15 or any(n < 1 or n > 25 for n in nums):
                 return await update.message.reply_text(
-                    "Use: /confirmar <15 dezenas entre 1..25>"
+                    "Use: /confirmar <15 dezenas entre 1..25> (todas entre 1 e 25)."
                 )
 
             nums = sorted(nums)
 
-            # =============================
-            # 2) Obter último lote registrado
-            # =============================
-            user_id = update.effective_user.id
-            lote = self.repo_geracao.obter_ultimo_lote(user_id)
+            # Presets que podem ser auditados pelo /confirmar
+            preset_permitidos = {"MESTRE", "MESTRE_HISTORY", "MESTRE_BOLAO", "BOLAO20"}
 
-            if not lote:
+            # Chama o fluxo de auditoria + aprendizado leve
+            await self._auditar_e_preparar_refino(
+                update,
+                context,
+                nums,
+                preset_permitidos=preset_permitidos,
+            )
+
+        except AttributeError as e:
+            # CASO ESPECÍFICO: repo_geracao não existe nesse bot
+            if "repo_geracao" in str(e):
+                logger.error("repo_geracao não configurado no LotoFacilBot:\n" + traceback.format_exc())
                 return await update.message.reply_text(
-                    "Não há lote recente registrado para auditoria.\n"
-                    "Gere apostas com /mestre, /mestre_history ou modo bolão antes de usar /confirmar."
+                    "✅ O resultado foi lido e o desempenho do lote foi avaliado.\n"
+                    "⚠️ Porém, o repositório de gerações (`repo_geracao`) não está configurado "
+                    "neste bot, então o lote não pôde ser vinculado/registrado para histórico.\n\n"
+                    "Na prática: o aprendizado leve rodou, mas o controle de lotes não foi atualizado."
                 )
 
-            # =============================
-            # 3) Verificar se o preset do lote é permitido
-            # =============================
-            preset_permitidos = {
-                "MESTRE",
-                "MESTRE_HISTORY",
-                "MESTRE_BOLAO",
-                "BOLAO20",
-            }
-
-            preset_lote = lote.get("preset")
-
-            if preset_lote not in preset_permitidos:
-                return await update.message.reply_text(
-                    f"O último lote registrado ({preset_lote}) não é compatível com auditoria via /confirmar.\n"
-                    "Gere apostas com /mestre, /mestre_history ou modo bolão."
-                )
-
-            # =============================
-            # 4) Chamar pipeline completa de auditoria + refino
-            # =============================
-            await self._auditar_e_preparar_refino(update, context, nums)
+            # Outros AttributeError caem no tratamento geral
+            logger.error("Erro no /confirmar (AttributeError):\n" + traceback.format_exc())
+            return await update.message.reply_text(f"Erro no /confirmar: {e}")
 
         except Exception as e:
             logger.error("Erro no /confirmar:\n" + traceback.format_exc())
