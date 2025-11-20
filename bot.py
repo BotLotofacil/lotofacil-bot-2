@@ -1443,8 +1443,12 @@ class LotoFacilBot:
         - Padrões 10R/9R/8R/11R
         - Regras: 15 dezenas, paridade 7–8, seq<=3
         """
-        chat_id = update.effective_chat.id if update.effective_chat else None
+        chat = update.effective_chat
+        user = update.effective_user
+        chat_id = chat.id if chat else None
+        user_id = user.id if user else None
 
+        # 1) Carregar histórico
         try:
             history = self._load_history_from_csv("data/history.csv")
         except Exception as e:
@@ -1456,6 +1460,7 @@ class LotoFacilBot:
                 await context.bot.send_message(chat_id=chat_id, text=msg)
             return
 
+        # 2) Gerar bloco Mestre a partir do histórico (linha 1, janela 50)
         try:
             apostas = self._gerar_bloco_mestre_history(history, janela=50)
         except Exception as e:
@@ -1475,19 +1480,84 @@ class LotoFacilBot:
                 )
             return
 
-        # Formatar resposta
+        # 3) TRIPLO CHECK-IN básico das apostas geradas
+        #    (15 dezenas, paridade 7–8, SeqMax<=3)
+        apostas_norm = []
+        for idx, aposta in enumerate(apostas, start=1):
+            dezenas = sorted(int(d) for d in aposta)  # garante lista ordenada de int
+
+            if len(dezenas) != 15:
+                raise ValueError(
+                    f"Aposta A{idx:02d} gerada com {len(dezenas)} dezenas (esperado: 15)."
+                )
+
+            pares, impares = self._paridade(dezenas)
+            seq_max = self._max_seq(dezenas)
+
+            # Paridade alvo ~7–8 (tanto pares quanto ímpares entre 7 e 8)
+            if not (7 <= pares <= 8 and 7 <= impares <= 8):
+                raise ValueError(
+                    f"Aposta A{idx:02d} fora da paridade alvo (P:{pares}/I:{impares})."
+                )
+
+            # Sequência máxima <= 3
+            if seq_max > 3:
+                raise ValueError(
+                    f"Aposta A{idx:02d} com SeqMax={seq_max} (limite: 3)."
+                )
+
+            apostas_norm.append(dezenas)
+
+        # 4) Registrar lote para auditoria (/confirmar)
+        try:
+            lote_id = self._registrar_geracao(
+                user_id=user_id,
+                chat_id=chat_id,
+                apostas=apostas_norm,
+                preset="MESTRE_HISTORY",
+                meta={
+                    "modo": "mestre_history",
+                    "fonte": "data/history.csv",
+                    "janela": 50,
+                    "descricao": "Preset Mestre baseado na 1ª linha do history.csv",
+                },
+            )
+        except Exception as e:
+            # Se não conseguir registrar, ainda assim mostra as apostas,
+            # mas avisa que não será possível usar /confirmar
+            logger.exception("Erro ao registrar geração do /mestre_history")
+            aviso = (
+                "⚠️ As apostas foram geradas, mas não consegui registrar o lote para auditoria.\n"
+                "O comando /confirmar pode não reconhecer este bloco.\n"
+                f"Detalhe técnico: {e}"
+            )
+            if chat_id is not None:
+                await context.bot.send_message(chat_id=chat_id, text=aviso)
+            # segue sem dar return: usuário pelo menos vê o bloco
+
+            lote_id = None
+
+        # 5) Formatar resposta para o usuário
         linhas = []
         linhas.append("🎯 *Preset Mestre (history.csv)*")
-        linhas.append("Base: último resultado (linha 1 do data/history.csv)")
+        linhas.append("Base: último resultado (linha 1 do `data/history.csv`)")
         linhas.append("Janela estatística: 50 concursos")
         linhas.append("Padrões alvo: 9R–10R (com 1x 8R e 1x 11R)\n")
 
-        for i, aposta in enumerate(apostas, start=1):
-            pares, impares = self._paridade(aposta)
-            seq_max = self._max_seq(aposta)
-            numeros_str = " ".join(f"{d:02d}" for d in sorted(aposta))
+        for i, dezenas in enumerate(apostas_norm, start=1):
+            pares, impares = self._paridade(dezenas)
+            seq_max = self._max_seq(dezenas)
+            numeros_str = " ".join(f"{d:02d}" for d in dezenas)
             linhas.append(
                 f"A{i:02d}: {numeros_str}  | P:{pares}/{impares}  SeqMax:{seq_max}"
+            )
+
+        if lote_id is not None:
+            linhas.append(f"\nID do lote: `{lote_id}`")
+            linhas.append("Use /confirmar <15 dezenas do resultado> para auditoria deste lote.")
+        else:
+            linhas.append(
+                "\n⚠️ Lote não registrado — /confirmar pode não funcionar para este bloco."
             )
 
         texto = "\n".join(linhas)
@@ -7094,14 +7164,65 @@ class LotoFacilBot:
     def _contar_repeticoes(aposta, ultimo):
         u = set(ultimo)
         return sum(1 for n in aposta if n in u)
-
+    
     async def confirmar(self, update, context):
+        """
+        /confirmar <15 dezenas> — Auditoria + preparação do refinamento
+        Funciona para blocos gerados por:
+        - /mestre
+        - /mestre_history
+        - /mestre_bolao
+        - /bolao20
+        """
         try:
-            nums = [int(x) for x in (update.message.text.split()[1:])]
+            # =============================
+            # 1) Coletar dezenas informadas
+            # =============================
+            partes = update.message.text.split()
+            nums = [int(x) for x in partes[1:]]  # ignora "/confirmar"
+
             if len(nums) != 15 or any(n < 1 or n > 25 for n in nums):
-                return await update.message.reply_text("Use: /confirmar <15 dezenas entre 1..25>")
+                return await update.message.reply_text(
+                    "Use: /confirmar <15 dezenas entre 1..25>"
+                )
+
             nums = sorted(nums)
+
+            # =============================
+            # 2) Obter último lote registrado
+            # =============================
+            user_id = update.effective_user.id
+            lote = self.repo_geracao.obter_ultimo_lote(user_id)
+
+            if not lote:
+                return await update.message.reply_text(
+                    "Não há lote recente registrado para auditoria.\n"
+                    "Gere apostas com /mestre, /mestre_history ou modo bolão antes de usar /confirmar."
+                )
+
+            # =============================
+            # 3) Verificar se o preset do lote é permitido
+            # =============================
+            preset_permitidos = {
+                "MESTRE",
+                "MESTRE_HISTORY",
+                "MESTRE_BOLAO",
+                "BOLAO20",
+            }
+
+            preset_lote = lote.get("preset")
+
+            if preset_lote not in preset_permitidos:
+                return await update.message.reply_text(
+                    f"O último lote registrado ({preset_lote}) não é compatível com auditoria via /confirmar.\n"
+                    "Gere apostas com /mestre, /mestre_history ou modo bolão."
+                )
+
+            # =============================
+            # 4) Chamar pipeline completa de auditoria + refino
+            # =============================
             await self._auditar_e_preparar_refino(update, context, nums)
+
         except Exception as e:
             logger.error("Erro no /confirmar:\n" + traceback.format_exc())
             return await update.message.reply_text(f"Erro no /confirmar: {e}")
