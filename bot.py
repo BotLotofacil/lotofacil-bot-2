@@ -183,8 +183,8 @@ DESEMPENHO_BOM_R    = 12.0     # opcional: faixa "bom"
 # ========================
 # Parâmetros padrão do gerador
 # ========================
-# Quantidade: permitir até 50 no /gerar
-QTD_BILHETES_PADRAO = 5
+# Quantidade: permitir até 200 no /gerar
+QTD_BILHETES_PADRAO = 10
 QTD_BILHETES_MIN = 1
 QTD_BILHETES_MAX = 200
 
@@ -192,10 +192,10 @@ SHOW_TIMESTAMP = True
 TIMEZONE = "America/Sao_Paulo"
 
 # Janela e alpha (alinhados ao utils/backtest defaults/amarras)
-JANELA_PADRAO = 60
+JANELA_PADRAO = 50
 JANELA_MIN, JANELA_MAX = 50, 1000
 
-ALPHA_PADRAO = 0.37
+ALPHA_PADRAO = 0.38
 ALPHA_MIN,  ALPHA_MAX  = 0.05, 0.95
 
 HISTORY_PATH = "data/history.csv"
@@ -203,7 +203,7 @@ WHITELIST_PATH = "whitelist.txt"
 
 # --- Alpha lock (apenas no /gerar) ---
 LOCK_ALPHA_GERAR = True      # deixe True para travar /gerar em 0.37
-ALPHA_LOCK_VALUE  = 0.37     # valor travado só para /gerar
+ALPHA_LOCK_VALUE  = 0.38     # valor travado só para /gerar
 
 # Cooldown (segundos) para evitar flood
 COOLDOWN_SECONDS = 10
@@ -217,9 +217,9 @@ BUILD_TAG = getenv("BUILD_TAG", "unknown")
 # ========================
 # Configurações do Bolão Inteligente v5 (19 → 15)
 # ========================
-BOLAO_JANELA = 60
-BOLAO_ALPHA  = 0.37
-BOLAO_QTD_APOSTAS = 5
+BOLAO_JANELA = 50
+BOLAO_ALPHA  = 0.38
+BOLAO_QTD_APOSTAS = 10
 BOLAO_ANCHORS = (9, 11)
 BOLAO_STATE_PATH = "data/bolao_state.json"
 
@@ -246,8 +246,8 @@ from pathlib import Path
 DATA_DIR = str(Path(HISTORY_PATH).parent)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-BOLAO20_JANELA = 60
-BOLAO20_ALPHA  = 0.34
+BOLAO20_JANELA = 100
+BOLAO20_ALPHA  = 0.38
 BOLAO20_PAR    = (7, 8)
 BOLAO20_MAXSEQ = 3
 BOLAO20_MAX_OVERLAP = 11
