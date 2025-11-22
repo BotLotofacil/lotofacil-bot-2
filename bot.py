@@ -184,7 +184,7 @@ DESEMPENHO_BOM_R    = 12.0     # opcional: faixa "bom"
 # Parâmetros padrão do gerador
 # ========================
 # Quantidade: permitir até 50 no /gerar
-QTD_BILHETES_PADRAO = 5
+QTD_BILHETES_PADRAO = 10
 QTD_BILHETES_MIN = 1
 QTD_BILHETES_MAX = 200
 
@@ -192,7 +192,7 @@ SHOW_TIMESTAMP = True
 TIMEZONE = "America/Sao_Paulo"
 
 # Janela e alpha (alinhados ao utils/backtest defaults/amarras)
-JANELA_PADRAO = 60
+JANELA_PADRAO = 100
 JANELA_MIN, JANELA_MAX = 50, 1000
 
 ALPHA_PADRAO = 0.36
@@ -246,8 +246,8 @@ from pathlib import Path
 DATA_DIR = str(Path(HISTORY_PATH).parent)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-BOLAO20_JANELA = 60
-BOLAO20_ALPHA  = 0.30
+BOLAO20_JANELA = 100
+BOLAO20_ALPHA  = 0.35
 BOLAO20_PAR    = (7, 8)
 BOLAO20_MAXSEQ = 3
 BOLAO20_MAX_OVERLAP = 11
